@@ -4216,12 +4216,26 @@ all.  Signals when resolution itself fails."
       (pilish-jsonl-session-dir-for-cwd
        (pilish--session-directory))))
 
+(defun pilish--browse-project-directory ()
+  "Return the linked chat's stable cwd, or the browser's project directory."
+  (if (buffer-live-p pilish--chat-buffer)
+      (pilish--route-preserving-expand-file-name
+       (pilish--chat-session-directory pilish--chat-buffer))
+    (pilish--session-directory)))
+
 (defun pilish--browse-flat-session-directory-p (dir)
   "Return non-nil when DIR is a flat custom session directory.
-Default pi storage uses a munged --…-- directory per project; an
-explicit sessionDir stores all projects' JSONL files directly in DIR."
-  (not (string-match-p "\\`--.*--\\'"
-                       (file-name-nondirectory (directory-file-name dir)))))
+Local default storage has one exact path for the linked chat's cwd;
+a custom sessionDir may have any name.  Remote storage still uses the
+munged-name heuristic because its configured sessions root is unknown."
+  (if (file-remote-p dir)
+      (not (string-match-p "\\`--.*--\\'"
+                           (file-name-nondirectory (directory-file-name dir))))
+    (not (equal (directory-file-name (expand-file-name dir))
+                (directory-file-name
+                 (expand-file-name
+                  (pilish-jsonl-session-dir-for-cwd
+                   (pilish--browse-project-directory))))))))
 
 (defun pilish--browse-session-directories (scope &optional buf token)
   "Return the session directories for SCOPE while BUF owns TOKEN.
@@ -4465,7 +4479,7 @@ new generation here."
                  (project-id
                   (when flat-current
                     (car (pilish--session-canonical-project-spec
-                          (list :cwd (pilish--session-directory)
+                          (list :cwd (pilish--browse-project-directory)
                                 :path (expand-file-name "session.jsonl"
                                                         (car dirs))))))))
             (when (pilish--browse-session-scan-current-p buf token)
