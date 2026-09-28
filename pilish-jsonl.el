@@ -277,28 +277,30 @@ check only."
       data)))
 
 (defun pilish-jsonl-read-session-header (path)
-  "Read only the first session header from PATH, or return nil.
-Read a small prefix so callers can reject unrelated sessions without
-loading their histories.  Fall back to the whole file only when leading
-blank lines or an unusually long header exceed that prefix.  The first
-nonblank line follows the same validation as `pilish-jsonl-read-file'."
+  "Read PATH's first complete nonblank session header, or return nil.
+Grow the byte prefix only until that line is complete (or EOF), never
+reading a whole history merely because its header exceeds 4096 bytes.
+The first nonblank line follows `pilish-jsonl-read-file's validation."
   (condition-case nil
       (with-temp-buffer
-        (insert-file-contents path nil 0 4096)
-        (goto-char (point-min))
-        (while (and (not (eobp)) (looking-at-p "[ \t\r]*$"))
-          (forward-line 1))
-        (when (and (>= (buffer-size) 4096)
-                   (or (eobp)
-                       (not (save-excursion (search-forward "\n" nil t)))))
-          (erase-buffer)
-          (insert-file-contents path)
-          (goto-char (point-min))
-          (while (and (not (eobp)) (looking-at-p "[ \t\r]*$"))
-            (forward-line 1)))
-        (unless (eobp)
-          (pilish--jsonl-parse-session-header
-           (buffer-substring-no-properties (point) (line-end-position)))))
+        (let ((limit 4096) size complete)
+          (while (not complete)
+            (erase-buffer)
+            (insert-file-contents path nil 0 limit)
+            (goto-char (point-min))
+            (while (and (not (eobp)) (looking-at-p "[ \t\r]*$"))
+              (forward-line 1))
+            (if (save-excursion (search-forward "\n" nil t))
+                (setq complete t)
+              ;; A decoded character count cannot establish whether a
+              ;; byte-limited UTF-8 read reached the end of the file.
+              (setq size (or size (file-attribute-size (file-attributes path))))
+              (if (< limit size)
+                  (setq limit (min size (* 2 limit)))
+                (setq complete t))))
+          (unless (eobp)
+            (pilish--jsonl-parse-session-header
+             (buffer-substring-no-properties (point) (line-end-position))))))
     (error nil)))
 
 (defun pilish-jsonl-read-file (path)
