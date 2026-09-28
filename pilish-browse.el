@@ -4480,8 +4480,7 @@ new generation here."
                   (when flat-current
                     (car (pilish--session-canonical-project-spec
                           (list :cwd (pilish--browse-project-directory)
-                                :path (expand-file-name "session.jsonl"
-                                                        (car dirs))))))))
+                                :path (car dirs)))))))
             (when (pilish--browse-session-scan-current-p buf token)
               (run-at-time
                0 nil #'pilish--browse-scan-session-files buf token files nil

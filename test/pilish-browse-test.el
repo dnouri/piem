@@ -5622,6 +5622,50 @@ and non-munged directories.  scope=current scans one directory."
       (kill-buffer chat)
       (delete-directory sandbox t))))
 
+(ert-deftest pilish-test-flat-session-current-keeps-remote-route ()
+  "Flat current scopes keep single-hop and multi-hop TRAMP identities."
+  (dolist (route '("/ssh:target:" "/ssh:jump|ssh:target:"))
+    (let* ((chat (generate-new-buffer " *pilish-flat-remote-chat*"))
+           (dir (concat route "/flat/"))
+           (path-a (concat dir "a.jsonl"))
+           (path-b (concat dir "b.jsonl"))
+           opened calls)
+      (unwind-protect
+          (progn
+            (with-current-buffer chat
+              (setq pilish--canonical-session-directory (concat route "/work/")
+                    pilish--state (list :session-file path-a)))
+            (pilish-test--with-browse-link chat
+              ;; Keep filesystem IO synthetic, but use real TRAMP path
+              ;; operations and real project identity/filtering code.
+              (cl-letf (((symbol-function 'pilish--browse-session-files)
+                         (lambda (dirs &rest _)
+                           (should (equal dirs (list dir)))
+                           (list path-a path-b)))
+                        ((symbol-function 'pilish-jsonl-read-session-header)
+                         (lambda (path)
+                           (list :type "session" :cwd
+                                 (if (equal path path-a) "/work" "/other"))))
+                        ((symbol-function 'pilish-jsonl-open-session-info)
+                         (lambda (path &rest _) (push path opened) path))
+                        ((symbol-function 'pilish-jsonl-step-session-info)
+                         (lambda (path &rest _)
+                           (cons 'done (list :path path :cwd "/work"))))
+                        ((symbol-function 'pilish-jsonl-close-session-info)
+                         #'ignore)
+                        ((symbol-function 'run-at-time)
+                         (lambda (_secs _repeat fn &rest args)
+                           (apply fn args))))
+                (pilish--browse-load-sessions
+                 'current (lambda (items error) (push (list items error) calls)))))
+            (should (= (length calls) 1))
+            (should-not (cadar calls))
+            (should (equal (mapcar (lambda (item) (plist-get item :path))
+                                   (caar calls))
+                           (list path-a)))
+            (should (equal opened (list path-a))))
+        (kill-buffer chat)))))
+
 (ert-deftest pilish-test-load-sessions-chunked ()
   "--browse-load-sessions chunks long scans and reports once.
 The resumable reader is slowed so the scan spans several slices.
