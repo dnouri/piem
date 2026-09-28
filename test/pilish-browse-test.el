@@ -5944,6 +5944,74 @@ and no stale callback or continuation timer is emitted."
         (should-not callbacks)
         (should-not timers)))))
 
+(ert-deftest pilish-test-flat-session-setup-failure-clears-loading ()
+  "Project lookup failures finish a flat scan instead of leaving it loading."
+  (dolist (failure '(quit error))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (cl-letf (((symbol-function 'pilish--browse-current-session-directory)
+                 (lambda () "/flat/"))
+                ((symbol-function 'pilish--browse-session-files) #'ignore)
+                ((symbol-function 'pilish--browse-project-directory)
+                 (lambda () (signal failure '("broken cwd")))))
+        (condition-case nil
+            (pilish--session-browser-fetch-and-render)
+          ((error quit) nil)))
+      (should-not pilish--session-browser-loading)
+      (should (equal pilish--session-browser-error
+                     (if (eq failure 'quit)
+                         "Session scan was interrupted"
+                       "Cannot list sessions: broken cwd"))))))
+
+(ert-deftest pilish-test-flat-session-setup-cancellation ()
+  "Cancellation during scan setup stops before the next IO boundary."
+  (dolist (phase '(resolve classify project files))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (let (cancelled after-cancellation callbacks timers)
+        (cl-labels ((observe (stage)
+                      (when cancelled (push stage after-cancellation))
+                      (when (eq stage phase)
+                        (setq cancelled t)
+                        (cl-incf pilish--session-browser-fetch-token))))
+          (cl-letf (((symbol-function 'pilish--browse-session-directories)
+                     (lambda (&rest _) (observe 'resolve) '("/flat/")))
+                    ((symbol-function 'pilish--browse-flat-session-directory-p)
+                     (lambda (_) (observe 'classify) t))
+                    ((symbol-function 'pilish--browse-project-directory)
+                     (lambda () "/work/"))
+                    ((symbol-function 'pilish--session-canonical-project-spec)
+                     (lambda (_) (observe 'project) '("/work" nil ("work"))))
+                    ((symbol-function 'pilish--browse-session-files)
+                     (lambda (&rest _) (observe 'files) '("/flat/a.jsonl")))
+                    ((symbol-function 'run-at-time)
+                     (lambda (&rest args) (push args timers))))
+            (pilish--browse-load-sessions
+             'current (lambda (&rest args) (push args callbacks)))))
+        (should cancelled)
+        (should-not after-cancellation)
+        (should-not callbacks)
+        (should-not timers)))))
+
+(ert-deftest pilish-test-session-directories-cancel-during-classification ()
+  "All-projects classification cannot return stale paths or enter root IO."
+  (dolist (flat '(nil t))
+    (with-temp-buffer
+      (pilish-session-browser-mode)
+      (setq pilish--session-browser-fetch-token 1)
+      (let (root-io)
+        (cl-letf (((symbol-function 'pilish--browse-current-session-directory)
+                   (lambda () "/flat/"))
+                  ((symbol-function 'pilish--browse-flat-session-directory-p)
+                   (lambda (_dir)
+                     (cl-incf pilish--session-browser-fetch-token)
+                     flat))
+                  ((symbol-function 'pilish-jsonl-sessions-root)
+                   (lambda (&rest _) (push t root-io) "/sessions/")))
+          (should-not (pilish--browse-session-directories
+                       'all (current-buffer) 1)))
+        (should-not root-io)))))
+
 (ert-deftest pilish-test-flat-session-prefilter-cancellation ()
   "A superseded header probe never opens the file or reports results."
   (with-temp-buffer
