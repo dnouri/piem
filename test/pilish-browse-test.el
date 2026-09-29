@@ -5599,7 +5599,9 @@ and non-munged directories.  scope=current scans one directory."
                    (cons (format "PI_CODING_AGENT_DIR=%s"
                                  (expand-file-name "agent" sandbox))
                          process-environment)))
-              (should (equal (directory-file-name (project-root (project-current)))
+              (should (equal (directory-file-name
+                              (expand-file-name
+                               (project-root (project-current))))
                              project))
               (should (equal (directory-file-name
                               (pilish--session-list-directory)) flat))
