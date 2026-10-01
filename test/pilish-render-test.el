@@ -2342,6 +2342,7 @@ The banner is toggled before thinking blocks and outline cycling."
         (pilish-test--send-assistant-message-update
          '(:type "toolcall_delta" :contentIndex 1
            :delta "{\"path\":\"/tmp/example.txt\"}"))
+        (pilish--flush-stream-deltas)
         (pilish--refresh-hot-tail-tables 70)
         (let* ((overlays (seq-filter
                           (lambda (ov) (overlay-get ov 'pilish-table-display))
@@ -12920,6 +12921,7 @@ Edit diffs include unchanged context rows with a leading space marker."
            (pilish-test--send-assistant-message-update
             '(:type "toolcall_delta" :contentIndex 0
               :delta "{\"path\":[\"not\",\"a\",\"path\"],\"content\":\"hello\\n\"}"))
+           (pilish--flush-stream-deltas)
            t)
        (error nil)))
     (should (string-match-p "write \\.\\.\\." (buffer-string)))
@@ -14539,6 +14541,409 @@ Content lines — even those starting with ``` — are preserved."
   (pilish-test--tool-content-lines-from-stream
    (pilish-test--tool-stream-body-by-id tool-call-id)))
 
+;; ── Coalesced raw toolcall argument deltas ─────────────────────────
+
+(defun pilish-test--send-raw-toolcall-delta (content-index delta)
+  "Send raw argument JSON DELTA for CONTENT-INDEX."
+  (pilish-test--send-assistant-message-update
+   `(:type "toolcall_delta" :contentIndex ,content-index :delta ,delta)))
+
+(defun pilish-test--toolcall-stream-snapshots (tool-name chunks args synchronous)
+  "Return preview and final text for TOOL-NAME streamed in CHUNKS with ARGS.
+SYNCHRONOUS feeds and paints each delta with the current assembler and renderer."
+  (pilish-test--with-streaming-assistant
+    (pilish-test--send-assistant-message-update
+     `(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName ,tool-name))
+    (dolist (chunk chunks)
+      (if synchronous
+          (let ((stream (gethash 0 pilish--toolcall-streams)))
+            (pilish--toolcall-stream-feed stream chunk)
+            (pilish--render-toolcall-stream stream "toolcall_delta"))
+        (pilish-test--send-raw-toolcall-delta 0 chunk)))
+    (pilish--flush-stream-deltas)
+    (let ((preview (buffer-substring-no-properties (point-min) (point-max))))
+      (pilish-test--send-assistant-message-update
+       `(:type "toolcall_end" :contentIndex 0
+         :toolCall ,(pilish-test--toolcall "call_1" tool-name args)))
+      (font-lock-ensure (point-min) (point-max))
+      (list preview (buffer-substring-no-properties (point-min) (point-max))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-feeds-without-painting ()
+  "All four built-in tools assemble every delta but paint once per flush."
+  (dolist (fixture
+           '(("bash" ("{\"command\":\"echo " "alpha " "bravo\"}")
+              :command "echo alpha bravo")
+             ("read" ("{\"path\":\"/tmp/" "alpha" ".txt\"}")
+              :path "/tmp/alpha.txt")
+             ("edit" ("{\"path\":\"/tmp/" "alpha" ".py\"}")
+              :path "/tmp/alpha.py")
+             ("write" ("{\"path\":\"/tmp/alpha.py\",\"content\":\"" "one\\n" "two\\n\"}")
+              :path "/tmp/alpha.py" :content "one\ntwo\n")))
+    (ert-info ((car fixture))
+      (pilish-test--with-streaming-assistant
+        (pilish-test--send-assistant-message-update
+         `(:type "toolcall_start" :contentIndex 0 :id "call_1"
+           :toolName ,(car fixture)))
+        (let ((original (symbol-function 'pilish--render-toolcall-stream))
+              (paints 0)
+              (before (buffer-string)))
+          (cl-letf (((symbol-function 'pilish--render-toolcall-stream)
+                     (lambda (&rest args)
+                       (cl-incf paints)
+                       (apply original args))))
+            (dolist (chunk (cadr fixture))
+              (pilish-test--send-raw-toolcall-delta 0 chunk))
+            (should (= paints 0))
+            (should (equal before (buffer-string)))
+            (should (equal (cddr fixture)
+                           (pilish--tool-stream-arguments
+                            (gethash 0 pilish--toolcall-streams))))
+            (should (timerp pilish--stream-delta-flush-timer))
+            (pilish--flush-stream-deltas)
+            (should (= paints 1))
+            (should-not (equal before (buffer-string)))
+            (pilish--flush-stream-deltas)
+            (should (= paints 1)))
+          (should-not pilish--pending-stream-deltas)
+          (should-not pilish--stream-delta-flush-timer))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-timer-paints ()
+  "Toolcall paints use the existing one-shot streaming flush timer."
+  (pilish-test--with-streaming-assistant
+    (let ((pilish--stream-delta-render-interval 0.001))
+      (pilish-test--send-assistant-message-update
+       '(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName "bash"))
+      (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"timer-painted\"}")
+      (should (equal "$ ..." (pilish-test--tool-header-by-id "call_1")))
+      (sit-for 0.05)
+      (should (equal "$ timer-painted" (pilish-test--tool-header-by-id "call_1")))
+      (should-not pilish--pending-stream-deltas)
+      (should-not pilish--stream-delta-flush-timer))))
+
+(ert-deftest pilish-test-toolcall-coalescing-matches-synchronous-content ()
+  "Synchronous and coalesced painting produce identical preview and final text."
+  (dolist (fixture
+           '(("bash" ("{\"command\":\"echo ``` " "[ref]: " "caf\\u00" "e9\"}")
+              (:command "echo ``` [ref]: café"))
+             ("read" ("{\"path\":\"src/" "main.py\"}") (:path "src/main.py"))
+             ("edit" ("{\"path\":\"src/" "main.py\",\"oldText\":\"old\","
+                       "\"newText\":\"new\\n\"}")
+              (:path "src/main.py" :oldText "old" :newText "new\n"))
+             ;; Late path changes the already assembled body's fence language.
+             ("write" ("{\"content\":\"first\\n" "```\\n[ref]: target\\n" "last"
+                        "\",\"path\":\"src/main.py\"}")
+              (:path "src/main.py" :content "first\n```\n[ref]: target\nlast"))
+             ;; Duplicate keys must clear a stale/truncated fenced body.
+             ("write" ("{\"path\":\"src/main.py\",\"content\":\"old\\n" "\","
+                        "\"content\":null}")
+              (:path "src/main.py" :content :json-null))))
+    (ert-info ((car fixture))
+      (should (equal (apply #'pilish-test--toolcall-stream-snapshots
+                           (append fixture '(t)))
+                     (apply #'pilish-test--toolcall-stream-snapshots
+                            (append fixture '(nil))))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-retains-last-paintable-write-tail ()
+  "Partial lines cannot evict the completed write preview before its paint."
+  (let* ((pilish-preview-max-bytes 20)
+         (long-line (make-string 30 ?a))
+         (partial-line (make-string 25 ?x))
+         (prefix (concat "{\"path\":\"file.el\",\"content\":\"" long-line "\\n"))
+         (args (list :path "file.el" :content (concat long-line "\nB\n" partial-line)))
+         (chunks (list prefix "B\\n" partial-line))
+         (expected (pilish-test--toolcall-stream-snapshots "write" chunks args t)))
+    (should (string-match-p "\nB\n" (car expected)))
+    (should (equal expected
+                   (pilish-test--toolcall-stream-snapshots "write" chunks args nil)))
+    ;; For a single delta or a redraw forced by a late path, synchronous painting
+    ;; uses that delta's final raw tail even if it has lost the complete lines.
+    (dolist (chunks (list (list prefix (concat "B\\n" partial-line))
+                         (list (concat "{\"content\":\"" long-line "\\n")
+                               "B\\n" partial-line "\",\"path\":\"file.el\"}")))
+      (should (equal (pilish-test--toolcall-stream-snapshots "write" chunks args t)
+                     (pilish-test--toolcall-stream-snapshots "write" chunks args nil))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-keeps-text-order ()
+  "Interleaved text and argument deltas retain their visible stream order."
+  (pilish-test--with-streaming-assistant
+    (pilish-test--send-text-delta "before tool")
+    (pilish-test--send-assistant-message-update
+     '(:type "toolcall_start" :contentIndex 1 :id "call_1" :toolName "bash"))
+    (pilish-test--send-raw-toolcall-delta 1 "{\"command\":\"echo ")
+    (pilish-test--send-text-delta "after alpha ")
+    (pilish-test--send-raw-toolcall-delta 1 "done\"}")
+    (pilish-test--send-text-delta "after bravo")
+    (should-not (string-match-p "after alpha" (buffer-string)))
+    (pilish--flush-stream-deltas)
+    (let* ((text (buffer-substring-no-properties (point-min) (point-max)))
+           (before (string-search "before tool" text))
+           (tool (string-search "$ echo done" text))
+           (after (string-search "after alpha after bravo" text)))
+      (should (numberp before))
+      (should (numberp tool))
+      (should (numberp after))
+      (should (< before tool after))
+      (should (= 1 (pilish-test--count-matches "echo done" text))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-interleaving-matches-synchronous-paints ()
+  "Synchronous and coalesced painting match for interleaved text and tool previews."
+  (cl-labels
+      ((render-stream
+        (tool-name chunks synchronous)
+        (pilish-test--with-streaming-assistant
+          (pilish-test--send-text-delta "before tool")
+          (pilish-test--send-assistant-message-update
+           `(:type "toolcall_start" :contentIndex 1 :id "call_1" :toolName ,tool-name))
+          (cl-loop for chunk in chunks for index from 0 do
+                   (if synchronous
+                       (let ((stream (gethash 1 pilish--toolcall-streams)))
+                         (pilish--toolcall-stream-feed stream chunk)
+                         (pilish--render-toolcall-stream stream "toolcall_delta"))
+                     (pilish-test--send-raw-toolcall-delta 1 chunk))
+                   (pilish-test--send-text-delta (format "after-%d\n" index))
+                   (when synchronous (pilish--flush-stream-deltas)))
+          (pilish--flush-stream-deltas)
+          (buffer-substring-no-properties (point-min) (point-max)))))
+    (dolist (fixture
+             '(("bash" ("{\"command\":\"echo " "done\"}"))
+               ("read" ("{\"path\":\"src/" "main.el\"}"))
+               ("edit" ("{\"path\":\"src/" "main.el\",\"newText\":\"new\\n\"}"))
+               ("write" ("{\"path\":\"src/main.el\",\"content\":\"one\\n" "two\\n\"}"))))
+      (ert-info ((car fixture))
+        (should (equal (render-stream (car fixture) (cadr fixture) t)
+                       (render-stream (car fixture) (cadr fixture) nil)))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-end-is-authoritative ()
+  "toolcall_end immediately replaces queued command and write-body previews."
+  (dolist (tool-name '("bash" "write"))
+    (pilish-test--with-streaming-assistant
+      (pilish-test--send-assistant-message-update
+       `(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName ,tool-name))
+      (pilish-test--send-raw-toolcall-delta
+       0 (if (equal tool-name "bash") "{\"command\":\"obsolete"
+           "{\"path\":\"old.py\",\"content\":\"obsolete\\n"))
+      (let ((timer pilish--stream-delta-flush-timer))
+        (should (timerp timer))
+        (pilish-test--send-assistant-message-update
+         `(:type "toolcall_end" :contentIndex 0
+           :toolCall ,(pilish-test--toolcall
+                       "call_1" tool-name
+                       (if (equal tool-name "bash") '(:command "final command")
+                         '(:path "final.py" :content "final line\npartial\n")))))
+        (should-not (memq timer timer-list)))
+      (should-not (string-match-p "obsolete" (buffer-string)))
+      (should-not pilish--pending-stream-deltas)
+      (should-not pilish--stream-delta-flush-timer)
+      (if (equal tool-name "bash")
+          (should (equal "$ final command" (pilish-test--tool-header-by-id "call_1")))
+        (should (equal '("final line" "partial")
+                       (pilish-test--tool-content-lines-by-id "call_1")))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-execution-start-flushes ()
+  "Execution authority wins over a pending paint of its keyed preview."
+  (pilish-test--with-streaming-assistant
+    (pilish-test--send-assistant-message-update
+     '(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName "bash"))
+    (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"early")
+    (pilish-test--send-assistant-message-update
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "call_1" :name "bash"
+                  :arguments (:command "early"))))
+    ;; Keep the existing stream ownership until message_end; a delayed delta
+    ;; must not repaint over execution's authoritative arguments afterwards.
+    (pilish-test--send-raw-toolcall-delta 0 " delayed")
+    (let ((preview (pilish-test--tool-block-overlay-by-id "call_1")))
+      (should (timerp pilish--stream-delta-flush-timer))
+      (pilish--handle-display-event
+       '(:type "tool_execution_start" :toolCallId "call_1" :toolName "bash"
+         :args (:command "executing")))
+      (should (eq preview (pilish-test--tool-block-overlay-by-id "call_1")))
+      (should (equal "$ executing" (pilish-test--tool-header-by-id "call_1")))
+      (pilish--flush-stream-deltas)
+      (should (equal "$ executing" (pilish-test--tool-header-by-id "call_1")))
+      (should-not pilish--pending-stream-deltas)
+      (should-not pilish--stream-delta-flush-timer))))
+
+(ert-deftest pilish-test-toolcall-coalescing-blocks-are-independent ()
+  "Each indexed toolcall paints once, even when provisional IDs collide."
+  (pilish-test--with-streaming-assistant
+    (dolist (index '(0 1))
+      (pilish-test--send-assistant-message-update
+       `(:type "toolcall_start" :contentIndex ,index :id "duplicate" :toolName "write")))
+    (let ((original (symbol-function 'pilish--render-toolcall-stream)) paints)
+      (cl-letf (((symbol-function 'pilish--render-toolcall-stream)
+                 (lambda (stream event-type)
+                   (push (pilish--tool-stream-content-index stream) paints)
+                   (funcall original stream event-type))))
+        (pilish-test--send-raw-toolcall-delta
+         0 "{\"path\":\"a.py\",\"content\":\"alpha")
+        (pilish-test--send-raw-toolcall-delta
+         1 "{\"path\":\"b.py\",\"content\":\"bravo\\n\"}")
+        (pilish-test--send-raw-toolcall-delta 0 "\\n\"}")
+        (should-not paints)
+        (pilish--flush-stream-deltas)
+        (should (equal '(0 1) (nreverse paints)))
+        (let* ((first (pilish--tool-stream-block (gethash 0 pilish--toolcall-streams)))
+               (second (pilish--tool-stream-block (gethash 1 pilish--toolcall-streams)))
+               (first-overlay (pilish--tool-block-overlay first))
+               (second-overlay (pilish--tool-block-overlay second)))
+          (should (equal "write a.py" (pilish-test--tool-header-from-overlay first-overlay)))
+          (should (equal "write b.py" (pilish-test--tool-header-from-overlay second-overlay)))
+          (should (string-match-p "alpha" (pilish-test--tool-stream-body-from-overlay first-overlay)))
+          (should (string-match-p "bravo" (pilish-test--tool-stream-body-from-overlay second-overlay)))
+          (should (< (overlay-start first-overlay) (overlay-start second-overlay))))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-suspends-every-paint ()
+  "Starts, timer paints, final body rewrites and execution suspend stale hooks."
+  (pilish-test--assert-md-ts-04-change-hook-capabilities)
+  (pilish-test--with-streaming-assistant
+    (let ((original (symbol-function 'md-ts--font-lock-record-stale-side-effect-bounds))
+          (before before-change-functions)
+          (after after-change-functions)
+          (stale-calls 0))
+      (cl-letf (((symbol-function 'md-ts--font-lock-record-stale-side-effect-bounds)
+                 (lambda (&rest args)
+                   (cl-incf stale-calls)
+                   (apply original args))))
+        (pilish-test--send-assistant-message-update
+         '(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName "write"))
+        (pilish-test--send-raw-toolcall-delta
+         0 "{\"path\":\"a.py\",\"content\":\"first\\n")
+        (pilish--flush-stream-deltas)
+        (pilish-test--send-raw-toolcall-delta 0 "second\\n")
+        (pilish--flush-stream-deltas)
+        (should (equal '("first" "second") (pilish-test--tool-content-lines-by-id "call_1")))
+        ;; Changing write to edit must remove the old fenced body immediately.
+        (pilish-test--send-assistant-message-update
+         '(:type "toolcall_end" :contentIndex 0
+           :toolCall (:type "toolCall" :id "call_1" :name "edit"
+                      :arguments (:path "b.py" :oldText "old" :newText "new"))))
+        (should (string-empty-p (string-trim (pilish-test--tool-stream-body-by-id "call_1"))))
+        (pilish--handle-display-event
+         '(:type "tool_execution_start" :toolCallId "call_1" :toolName "edit"
+           :args (:path "final.py" :oldText "old" :newText "new"))))
+      (should (= stale-calls 0))
+      (should (equal before before-change-functions))
+      (should (equal after after-change-functions))
+      (should (memq 'md-ts--font-lock-record-dirty-side-effect-bounds before-change-functions))
+      (should (memq 'md-ts--before-change-check-link-reference-definition before-change-functions))
+      (should (memq 'md-ts--after-change-flush-link-reference-links after-change-functions)))))
+
+(ert-deftest pilish-test-toolcall-coalescing-suspends-preview-removal ()
+  "Replacing a start and pruning final previews suspend destructive deletions."
+  (pilish-test--with-streaming-assistant
+    (let ((original (symbol-function 'md-ts--font-lock-record-stale-side-effect-bounds))
+          (stale-calls 0))
+      (cl-letf (((symbol-function 'md-ts--font-lock-record-stale-side-effect-bounds)
+                 (lambda (&rest args)
+                   (cl-incf stale-calls)
+                   (apply original args))))
+        (pilish-test--send-assistant-message-update
+         '(:type "toolcall_start" :contentIndex 0 :id "old" :toolName "write"))
+        (pilish-test--send-raw-toolcall-delta 0 "{\"content\":\"obsolete\\n\"}")
+        (let ((old-overlay (pilish-test--tool-block-overlay-by-id "old")))
+          (pilish-test--send-assistant-message-update
+           '(:type "toolcall_start" :contentIndex 0 :id "new" :toolName "write"))
+          (should-not (overlay-buffer old-overlay)))
+        (let ((new-overlay (pilish-test--tool-block-overlay-by-id "new")))
+          (pilish--handle-display-event
+           '(:type "message_end" :message (:role "assistant" :content [])))
+          (should-not (overlay-buffer new-overlay))))
+      (should (= stale-calls 0))
+      (should-not (string-match-p "obsolete" (buffer-string)))
+      (should-not (pilish-test--all-tool-overlays)))))
+
+(ert-deftest pilish-test-toolcall-coalescing-paint-error-clears-all-flags ()
+  "A failed paint discards the staged batch without wedging either stream."
+  (pilish-test--with-streaming-assistant
+    (dolist (index '(0 1))
+      (pilish-test--send-assistant-message-update
+       `(:type "toolcall_start" :contentIndex ,index
+         :id ,(format "call_%d" index) :toolName "bash")))
+    (dolist (index '(0 1))
+      (pilish-test--send-raw-toolcall-delta
+       index (format "{\"command\":\"command %d" index)))
+    (let (diagnostics)
+      (cl-letf (((symbol-function 'pilish--render-toolcall-stream)
+                 (lambda (&rest _) (error "tool paint")))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) diagnostics))))
+        (pilish--flush-stream-deltas))
+      (should (equal diagnostics '("pilish: stream delta flush failed: tool paint"))))
+    (should-not pilish--pending-stream-deltas)
+    (should-not pilish--stream-delta-flush-timer)
+    (dolist (index '(0 1))
+      (pilish-test--send-raw-toolcall-delta index " repainted\"}"))
+    (pilish--flush-stream-deltas)
+    (should (equal "$ command 0 repainted" (pilish-test--tool-header-by-id "call_0")))
+    (should (equal "$ command 1 repainted" (pilish-test--tool-header-by-id "call_1")))))
+
+(ert-deftest pilish-test-toolcall-coalescing-abort-clears-pending-paints ()
+  "Abort flushes the old preview and cannot leak its paint into a new run."
+  (pilish-test--with-streaming-assistant
+    (pilish-test--send-assistant-message-update
+     '(:type "toolcall_start" :contentIndex 0 :id "old" :toolName "bash"))
+    (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"old command")
+    (let ((timer pilish--stream-delta-flush-timer))
+      (should (timerp timer))
+      (setq pilish--aborted t)
+      (pilish--handle-display-event '(:type "agent_end"))
+      (should-not (memq timer timer-list)))
+    (should-not pilish--pending-stream-deltas)
+    (should-not pilish--stream-delta-flush-timer)
+    (should (= 0 (hash-table-count pilish--toolcall-streams)))
+    (pilish--handle-display-event '(:type "agent_settled"))
+    (pilish--handle-display-event '(:type "agent_start"))
+    (pilish--handle-display-event '(:type "message_start" :message (:role "assistant")))
+    (pilish-test--send-assistant-message-update
+     '(:type "toolcall_start" :contentIndex 0 :id "new" :toolName "bash"))
+    (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"new command\"}")
+    (pilish--flush-stream-deltas)
+    (should (equal "$ new command" (pilish-test--tool-header-by-id "new")))
+    (should (= 1 (pilish-test--count-matches "old command" (buffer-string))))))
+
+(ert-deftest pilish-test-toolcall-coalescing-reset-discards-paint ()
+  "Session/history reset cancels the shared timer and drops old tool paints."
+  (pilish-test--with-streaming-assistant
+    (pilish-test--send-assistant-message-update
+     '(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName "write"))
+    (pilish-test--send-raw-toolcall-delta 0 "{\"content\":\"obsolete\\n")
+    (let ((timer pilish--stream-delta-flush-timer))
+      (should (timerp timer))
+      (pilish--clear-render-artifacts)
+      (should-not (memq timer timer-list)))
+    (pilish--flush-stream-deltas)
+    (should-not (string-match-p "obsolete" (buffer-string)))
+    (should-not pilish--pending-stream-deltas)
+    (should-not pilish--stream-delta-flush-timer)
+    (should (= 0 (hash-table-count pilish--toolcall-streams)))))
+
+(ert-deftest pilish-test-toolcall-coalescing-kill-clears-paint-flag ()
+  "Killing a chat buffer cancels the shared timer and clears its toolcall flag."
+  ;; Temporary buffers inhibit kill-buffer-hook; use a real buffer here.
+  (let ((buf (generate-new-buffer "*pilish-test-toolcall-kill*"))
+        (pilish-quit-without-confirmation t)
+        stream timer)
+    (unwind-protect
+        (with-current-buffer buf
+          (pilish-chat-mode)
+          (pilish--handle-display-event '(:type "agent_start"))
+          (pilish--handle-display-event
+           '(:type "message_start" :message (:role "assistant")))
+          (pilish-test--send-assistant-message-update
+           '(:type "toolcall_start" :contentIndex 0 :id "call_1" :toolName "bash"))
+          (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"queued")
+          (setq stream (gethash 0 pilish--toolcall-streams)
+                timer pilish--stream-delta-flush-timer)
+          (should (timerp timer))
+          (should (pilish--tool-stream-paint-pending-p stream))
+          (kill-buffer buf)
+          (should-not (memq timer timer-list))
+          (should-not (pilish--tool-stream-paint-pending-p stream)))
+      (when (buffer-live-p buf)
+        (kill-buffer buf)))))
+
 (ert-deftest pilish-test-toolcall-start-after-text-has-blank-line ()
   "toolcall_start after text delta without trailing newline has proper spacing."
   (with-temp-buffer
@@ -14555,6 +14960,7 @@ Content lines — even those starting with ``` — are preserved."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 1
        :delta "{\"command\":\"ls\"}"))
+    (pilish--flush-stream-deltas)
     ;; Must have blank line between text and tool header.
     (should (string-match-p "check\\.\n\n\\$ ls" (buffer-string)))))
 
@@ -14568,6 +14974,7 @@ Content lines — even those starting with ``` — are preserved."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "{\"path\":\"/tmp/foo.py"))
+    (pilish--flush-stream-deltas)
     (should (string-match-p "read /tmp/foo\\.py" (buffer-string)))
     (should-not (overlay-get pilish--pending-tool-overlay
                              'pilish-tool-path))
@@ -15247,6 +15654,7 @@ Multiple deltas should replace the preview instead of appending forever."
       (pilish-test--send-assistant-message-update
        '(:type "toolcall_delta" :contentIndex 0
          :delta "content\\n\"}"))
+      (pilish--flush-stream-deltas)
       (should (eq preview
                   (pilish-test--tool-block-overlay-by-id "call_1")))
       (should (equal "write /tmp/foo.py"
@@ -15312,6 +15720,7 @@ Multiple deltas should replace the preview instead of appending forever."
          :delta "{\"path\":\"/tmp/b.py\",\"content\":\"bravo\\n\"}"))
       (pilish-test--send-assistant-message-update
        '(:type "toolcall_delta" :contentIndex 1 :delta "\\n\"}"))
+      (pilish--flush-stream-deltas)
       (should (eq first
                   (pilish-test--tool-block-overlay-by-id "call_a")))
       (should (eq second
@@ -15373,6 +15782,7 @@ Multiple deltas should replace the preview instead of appending forever."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "\\uDE00\\n\"}"))
+    (pilish--flush-stream-deltas)
     (should (equal "write src/main.py"
                    (pilish-test--tool-header-by-id "call_1")))
     (should (equal '("café 😀")
@@ -15389,6 +15799,7 @@ Multiple deltas should replace the preview instead of appending forever."
       (pilish-test--send-assistant-message-update
        `(:type "toolcall_delta" :contentIndex 0
          :delta ,(concat "{\"path\":\"" path "\"}")))
+      (pilish--flush-stream-deltas)
       (should (equal (concat "read " path)
                      (pilish-test--tool-header-by-id "call_1"))))))
 
@@ -15404,6 +15815,7 @@ Multiple deltas should replace the preview instead of appending forever."
          :delta ,(concat "{\"content\":\""
                          (make-string 80 ?x)
                          "TAIL\\n\"}")))
+      (pilish--flush-stream-deltas)
       (let ((body (pilish-test--tool-stream-body-by-id "call_1")))
         (should (string-match-p "TAIL" body))
         (should (string-match-p "earlier output" body))
@@ -15418,10 +15830,12 @@ Multiple deltas should replace the preview instead of appending forever."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "{\"content\":\"value = 1\\n\","))
+    (pilish--flush-stream-deltas)
     (should-not (string-match-p "```python" (buffer-string)))
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "\"path\":\"/tmp/value.py\"}"))
+    (pilish--flush-stream-deltas)
     (should (equal "write /tmp/value.py"
                    (pilish-test--tool-header-by-id "call_1")))
     (should (string-match-p "```python" (buffer-string)))
@@ -15438,6 +15852,7 @@ Multiple deltas should replace the preview instead of appending forever."
        `(:type "toolcall_delta" :contentIndex 0
          :delta ,(concat "{\"content\":\"" (make-string 40 ?x)
                          "\\n\",\"content\":\"ok\\n\"}")))
+      (pilish--flush-stream-deltas)
       (let ((body (pilish-test--tool-stream-body-by-id "call_1")))
         (should (string-match-p "ok" body))
         (should-not (string-match-p "earlier output" body))))))
@@ -15451,6 +15866,7 @@ Multiple deltas should replace the preview instead of appending forever."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "{\"path\":\"/tmp/stale\",\"path\":null}"))
+    (pilish--flush-stream-deltas)
     (should (equal "read ..."
                    (pilish-test--tool-header-by-id "call_1")))))
 
@@ -15490,6 +15906,7 @@ Multiple deltas should replace the preview instead of appending forever."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "{\"path\":\"/tmp/file.txt\",\"content\":\"stale\\n\"}"))
+    (pilish--flush-stream-deltas)
     (let ((preview (pilish-test--tool-block-overlay-by-id "call_1")))
       (should (equal '("stale")
                      (pilish-test--tool-content-lines-by-id "call_1")))
@@ -15522,6 +15939,7 @@ Multiple deltas should replace the preview instead of appending forever."
       (pilish-test--send-assistant-message-update
        '(:type "toolcall_delta" :contentIndex 1
          :delta "{\"path\":\"/tmp/b.py\"}"))
+      (pilish--flush-stream-deltas)
       (should (equal "write /tmp/a.py"
                      (pilish-test--tool-header-from-overlay first)))
       (should (equal "write /tmp/b.py"
@@ -15770,8 +16188,15 @@ Multiple deltas should replace the preview instead of appending forever."
              :id "" :toolName "read"))
           (let ((overlays (pilish-test--all-tool-overlays)))
             (should (= 2 (length overlays)))
+            (pilish-test--send-raw-toolcall-delta
+             0 "{\"path\":\"/tmp/residual.txt\"}")
+            (should (timerp pilish--stream-delta-flush-timer))
             (pilish--mark-process-exited
              process '(:error "Process exited" :exitCode 1))
+            (should (equal "read /tmp/residual.txt"
+                           (pilish-test--tool-header-from-overlay (car overlays))))
+            (should-not pilish--pending-stream-deltas)
+            (should-not pilish--stream-delta-flush-timer)
             (dolist (overlay overlays)
               (should (eq (overlay-get overlay 'face)
                           'pilish-tool-block-error)))
@@ -15909,6 +16334,7 @@ banner just because it was still queued when the process died."
     (pilish-test--send-assistant-message-update
      '(:type "toolcall_delta" :contentIndex 0
        :delta "{\"path\":\"/tmp/new.py\",\"content\":\"new\\n\"}"))
+    (pilish--flush-stream-deltas)
     (should (equal "write /tmp/new.py"
                    (pilish-test--tool-header-by-id "call_2")))
     (should (equal '("new")
@@ -16481,6 +16907,7 @@ Commands with embedded newlines should not have any lines deleted."
                             (:type "toolcall_delta" :contentIndex 2
                              :delta "{\"path\":\"/tmp/continued.txt\"}")))
             (pilish-test--send-assistant-message-update update))
+          (pilish--flush-stream-deltas)
           (should (equal shown-message "Pi: Compacted from 1,000 tokens"))
           (should (= 2 (pilish-test--count-matches
                         "^Assistant\n=+" (buffer-string))))

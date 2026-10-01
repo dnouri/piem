@@ -41,6 +41,7 @@ def config_from_env() -> Json:
         "thinking_deltas": env_int("PI_SD_BENCH_THINKING_DELTAS", 80),
         "thinking_burst": env_int("PI_SD_BENCH_THINKING_BURST", 20),
         "backlog_deltas": env_int("PI_SD_BENCH_BACKLOG_DELTAS", 300),
+        "toolcall_repeats": env_int("PI_SD_BENCH_TOOLCALL_REPEATS", 0),
         "burst_pause_ms": env_int("PI_SD_BENCH_BURST_PAUSE_MS", 80),
         "seed": env_int("PI_SD_BENCH_SEED", 20240817),
     }
@@ -222,12 +223,34 @@ def run_stream(
     backlog = "".join(
         backlog_line(index, seed) for index in range(backlog_count)
     )
+    toolcall_repeats = int(config["toolcall_repeats"])
+    command = "echo SD-BOUNDARY-TOOL"
+    if toolcall_repeats:
+        command += "; " + "".join(
+            f"echo SD-CMD-{index:04d}; " for index in range(toolcall_repeats)
+        )
     tool_call: Json = {
         "type": "toolCall",
         "id": "call-stream-boundary",
         "name": "bash",
-        "arguments": {"command": "echo SD-BOUNDARY-TOOL"},
+        "arguments": {"command": command},
     }
+    raw_args = json.dumps(tool_call["arguments"], separators=(",", ":"))
+    chunks = (
+        [raw_args[start : start + 32] for start in range(0, len(raw_args), 32)]
+        if toolcall_repeats else [raw_args]
+    )
+    tool_deltas = [
+        message_update(
+            {"type": "toolcall_delta", "contentIndex": 3, "delta": chunk},
+            phase="timer-toolcall" if toolcall_repeats else "tool-boundary",
+        )
+        for chunk in chunks
+    ]
+    tool_end = message_update(
+        {"type": "toolcall_end", "contentIndex": 3, "toolCall": tool_call},
+        phase="tool-boundary",
+    )
     final_message: Json = {
         "role": "assistant",
         "content": [
@@ -350,33 +373,22 @@ def run_stream(
                 },
                 phase="tool-boundary",
             ),
-            message_update(
-                {
-                    "type": "toolcall_delta",
-                    "contentIndex": 3,
-                    "delta": json.dumps(
-                        tool_call["arguments"], separators=(",", ":")
-                    ),
-                },
-                phase="tool-boundary",
-            ),
-            message_update(
-                {
-                    "type": "toolcall_end",
-                    "contentIndex": 3,
-                    "toolCall": tool_call,
-                },
-                phase="tool-boundary",
-            ),
-            {
-                "type": "benchmark_backlog_complete",
-                "benchmarkMarker": "SD-BACKLOG-COMPLETE-CONTROL",
-                "benchmarkPhase": "backlog-control",
-            },
         ]
+    )
+    if not toolcall_repeats:
+        backlog_payloads.extend([*tool_deltas, tool_end])
+    backlog_payloads.append(
+        {
+            "type": "benchmark_backlog_complete",
+            "benchmarkMarker": "SD-BACKLOG-COMPLETE-CONTROL",
+            "benchmarkPhase": "backlog-control",
+        }
     )
     write_payloads(backlog_payloads)
     time.sleep(0.1)
+    if toolcall_repeats:
+        emit_bursts(tool_deltas, int(config["text_burst"]), pause_ms)
+        write_payload(tool_end)
 
     write_payload(
         {
@@ -402,6 +414,7 @@ def run_stream(
             "event": "stream-complete",
             "textDeltas": timer_count + backlog_count,
             "thinkingDeltas": thinking_count,
+            "toolcallDeltas": len(chunks),
             "backlogDeltas": backlog_count,
         },
     )

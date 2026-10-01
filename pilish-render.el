@@ -88,6 +88,32 @@ current message with tree-sitter.  Most assistant text is not table content, so
 we track whether a pipe has appeared since the last decoration attempt and skip
 the query when no table can be present.")
 
+(cl-defstruct (pilish--toolcall-stream
+               (:conc-name pilish--tool-stream-)
+               (:constructor pilish--make-toolcall-stream))
+  "Incremental preview state for one streamed tool call."
+  content-index
+  tool-call-id
+  tool-name
+  block
+  arguments
+  rendered-header-key
+  paint-pending-p
+  content-render-p
+  ;; Last bounded write value that would repaint synchronously.  Partial-only
+  ;; deltas may evict complete lines before painting without replacing it.
+  content-to-render
+  content-truncated
+  (depth 0)
+  (root-state 'root)
+  string-role
+  (string-value "")
+  current-key
+  escape-state
+  (unicode-value 0)
+  (unicode-digits 0)
+  high-surrogate)
+
 (defvar-local pilish--toolcall-streams nil
   "Tool-call generation state keyed by assistant content index.
 Pi's RPC protocol streams raw argument JSON deltas without a cumulative
@@ -96,17 +122,18 @@ is being generated; completed tool execution remains keyed separately by tool
 call ID in `pilish--live-tool-blocks'.")
 
 (defconst pilish--stream-delta-render-interval 0.05
-  "Seconds between coalesced renders of streamed text and thinking deltas.
+  "Seconds between coalesced text, thinking and toolcall paints.
 Pi emits one `message_update' per streamed token.  Rendering every token
 multiplies markdown/tree-sitter change-hook work by the token rate and grows
-quadratically with message size.  Pending deltas are concatenated and inserted
-at this cadence, and flushed before any non-delta event, so display order stays
-authoritative.  Internal constant, not a user option.")
+quadratically with message size.  Pending text is concatenated and toolcall
+previews are painted at this cadence, and flushed before any non-delta event,
+so display order stays authoritative.  Internal constant, not a user option.")
 
 (defvar-local pilish--pending-stream-deltas nil
-  "Reversed list of (KIND . STRING) streaming deltas awaiting rendering.
-KIND is `text' or `thinking'.  Consecutive entries with the same kind are
-concatenated at flush time.")
+  "Reversed list of (KIND . VALUE) streaming updates awaiting rendering.
+KIND is `text' or `thinking' with a string VALUE, or `toolcall' with a stream
+record VALUE.  Consecutive same-kind text entries are concatenated at flush
+time; each toolcall stream has at most one queued paint.")
 
 (defvar-local pilish--stream-delta-flush-timer nil
   "The one pending one-shot streaming delta flush timer, or nil.")
@@ -771,12 +798,13 @@ CONTENT is ignored - we use what was already streamed."
                 pos replacements)))))))))
 
 (defun pilish--stream-delta-kind (event)
-  "Return `text', `thinking', or nil for a renderable streaming EVENT.
+  "Return `text', `thinking', `toolcall', or nil for streaming EVENT.
 Single source of truth for the delta kinds the coalescer understands."
   (when (equal (plist-get event :type) "message_update")
     (pcase (plist-get (plist-get event :assistantMessageEvent) :type)
       ("text_delta" 'text)
-      ("thinking_delta" 'thinking))))
+      ("thinking_delta" 'thinking)
+      ("toolcall_delta" 'toolcall))))
 
 (defun pilish--schedule-stream-delta-flush ()
   "Arm the one-shot streaming delta flush timer for the current buffer."
@@ -786,18 +814,23 @@ Single source of truth for the delta kinds the coalescer understands."
                      (current-buffer))))
 
 (defun pilish--queue-stream-delta (kind delta)
-  "Queue streaming DELTA of KIND (`text' or `thinking') for rendering.
-DELTA may be a non-string value; it is normalized with
-`pilish--render-safe-string' so every queued entry is a string.
-Consecutive same-kind deltas are joined once at flush time so the renderer
-performs one markdown-changing insertion per kind run instead of one per token."
+  "Queue streaming DELTA of KIND for rendering.
+For `toolcall', DELTA is an incrementally assembled stream record; queue it
+only once per flush.  For `text' and `thinking', normalize non-string values
+with `pilish--render-safe-string' and join consecutive same-kind deltas once
+at flush time, avoiding one markdown-changing insertion per token."
   (when delta
-    (let ((delta (if (stringp delta) delta
-                   (pilish--render-safe-string delta))))
-      (unless (string-empty-p delta)
-        (push (cons kind delta) pilish--pending-stream-deltas)
-        (unless pilish--stream-delta-flush-timer
-          (pilish--schedule-stream-delta-flush))))))
+    (if (eq kind 'toolcall)
+        (unless (pilish--tool-stream-paint-pending-p delta)
+          (setf (pilish--tool-stream-paint-pending-p delta) t)
+          (push (cons kind delta) pilish--pending-stream-deltas))
+      (let ((delta (if (stringp delta) delta
+                     (pilish--render-safe-string delta))))
+        (unless (string-empty-p delta)
+          (push (cons kind delta) pilish--pending-stream-deltas))))
+    (when (and pilish--pending-stream-deltas
+               (not pilish--stream-delta-flush-timer))
+      (pilish--schedule-stream-delta-flush))))
 
 (defun pilish--flush-stream-deltas (&optional buffer)
   "Stage BUFFER's pending delta batch, clear flush state, then render it.
@@ -815,11 +848,11 @@ canonical history or reload is the recovery path."
       (with-current-buffer buffer
         (when (or pilish--pending-stream-deltas
                   pilish--stream-delta-flush-timer)
-          (when (timerp pilish--stream-delta-flush-timer)
-            (cancel-timer pilish--stream-delta-flush-timer))
-          (setq pilish--stream-delta-flush-timer nil)
-          (let ((pending (nreverse pilish--pending-stream-deltas)))
-            (setq pilish--pending-stream-deltas nil)
+          (let ((pending pilish--pending-stream-deltas))
+            ;; Own the batch before clearing timer, queue and per-stream flags.
+            ;; A failed paint must not leave any staged stream marked pending.
+            (pilish--cancel-stream-delta-flush)
+            (setq pending (nreverse pending))
             ;; Coalesced deltas still insert into a growing transcript.  Suspend
             ;; only the explicitly allowlisted stale-side-effect hook; jit-lock
             ;; plus md-ts's dirty-tick and reference-definition hooks remain for
@@ -828,17 +861,18 @@ canonical history or reload is the recovery path."
                 (pilish--with-md-ts-change-hooks-suspended
                     #'pilish--md-ts-expensive-change-hook-p
                   (while pending
-                    (let ((kind (car (car pending)))
-                          (chunks (list (cdr (car pending)))))
-                      (setq pending (cdr pending))
-                      (while (and pending (eq (car (car pending)) kind))
-                        (push (cdr (car pending)) chunks)
-                        (setq pending (cdr pending)))
-                      (let ((text (mapconcat #'identity (nreverse chunks) "")))
-                        (pcase kind
-                          ('text (pilish--display-message-delta text))
-                          ('thinking
-                           (pilish--display-thinking-delta text)))))))
+                    (if (eq (caar pending) 'toolcall)
+                        (pilish--render-toolcall-stream
+                         (cdr (pop pending)) "toolcall_delta")
+                      (let ((kind (caar pending))
+                            (chunks (list (cdr (pop pending)))))
+                        (while (and pending (eq (caar pending) kind))
+                          (push (cdr (pop pending)) chunks))
+                        (let ((text (mapconcat #'identity (nreverse chunks) "")))
+                          (pcase kind
+                            ('text (pilish--display-message-delta text))
+                            ('thinking
+                             (pilish--display-thinking-delta text))))))))
               (error
                (message "pilish: stream delta flush failed: %s"
                         (error-message-string err))
@@ -847,12 +881,15 @@ canonical history or reload is the recovery path."
 (defun pilish--cancel-stream-delta-flush ()
   "Cancel any armed streaming delta flush timer and drop pending deltas.
 Idempotent.  Used for buffer kill and render-artifact teardown during session
-or history reset.  Process exit does not call this discard helper: it first
-attempts `pilish--flush-stream-deltas',
-which leaves timer and queue state clear and, on failure, logs and discards the
-staged batch."
+or history reset.  `pilish--flush-stream-deltas' stages the batch before
+calling this helper, leaving timer, queue and per-stream flags clear even
+when rendering fails.  Process exit attempts that flush rather than dropping
+the unpainted batch."
   (when (timerp pilish--stream-delta-flush-timer)
     (cancel-timer pilish--stream-delta-flush-timer))
+  (dolist (entry pilish--pending-stream-deltas)
+    (when (eq (car entry) 'toolcall)
+      (setf (pilish--tool-stream-paint-pending-p (cdr entry)) nil)))
   (setq pilish--stream-delta-flush-timer nil
         pilish--pending-stream-deltas nil))
 
@@ -1404,7 +1441,7 @@ which asks upfront before any buffers are touched."
       (setq pilish--state
             (plist-put pilish--state :last-error error-msg))
       (unwind-protect
-          ;; Flush coalesced stream text first: it was produced before the exit,
+          ;; Flush coalesced stream paints first: produced before the exit,
           ;; so it must land before the exit banner rather than after it.
           (progn
             (pilish--flush-stream-deltas)
@@ -1472,7 +1509,7 @@ Updates buffer-local state and renders display updates."
         (pilish--set-aborted nil)
         (pilish--set-activity-phase "idle")
         (pilish--process-followup-queue))
-      (when delta-kind
+      (when (memq delta-kind '(text thinking))
         (when (eq delta-kind 'text)
           (pilish--set-activity-phase "replying"))
         (pilish--queue-stream-delta
@@ -1535,8 +1572,8 @@ Updates buffer-local state and renders display updates."
     ("message_update"
      (when-let* ((msg-event (plist-get event :assistantMessageEvent))
                  (event-type (plist-get msg-event :type)))
-       ;; Stream deltas were queued from the single classification above.
-       ;; Dispatch the remaining block events here.
+       ;; Text/thinking deltas were queued above.  Toolcall deltas still feed
+       ;; their incremental assembler here before queuing a preview paint.
        (pcase event-type
          ("text_start"
           (when pilish--hover-assistant
@@ -1596,24 +1633,26 @@ Updates buffer-local state and renders display updates."
          (pilish--apply-assistant-message-hover message duration))))
     ("tool_execution_start"
      (pilish--set-activity-phase "running")
-     (let* ((tool-call-id (plist-get event :toolCallId))
-            (args (plist-get event :args))
-            (block (pilish--tool-block-get tool-call-id)))
-       ;; Cache args for tool_execution_end (which doesn't include args)
-       (when (and tool-call-id pilish--tool-args-cache)
-         (puthash tool-call-id args pilish--tool-args-cache))
-       ;; Reuse the keyed preview block when it already exists.
-       (unless block
-         (setq block (pilish--display-tool-start
-                      (plist-get event :toolName) args tool-call-id)))
-       (pilish--tool-block-set-execution-start block hover-time)
-       ;; Update header and path from authoritative args.
-       ;; During streaming, the header may show placeholders since delta
-       ;; args can be partial.  Execution start carries the real args.
-       (pilish--display-tool-update-header
-        (plist-get event :toolName) args block)
-       (pilish--tool-block-sync-path-metadata
-        block (pilish--tool-arg-path args))))
+     (pilish--with-md-ts-change-hooks-suspended
+         #'pilish--md-ts-expensive-change-hook-p
+       (let* ((tool-call-id (plist-get event :toolCallId))
+              (args (plist-get event :args))
+              (block (pilish--tool-block-get tool-call-id)))
+         ;; Cache args for tool_execution_end (which doesn't include args)
+         (when (and tool-call-id pilish--tool-args-cache)
+           (puthash tool-call-id args pilish--tool-args-cache))
+         ;; Reuse the keyed preview block when it already exists.
+         (unless block
+           (setq block (pilish--display-tool-start
+                        (plist-get event :toolName) args tool-call-id)))
+         (pilish--tool-block-set-execution-start block hover-time)
+         ;; Update header and path from authoritative args.
+         ;; During streaming, the header may show placeholders since delta
+         ;; args can be partial.  Execution start carries the real args.
+         (pilish--display-tool-update-header
+          (plist-get event :toolName) args block)
+         (pilish--tool-block-sync-path-metadata
+          block (pilish--tool-arg-path args)))))
     ("tool_execution_end"
      (pilish--set-activity-phase "thinking")
      (let* ((tool-call-id (plist-get event :toolCallId))
@@ -1802,28 +1841,6 @@ overlays are left alone."
   image-previews
   execution-start
   help-echo)
-
-(cl-defstruct (pilish--toolcall-stream
-               (:conc-name pilish--tool-stream-)
-               (:constructor pilish--make-toolcall-stream))
-  "Incremental preview state for one streamed tool call."
-  content-index
-  tool-call-id
-  tool-name
-  block
-  arguments
-  rendered-header-key
-  content-render-p
-  content-truncated
-  (depth 0)
-  (root-state 'root)
-  string-role
-  (string-value "")
-  current-key
-  escape-state
-  (unicode-value 0)
-  (unicode-digits 0)
-  high-surrogate)
 
 (defun pilish--ensure-live-tool-blocks ()
   "Return the live tool block registry for the current buffer."
@@ -2672,7 +2689,9 @@ until an authoritative tool execution/history event supplies it."
        ((and previous-tool (eq (char-before start) ?\n))
         (setq delete-start (1- start))))
       (pilish--with-scroll-preservation
-        (delete-region delete-start delete-end))
+        (pilish--with-md-ts-change-hooks-suspended
+            #'pilish--md-ts-expensive-change-hook-p
+          (delete-region delete-start delete-end)))
       (delete-overlay ov)
       (when-let* ((header-end (pilish--tool-block-header-end block)))
         (set-marker header-end nil))
@@ -2810,7 +2829,16 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
             (make-hash-table :test 'eql))))
 
 (defun pilish--reset-toolcall-streams ()
-  "Discard raw tool-call generation state for the current message."
+  "Discard raw tool-call generation state and queued paints for this message."
+  (setq pilish--pending-stream-deltas
+        (seq-remove
+         (lambda (entry)
+           (when (eq (car entry) 'toolcall)
+             (setf (pilish--tool-stream-paint-pending-p (cdr entry)) nil)
+             t))
+         pilish--pending-stream-deltas))
+  (unless pilish--pending-stream-deltas
+    (pilish--cancel-stream-delta-flush))
   (when pilish--toolcall-streams
     (clrhash pilish--toolcall-streams)))
 
@@ -3087,7 +3115,11 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
   "Append raw argument JSON DELTA to STREAM's display-only preview state."
   (when (stringp delta)
     (let ((index 0)
-          (length (length delta)))
+          (length (length delta))
+          (pending-content (pilish--tool-stream-content-render-p stream))
+          (header-key (pilish--toolcall-stream-header-key stream)))
+      ;; Distinguish this delta's repaint trigger from an earlier queued one.
+      (setf (pilish--tool-stream-content-render-p stream) nil)
       (while (< index length)
         (if (and (pilish--tool-stream-string-role stream)
                  (null (pilish--tool-stream-escape-state stream)))
@@ -3109,9 +3141,22 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
             (if (pilish--tool-stream-string-role stream)
                 (pilish--toolcall-stream-feed-string-char stream char)
               (pilish--toolcall-stream-feed-structure-char stream char)))
-          (setq index (1+ index)))))
-    (when (eq (pilish--tool-stream-string-role stream) 'value)
-      (pilish--toolcall-stream-publish-value stream)))
+          (setq index (1+ index))))
+      (when (eq (pilish--tool-stream-string-role stream) 'value)
+        (pilish--toolcall-stream-publish-value stream))
+      (when (and (equal (pilish--tool-stream-tool-name stream) "write")
+                 (pilish--tool-arg-member
+                  (pilish--tool-stream-arguments stream) :content)
+                 (or (pilish--tool-stream-content-render-p stream)
+                     (not (equal header-key
+                                 (pilish--toolcall-stream-header-key stream)))))
+        ;; Keep the value at the last synchronous repaint boundary, not the
+        ;; raw tail after later partial-only deltas have rolled it away.
+        (setf (pilish--tool-stream-content-to-render stream)
+              (pilish--tool-arg-get (pilish--tool-stream-arguments stream) :content)
+              (pilish--tool-stream-content-render-p stream) t))
+      (setf (pilish--tool-stream-content-render-p stream)
+            (or pending-content (pilish--tool-stream-content-render-p stream)))))
   stream)
 
 (defun pilish--tool-name-p (tool-name)
@@ -3136,57 +3181,56 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
       (_ nil))))
 
 (defun pilish--render-toolcall-stream (stream _event-type)
-  "Render changed, visible parts of generation STREAM."
-  (when (pilish--tool-name-p
-         (pilish--tool-stream-tool-name stream))
-    (let* ((tool-name (pilish--tool-stream-tool-name stream))
-           (args (pilish--tool-stream-arguments stream))
-           (header-key (pilish--toolcall-stream-header-key stream))
-           (block (pilish--tool-stream-block stream)))
-      (unless block
-        ;; Generation identity is contentIndex, not a provider ID that may be
-        ;; empty, duplicated, or corrected at either authoritative end event.
-        (setq block
-              (pilish--display-tool-start
-               tool-name args nil
-               (pilish--tool-stream-content-index stream)
-               'streaming 'defer))
-        (setf (pilish--tool-stream-block stream) block
-              (pilish--tool-stream-rendered-header-key stream)
-              header-key))
-      (setq pilish--pending-tool-overlay
-            (pilish--tool-block-overlay block))
-      (unless (equal header-key
-                     (pilish--tool-stream-rendered-header-key
-                      stream))
-        (pilish--display-tool-update-header
-         tool-name args block 'streaming)
-        (setf (pilish--tool-stream-rendered-header-key stream)
-              header-key)
+  "Render changed, visible parts of generation STREAM.
+Suspend expensive md-ts hooks for immediate starts as well as queued paints."
+  (pilish--with-md-ts-change-hooks-suspended
+      #'pilish--md-ts-expensive-change-hook-p
+    (when (pilish--tool-name-p
+           (pilish--tool-stream-tool-name stream))
+      (let* ((tool-name (pilish--tool-stream-tool-name stream))
+             (args (pilish--tool-stream-arguments stream))
+             (header-key (pilish--toolcall-stream-header-key stream))
+             (block (pilish--tool-stream-block stream)))
+        (unless block
+          ;; Generation identity is contentIndex, not a provider ID that may be
+          ;; empty, duplicated, or corrected at either authoritative end event.
+          (setq block
+                (pilish--display-tool-start
+                 tool-name args nil
+                 (pilish--tool-stream-content-index stream)
+                 'streaming 'defer))
+          (setf (pilish--tool-stream-block stream) block
+                (pilish--tool-stream-rendered-header-key stream)
+                header-key))
+        (setq pilish--pending-tool-overlay
+              (pilish--tool-block-overlay block))
+        (unless (equal header-key
+                       (pilish--tool-stream-rendered-header-key
+                        stream))
+          (pilish--display-tool-update-header
+           tool-name args block 'streaming)
+          (setf (pilish--tool-stream-rendered-header-key stream)
+                header-key))
+        ;; The write preview displays complete lines only.  Avoid rewriting its
+        ;; fenced body for every token that merely extends a partial line.
         (when (and (equal tool-name "write")
-                   (pilish--tool-arg-member args :content))
-          (setf (pilish--tool-stream-content-render-p stream)
-                t)))
-      ;; The write preview displays complete lines only.  Avoid rewriting its
-      ;; fenced body for every token that merely extends a partial line.
-      (when (and (equal tool-name "write")
-                 (pilish--tool-arg-member args :content)
-                 (pilish--tool-stream-content-render-p stream))
-        (let* ((content (pilish--tool-arg-get args :content))
-               (complete-content
-                (pilish--toolcall-complete-content content)))
-          (if (stringp content)
-              (pilish--display-tool-streaming-text
-               (or complete-content "")
-               pilish-tool-preview-lines
-               (pilish--path-to-language
-                (pilish--tool-path-string
-                 (pilish--tool-arg-path args)))
-               block
-               (pilish--tool-stream-content-truncated stream))
-            (pilish--clear-toolcall-preview-body block))
-          (setf (pilish--tool-stream-content-render-p stream)
-                nil))))))
+                   (pilish--tool-arg-member args :content)
+                   (pilish--tool-stream-content-render-p stream))
+          (let* ((content (pilish--tool-stream-content-to-render stream))
+                 (complete-content
+                  (pilish--toolcall-complete-content content)))
+            (if (stringp content)
+                (pilish--display-tool-streaming-text
+                 (or complete-content "")
+                 pilish-tool-preview-lines
+                 (pilish--path-to-language
+                  (pilish--tool-path-string
+                   (pilish--tool-arg-path args)))
+                 block
+                 (pilish--tool-stream-content-truncated stream))
+              (pilish--clear-toolcall-preview-body block))
+            (setf (pilish--tool-stream-content-render-p stream) nil
+                  (pilish--tool-stream-content-to-render stream) nil)))))))
 
 (defun pilish--tool-block-rekey (block tool-call-id)
   "Change live BLOCK's registry key to authoritative TOOL-CALL-ID."
@@ -3206,33 +3250,37 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
 (defun pilish--reconcile-final-toolcall
     (content-index tool-call &optional stream)
   "Reconcile authoritative TOOL-CALL at CONTENT-INDEX with STREAM preview."
-  (let* ((tool-call-id (plist-get tool-call :id))
-         (tool-name (plist-get tool-call :name))
-         (args (plist-get tool-call :arguments))
-         ;; Content index owns a generation stream.  If that stream has not
-         ;; rendered yet (as in tagged Pi 0.84.2), create its block rather than
-         ;; adopting another stream's colliding authoritative ID.
-         (block (if stream
-                    (or (pilish--tool-stream-block stream)
-                        (pilish--display-tool-start
-                         tool-name args nil content-index nil 'defer))
-                  (pilish--tool-block-get tool-call-id))))
-    (when block
-      (pilish--tool-block-rekey block tool-call-id))
-    (setq block
-          (pilish--reconcile-toolcall-preview-block
-           content-index tool-call "toolcall_end" block))
-    (when stream
-      (setf (pilish--tool-stream-tool-call-id stream) tool-call-id
-            (pilish--tool-stream-tool-name stream)
-            (plist-get tool-call :name)
-            (pilish--tool-stream-arguments stream)
-            (plist-get tool-call :arguments)
-            (pilish--tool-stream-block stream) block))
-    block))
+  (pilish--with-md-ts-change-hooks-suspended
+      #'pilish--md-ts-expensive-change-hook-p
+    (let* ((tool-call-id (plist-get tool-call :id))
+           (tool-name (plist-get tool-call :name))
+           (args (plist-get tool-call :arguments))
+           ;; Content index owns a generation stream.  If that stream has not
+           ;; rendered yet (as in tagged Pi 0.84.2), create its block rather than
+           ;; adopting another stream's colliding authoritative ID.
+           (block (if stream
+                      (or (pilish--tool-stream-block stream)
+                          (pilish--display-tool-start
+                           tool-name args nil content-index nil 'defer))
+                    (pilish--tool-block-get tool-call-id))))
+      (when block
+        (pilish--tool-block-rekey block tool-call-id))
+      (setq block
+            (pilish--reconcile-toolcall-preview-block
+             content-index tool-call "toolcall_end" block))
+      (when stream
+        (setf (pilish--tool-stream-tool-call-id stream) tool-call-id
+              (pilish--tool-stream-tool-name stream)
+              (plist-get tool-call :name)
+              (pilish--tool-stream-arguments stream)
+              (plist-get tool-call :arguments)
+              (pilish--tool-stream-block stream) block
+              (pilish--tool-stream-content-render-p stream) nil
+              (pilish--tool-stream-content-to-render stream) nil))
+      block)))
 
 (defun pilish--handle-toolcall-message-event (event)
-  "Assemble and render one delta-only toolcall message EVENT."
+  "Assemble toolcall EVENT, queuing delta paints and rendering boundaries."
   (let* ((event-type (plist-get event :type))
          (content-index (plist-get event :contentIndex))
          (streams (pilish--ensure-toolcall-streams)))
@@ -3261,7 +3309,7 @@ When PREVIEW-STATE is `streaming', generic tool headers omit ARGS."
                        '("bash" "read" "edit" "write"))
            (pilish--toolcall-stream-feed
             stream (plist-get event :delta)))
-         (pilish--render-toolcall-stream stream event-type)))
+         (pilish--queue-stream-delta 'toolcall stream)))
       ("toolcall_end"
        (when-let* ((tool-call (plist-get event :toolCall)))
          (let ((stream (or (gethash content-index streams)

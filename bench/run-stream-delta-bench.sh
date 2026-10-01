@@ -5,6 +5,7 @@
 #   ./bench/run-stream-delta-bench.sh                       # GUI/xvfb full preset
 #   ./bench/run-stream-delta-bench.sh --batch               # batch full preset
 #   ./bench/run-stream-delta-bench.sh --scenario smoke -c 1 # cheap CI smoke
+#   ./bench/run-stream-delta-bench.sh --scenario toolcall  # bash argument stream
 #   ./bench/run-stream-delta-bench.sh -c 3                  # repetitions
 #   ./bench/run-stream-delta-bench.sh --out-dir tmp/sd      # custom artifacts
 #
@@ -87,6 +88,7 @@ PI_SD_BENCH_TEXT_BURST=12
 PI_SD_BENCH_THINKING_DELTAS=6
 PI_SD_BENCH_THINKING_BURST=6
 PI_SD_BENCH_BACKLOG_DELTAS=20
+PI_SD_BENCH_TOOLCALL_REPEATS=8
 PI_SD_BENCH_BURST_PAUSE_MS=80
 PI_SD_BENCH_SEED=20240817
 PI_SD_BENCH_TIMEOUT_SECONDS=30
@@ -101,6 +103,22 @@ PI_SD_BENCH_TEXT_BURST=20
 PI_SD_BENCH_THINKING_DELTAS=80
 PI_SD_BENCH_THINKING_BURST=20
 PI_SD_BENCH_BACKLOG_DELTAS=300
+PI_SD_BENCH_TOOLCALL_REPEATS=0
+PI_SD_BENCH_BURST_PAUSE_MS=80
+PI_SD_BENCH_SEED=20240817
+PI_SD_BENCH_TIMEOUT_SECONDS=120
+EOF
+            ;;
+        toolcall)
+            cat <<'EOF'
+PI_SD_BENCH_HISTORY_TURNS=180
+PI_SD_BENCH_HISTORY_TEXT_BYTES=1200
+PI_SD_BENCH_TIMER_TEXT_DELTAS=12
+PI_SD_BENCH_TEXT_BURST=12
+PI_SD_BENCH_THINKING_DELTAS=6
+PI_SD_BENCH_THINKING_BURST=6
+PI_SD_BENCH_BACKLOG_DELTAS=20
+PI_SD_BENCH_TOOLCALL_REPEATS=160
 PI_SD_BENCH_BURST_PAUSE_MS=80
 PI_SD_BENCH_SEED=20240817
 PI_SD_BENCH_TIMEOUT_SECONDS=120
@@ -253,6 +271,7 @@ for result_path in sorted(out.glob("*/iter-*/result.json")):
     backlog = mapping(filters.get("backlog"))
     flushes = mapping(result.get("flushes"))
     displays = mapping(result.get("displayCalls"))
+    toolcalls = mapping(result.get("toolcallPaints"))
     probe = mapping(result.get("probe"))
     gc = mapping(result.get("gc"))
     history = mapping(result.get("history"))
@@ -276,6 +295,9 @@ for result_path in sorted(out.glob("*/iter-*/result.json")):
             "displayCalls": displays.get("total") or 0,
             "deltaEvents": displays.get("deltaEvents") or 0,
             "displayRatio": displays.get("ratio") or 0,
+            "toolcallPaints": toolcalls.get("count") or 0,
+            "toolcallDeltaEvents": toolcalls.get("deltaEvents") or 0,
+            "toolcallPaintRatio": toolcalls.get("ratio") or 0,
             "probeP95Ms": probe.get("p95Ms") or 0,
             "probeMaxMs": probe.get("maxMs") or 0,
             "gcs": gc.get("collections") or 0,
@@ -305,12 +327,12 @@ summary: list[str] = [
     f"- Scenarios: `{scenario_arg}`",
     "- Timing thresholds: `none` (correctness failures fail the run)",
     "",
-    "| scenario | wall ms | history bytes | filter total/max ms | backlog ms | timer/sync flushes | displays/deltas | display ratio | probe p95/max ms | GC | md-ts dirty before/after | successful runs |",
-    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    "| scenario | wall ms | history bytes | filter total/max ms | backlog ms | timer/sync flushes | displays/deltas | display ratio | toolcall paints/deltas | toolcall ratio | probe p95/max ms | GC | md-ts dirty before/after | successful runs |",
+    "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
 ]
 
 print("\nsummary")
-print("scenario  wall-ms history-B filter-total/max backlog timer/sync displays/deltas ratio probe-p95/max GC dirty ok")
+print("scenario  wall-ms history-B filter-total/max backlog timer/sync displays/deltas ratio toolcall-paints/deltas toolcall-ratio probe-p95/max GC dirty ok")
 failed = [row for row in rows if not row["ok"]]
 for scenario in sorted({str(row["scenario"]) for row in rows}):
     all_rows = [row for row in rows if str(row["scenario"]) == scenario]
@@ -318,7 +340,7 @@ for scenario in sorted({str(row["scenario"]) for row in rows}):
     if not good:
         print(f"{scenario:<8} no successful runs")
         summary.append(
-            f"| {scenario} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0/{len(all_rows)} |"
+            f"| {scenario} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | 0/{len(all_rows)} |"
         )
         continue
 
@@ -339,6 +361,8 @@ for scenario in sorted({str(row["scenario"]) for row in rows}):
         f"{int(sample['timerFlushes'])}/{int(sample['synchronousFlushes'])} "
         f"{int(sample['displayCalls'])}/{int(sample['deltaEvents'])} "
         f"{float(sample['displayRatio']):.4f} "
+        f"{int(sample['toolcallPaints'])}/{int(sample['toolcallDeltaEvents'])} "
+        f"{float(sample['toolcallPaintRatio']):.4f} "
         f"{median('probeP95Ms'):.1f}/{maximum('probeMaxMs'):.1f} "
         f"{int(maximum('gcs'))} {dirty} {ok_count}"
     )
@@ -349,6 +373,8 @@ for scenario in sorted({str(row["scenario"]) for row in rows}):
         f"{int(sample['timerFlushes'])}/{int(sample['synchronousFlushes'])} | "
         f"{int(sample['displayCalls'])}/{int(sample['deltaEvents'])} | "
         f"{float(sample['displayRatio']):.4f} | "
+        f"{int(sample['toolcallPaints'])}/{int(sample['toolcallDeltaEvents'])} | "
+        f"{float(sample['toolcallPaintRatio']):.4f} | "
         f"{median('probeP95Ms'):.1f}/{maximum('probeMaxMs'):.1f} | "
         f"{int(maximum('gcs'))} | {dirty} | {ok_count} |"
     )

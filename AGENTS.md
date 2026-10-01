@@ -112,7 +112,7 @@ latch on delayed agent/compaction starts.
 | `bench/pilish-tool-update-bench.el` | Synthetic tool-update storm and deferred agent_end cooling benchmark harness |
 | `bench/fake-pi-tool-update-storm.py` | Fake JSON-over-stdio pi backend emitting tool-update storm and cooling scenarios |
 | `bench/run-tool-update-bench.sh` | Tool-update/cooling benchmark runner; GUI uses `xvfb-run`, `--batch` for headless lane |
-| `bench/pilish-stream-delta-bench.el` | Synthetic history plus coalesced text/thinking stream benchmark harness |
+| `bench/pilish-stream-delta-bench.el` | Synthetic history plus coalesced text/thinking/toolcall stream benchmark harness |
 | `bench/fake-pi-stream-delta.py` | Fake JSON-over-stdio backend for deterministic stream bursts and backlog |
 | `bench/run-stream-delta-bench.sh` | Stream-delta benchmark runner; GUI uses `xvfb-run`, `--batch` for headless lane |
 | `bench/fixtures/tables.md` | Sample pipe tables used by the table benchmark |
@@ -196,6 +196,7 @@ make bench-tool-update-smoke       # cheap synthetic correctness smoke
 make bench-stream-delta            # stream-delta GUI lane via xvfb (primary)
 make bench-stream-delta-batch      # stream-delta batch lane (secondary)
 make bench-stream-delta-smoke      # cheap stream-delta correctness smoke
+./bench/run-stream-delta-bench.sh --scenario toolcall -c 1 # long bash argument stream
 make bench-agent-end-cooling       # deferred agent_end cooling GUI lane (primary)
 make bench-agent-end-cooling-batch # deferred cooling batch lane (secondary)
 make bench-agent-end-cooling-smoke # cheap deferred cooling correctness smoke
@@ -208,6 +209,10 @@ Tool-update storm benchmarks replay a deterministic synthetic
 `tool_execution_update` storm against a fake pi and likewise fail only on
 correctness errors.  Stream-delta benchmarks replay synthetic history before
 measuring coalesced text/thinking bursts and a single-filter backlog.  The
+`toolcall` preset streams a long bash command in 32-character argument deltas
+over a roughly 450 KB transcript; smoke includes a shorter toolcall stream.
+Toolcall paint counts and exact final command text are correctness checks,
+not timing thresholds.  The
 deferred agent_end scenario reuses the tool-update harness and fake backend to
 cross a 90-overlay cohort at the final real process-filter event, then observes
 production one-shot cooling timers and routed scroll

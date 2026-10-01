@@ -6,7 +6,7 @@
 
 ;;; Commentary:
 
-;; Deterministic coalesced text/thinking stream benchmark.  A fake pi replays
+;; Deterministic coalesced text/thinking/toolcall benchmark.  A fake pi replays
 ;; synthetic history, then sends timed bursts and one deliberately collected
 ;; backlog through the real `pilish--process-filter'.  Correctness assertions
 ;; fail the run; all timing values are diagnostic only.
@@ -82,6 +82,11 @@
 (defvar pilish-sd-bench-backlog-deltas
   (pilish-sd-bench--env-int "PI_SD_BENCH_BACKLOG_DELTAS" 300)
   "Number of text deltas delivered in one collected `process-filter' call.")
+
+(defvar pilish-sd-bench-toolcall-repeats
+  (pilish-sd-bench--env-int "PI_SD_BENCH_TOOLCALL_REPEATS" 0)
+  "Number of echo fragments in a bash command streamed in 32-character deltas.
+Zero keeps the original single-delta tool boundary check.")
 
 (defvar pilish-sd-bench-burst-pause-ms
   (pilish-sd-bench--env-int "PI_SD_BENCH_BURST_PAUSE_MS" 80)
@@ -160,6 +165,8 @@
   "Recorded nonempty stream flush rows, newest first.")
 (defvar pilish-sd-bench--display-rows nil
   "Recorded text/thinking display-call rows, newest first.")
+(defvar pilish-sd-bench--toolcall-paints 0
+  "Number of coalesced toolcall delta paints, excluding immediate starts.")
 (defvar pilish-sd-bench--event-counts nil
   "Hash table counting effective display event types.")
 (defvar pilish-sd-bench--agent-end-time nil
@@ -415,6 +422,12 @@
       (pilish-sd-bench--record-display
        "thinking" text (* 1000.0 (- (float-time) start))))))
 
+(defun pilish-sd-bench--around-toolcall-paint (orig stream event-type)
+  "Call toolcall renderer ORIG for STREAM and EVENT-TYPE, counting delta paints."
+  (when (equal event-type "toolcall_delta")
+    (cl-incf pilish-sd-bench--toolcall-paints))
+  (funcall orig stream event-type))
+
 (defun pilish-sd-bench--install-advice ()
   "Install narrow stream benchmark measurement advice."
   (advice-add 'pilish--process-filter
@@ -426,7 +439,9 @@
   (advice-add 'pilish--display-message-delta
               :around #'pilish-sd-bench--around-display-text)
   (advice-add 'pilish--display-thinking-delta
-              :around #'pilish-sd-bench--around-display-thinking))
+              :around #'pilish-sd-bench--around-display-thinking)
+  (advice-add 'pilish--render-toolcall-stream
+              :around #'pilish-sd-bench--around-toolcall-paint))
 
 (defun pilish-sd-bench--remove-advice ()
   "Remove all stream benchmark measurement advice."
@@ -439,7 +454,9 @@
   (advice-remove 'pilish--display-message-delta
                  #'pilish-sd-bench--around-display-text)
   (advice-remove 'pilish--display-thinking-delta
-                 #'pilish-sd-bench--around-display-thinking))
+                 #'pilish-sd-bench--around-display-thinking)
+  (advice-remove 'pilish--render-toolcall-stream
+                 #'pilish-sd-bench--around-toolcall-paint))
 
 (defun pilish-sd-bench--wait-until (predicate timeout)
   "Wait up to TIMEOUT seconds for PREDICATE to return non-nil."
@@ -473,6 +490,23 @@
   (format "SD-BACKLOG-%04d value-%05d"
           index (mod (+ pilish-sd-bench-seed (* index 6151)) 100000)))
 
+(defun pilish-sd-bench--tool-command ()
+  "Return the deterministic bash command for the configured toolcall stream."
+  (concat "echo SD-BOUNDARY-TOOL"
+          (when (> pilish-sd-bench-toolcall-repeats 0)
+            (concat "; "
+                    (mapconcat (lambda (index) (format "echo SD-CMD-%04d; " index))
+                               (number-sequence 0 (1- pilish-sd-bench-toolcall-repeats))
+                               "")))))
+
+(defun pilish-sd-bench--toolcall-delta-count ()
+  "Return the expected number of raw toolcall argument deltas."
+  (if (> pilish-sd-bench-toolcall-repeats 0)
+      (ceiling (/ (float (length (json-serialize
+                                 (list :command (pilish-sd-bench--tool-command)))))
+                  32))
+    1))
+
 (defun pilish-sd-bench--expected-projection ()
   "Return exact deterministic visible marker projection."
   (string-join
@@ -494,9 +528,9 @@
    '((omit . ""))
    (cl-loop for index below pilish-sd-bench-backlog-deltas
             collect (cons 'payload (pilish-sd-bench--backlog-line index)))
-   '((omit . "")
-     (tool . "SD-BOUNDARY-TOOL")
-     (omit . ""))))
+   (list '(omit . "")
+         (cons 'tool (substring (pilish-sd-bench--tool-command) 5))
+         '(omit . ""))))
 
 (defun pilish-sd-bench--actual-projection (chat-buf)
   "Return CHAT-BUF's exact normalized visible stream-span projection.
@@ -567,6 +601,8 @@ other visible line is retained so unexpected text fails projection equality."
 HISTORY-COUNT and HISTORY-BYTES describe replay; PROJECTION and MD-TS describe
 the settled rendered buffer."
   (let* ((full (equal pilish-sd-bench-scenario "full"))
+         (large-history (member pilish-sd-bench-scenario '("full" "toolcall")))
+         (toolcall-deltas (pilish-sd-bench--toolcall-delta-count))
          (expected-history (* 2 pilish-sd-bench-history-turns))
          (text-events (+ pilish-sd-bench-timer-text-deltas
                          pilish-sd-bench-backlog-deltas))
@@ -605,11 +641,11 @@ the settled rendered buffer."
           checks)
     (push (pilish-sd-bench--check
            "representative-history-size"
-           (if full
+           (if large-history
                (<= (* 400 1024) history-bytes (* 500 1024))
              (> history-bytes 0))
            (format "%d rendered bytes%s" history-bytes
-                   (if full " (required 409600..512000)" "")))
+                   (if large-history " (required 409600..512000)" "")))
           checks)
     (push (pilish-sd-bench--check
            "exact-stream-payload-visible-projection"
@@ -645,7 +681,7 @@ the settled rendered buffer."
                 (= (pilish-sd-bench--event-count "thinking_start") 1)
                 (= (pilish-sd-bench--event-count "thinking_end") 1)
                 (= (pilish-sd-bench--event-count "toolcall_start") 1)
-                (= (pilish-sd-bench--event-count "toolcall_delta") 1)
+                (= (pilish-sd-bench--event-count "toolcall_delta") toolcall-deltas)
                 (= (pilish-sd-bench--event-count "toolcall_end") 1))
            (format "text=%d/%d thinking=%d/%d tool=%d/%d/%d"
                    (pilish-sd-bench--event-count "text_start")
@@ -711,6 +747,16 @@ the settled rendered buffer."
            (format "%d display calls for %d deltas (%.4f)"
                    (length displays) delta-events
                    (/ (float (length displays)) delta-events)))
+          checks)
+    (push (pilish-sd-bench--check
+           "toolcall-paints-coalesced"
+           (and (> pilish-sd-bench--toolcall-paints 0)
+                (if (> toolcall-deltas 1)
+                    (< pilish-sd-bench--toolcall-paints toolcall-deltas)
+                  (= pilish-sd-bench--toolcall-paints 1)))
+           (format "%d paints for %d deltas; command length %d"
+                   pilish-sd-bench--toolcall-paints toolcall-deltas
+                   (length (pilish-sd-bench--tool-command))))
           checks)
     (push (pilish-sd-bench--check
            "backlog-used-one-real-filter"
@@ -944,6 +990,7 @@ the settled rendered buffer."
         :thinkingDeltas pilish-sd-bench-thinking-deltas
         :thinkingBurst pilish-sd-bench-thinking-burst
         :backlogDeltas pilish-sd-bench-backlog-deltas
+        :toolcallRepeats pilish-sd-bench-toolcall-repeats
         :burstPauseMs pilish-sd-bench-burst-pause-ms
         :seed pilish-sd-bench-seed))
 
@@ -1064,6 +1111,11 @@ the settled rendered buffer."
                               pilish-sd-bench-backlog-deltas
                               pilish-sd-bench-thinking-deltas))
                  :rows (vconcat displays))
+           :toolcallPaints
+           (list :count pilish-sd-bench--toolcall-paints
+                 :deltaEvents (pilish-sd-bench--toolcall-delta-count)
+                 :ratio (/ (float pilish-sd-bench--toolcall-paints)
+                           (pilish-sd-bench--toolcall-delta-count)))
            :probe probe
            :mdTs (plist-get metrics :mdTs)
            :projection
@@ -1154,6 +1206,10 @@ the settled rendered buffer."
       (insert (format "- Display calls: `%d` text + `%d` thinking = `%d` for `%d` deltas (ratio `%.4f`)\n"
                       text-count thinking-count (length displays) delta-count
                       (/ (float (length displays)) delta-count)))
+      (insert (format "- Toolcall paints: `%d` for `%d` raw deltas; command length `%d`\n"
+                      pilish-sd-bench--toolcall-paints
+                      (pilish-sd-bench--toolcall-delta-count)
+                      (length (pilish-sd-bench--tool-command))))
       (insert (format "- Probe lateness p95/max: `%.3f`/`%.3f` ms\n"
                       (plist-get probe :p95Ms) (plist-get probe :maxMs)))
       (insert (format "- md-ts dirty ranges before/after final fontification: `%s`/`%s` (supported `%s`)\n"
@@ -1189,6 +1245,7 @@ Return non-nil only when settlement and every correctness assertion pass."
         pilish-sd-bench--filter-rows nil
         pilish-sd-bench--flush-rows nil
         pilish-sd-bench--display-rows nil
+        pilish-sd-bench--toolcall-paints 0
         pilish-sd-bench--event-counts (make-hash-table :test 'equal)
         pilish-sd-bench--agent-end-time nil
         pilish-sd-bench--settled-time nil
