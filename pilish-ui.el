@@ -60,8 +60,7 @@
 (declare-function pilish--dispatch-button "pilish-render")
 (declare-function pilish--cleanup-on-kill "pilish-render")
 (declare-function pilish--process-followup-queue "pilish-render")
-(declare-function pilish--restore-tool-properties "pilish-render")
-(declare-function pilish--fontify-with-hover-help "pilish-render")
+(declare-function pilish--fontify-preserving-properties "pilish-render")
 (declare-function pilish--hover-clear-live-state "pilish-render")
 (declare-function pilish--maybe-refresh-hot-tail-tables "pilish-table")
 
@@ -913,11 +912,9 @@ This is a read-only buffer showing the conversation history."
   ;; Recent content is hot by default in a fresh chat buffer.
   (setq-local pilish--hot-tail-start (copy-marker (point-min) nil))
 
-  ;; Run after font-lock to undo markdown damage in tool overlays.
-  (jit-lock-register #'pilish--restore-tool-properties)
-  ;; Let native Markdown help take precedence over completed-block fallback.
+  ;; Restore owned properties over the fontifier's actual expanded bounds.
   (add-function :around (local 'font-lock-fontify-region-function)
-                #'pilish--fontify-with-hover-help)
+                #'pilish--fontify-preserving-properties)
 
   ;; Compute theme-derived faces used by chat overlays.
   (pilish--update-theme-derived-faces)

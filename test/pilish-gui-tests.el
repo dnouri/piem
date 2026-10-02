@@ -669,6 +669,36 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
           (should (equal "https://added.example"
                          (button-get button 'help-echo))))))))
 
+(ert-deftest pilish-gui-test-tool-header-narrow-refresh-keeps-literal-backticks ()
+  "JIT repairs md-ts's expanded header range, leaving body fences hidden."
+  (let ((buf (generate-new-buffer "*pilish-gui-header*"))
+        (command "printf '%s\\n' '``` **bold**'; printf '%s\\n' '``` tail'"))
+    (unwind-protect
+        (save-window-excursion
+          (with-current-buffer buf (pilish-chat-mode))
+          (switch-to-buffer buf)
+          (let* ((args (list :command command))
+                 (block (pilish--display-tool-start "bash" args))
+                 (header-end (marker-position (pilish--tool-block-header-end block))))
+            (pilish--display-tool-end
+             "bash" args '((:type "text" :text "body text\n")) nil nil block)
+            (font-lock-ensure)
+            (font-lock-flush (1- header-end) header-end)
+            (font-lock-ensure (1- header-end) header-end)
+            (redisplay t)
+            (let ((start (overlay-start (pilish--tool-block-overlay block)))
+                  (end (1- header-end)))
+              (should (equal (substring-no-properties (pilish--visible-text start end))
+                             (concat "$ " command)))
+              (cl-loop for pos from start below end do
+                       (should (eq (get-text-property pos 'face)
+                                   (get-text-property pos 'font-lock-face)))))
+            (goto-char header-end)
+            (search-forward "```")
+            (should (invisible-p (match-beginning 0)))))
+      (with-current-buffer buf (set-buffer-modified-p nil))
+      (kill-buffer buf))))
+
 (ert-deftest pilish-gui-test-streaming-no-fences ()
   "Streaming write content shows no fence markers to the user.
 Fences exist in the buffer for tree-sitter parsing, but

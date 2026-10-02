@@ -152,7 +152,8 @@ installed because Pilish has no cost or correctness contract for them.")
   "Expensive subset of `pilish--md-ts-known-change-hooks' for stream flushes.
 The stale-side-effect recorder queries tree-sitter over regions that grow with
 the buffer.  Coupled to md-ts internals: if md-ts renames it, streaming
-suspension silently degrades to running it (correct, only slower).
+suspension degrades to running it (correct, only slower).  Full history
+replay warns once if unknown md-ts hooks are installed.
 
 The paired link-reference before/after hooks are deliberately NOT in this list.
 md-ts cheaply prefilters irrelevant edits, while real definition changes must
@@ -180,6 +181,24 @@ rather than being suppressed without a known correctness contract."
   "Return non-nil when HOOK is an expensive md-ts per-change hook.
 See `pilish--md-ts-expensive-change-hooks'."
   (memq hook pilish--md-ts-expensive-change-hooks))
+
+(defvar-local pilish--md-ts-change-hooks-warned nil
+  "Non-nil after warning about unknown installed md-ts change hooks.")
+
+(defun pilish--warn-unknown-md-ts-change-hooks ()
+  "Warn once if history replay cannot suspend installed md-ts hooks."
+  (unless pilish--md-ts-change-hooks-warned
+    (when-let* ((unknown
+                 (delete-dups
+                  (seq-filter
+                   (lambda (hook)
+                     (and (symbolp hook)
+                          (string-prefix-p "md-ts--" (symbol-name hook))
+                          (not (pilish--md-ts-change-hook-p hook))))
+                   (append before-change-functions after-change-functions)))))
+      (setq pilish--md-ts-change-hooks-warned t)
+      (message "Pi: unknown md-ts change hooks (%s); history replay may be slow"
+               (mapconcat #'symbol-name unknown ", ")))))
 
 (defmacro pilish--with-md-ts-change-hooks-suspended (predicate &rest body)
   "Run BODY with md-ts per-change hooks matching PREDICATE removed.
@@ -2184,13 +2203,14 @@ absent or previously owned help.  Links, images and buttons keep precedence."
       (add-text-properties start end
                            `(pilish-hover-help ,help rear-nonsticky t) object))))
 
-(defun pilish--fontify-with-hover-help (function start end &rest args)
-  "Fontify START..END with FUNCTION and ARGS, letting native help win.
+(defun pilish--fontify-preserving-properties (function start end &rest args)
+  "Fontify START..END with FUNCTION and ARGS, preserving Pilish properties.
 Mask fallback at the native unfontification seam: its bounds already include
 line/multiline expansion, unlike the original fontification request.  Restore
-cached fallback after native links have supplied their more-specific help."
+cached fallback after native links have supplied their more-specific help.
+Repair tool headers over FUNCTION's returned JIT bounds, not just the request."
   (let ((unfontify font-lock-unfontify-region-function)
-        ranges)
+        ranges result)
     (let ((font-lock-unfontify-region-function
            (lambda (beg end)
              (save-restriction
@@ -2209,11 +2229,14 @@ cached fallback after native links have supplied their more-specific help."
              (funcall unfontify beg end))))
       (with-silent-modifications
         (unwind-protect
-            (apply function start end args)
+            (setq result (apply function start end args))
           (save-restriction
             (widen)
             (dolist (range ranges)
-              (pilish--set-hover-help (car range) (cadr range) (nth 2 range)))))))))
+              (pilish--set-hover-help (car range) (cadr range) (nth 2 range)))
+            (if (eq (car-safe result) 'jit-lock-bounds)
+                (pilish--restore-tool-properties (cadr result) (cddr result))
+              (pilish--restore-tool-properties start end))))))))
 
 (defun pilish--apply-assistant-message-hover (message &optional duration)
   "Apply final MESSAGE help and live DURATION inside its message markers."
@@ -7635,6 +7658,7 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
   (setq chat-buf (or chat-buf (pilish--get-chat-buffer)))
   (when (and chat-buf (buffer-live-p chat-buf))
     (with-current-buffer chat-buf
+      (pilish--warn-unknown-md-ts-change-hooks)
       (pilish--set-canonical-messages messages)
       (let ((inhibit-read-only t)
             ;; A full resume/reload rebuild allocates many short strings,

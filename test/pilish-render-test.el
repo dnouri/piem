@@ -866,8 +866,8 @@ execution cannot retain a temporary record on this setup's evaluator stack."
   (with-temp-buffer
     (pilish-chat-mode)
     ;; Batch Emacs and space-prefixed temp buffers deliberately disable Font
-    ;; Lock.  Enable the real backend before inserting any history; otherwise
-    ;; jit-lock only runs tool-property restoration and never parses Markdown.
+    ;; Lock.  Enable the real backend before inserting any history so JIT runs
+    ;; the fontification wrapper and parses Markdown.
     (rename-buffer "pilish-hover-native-jit" t)
     (let ((noninteractive nil)) (font-lock-mode 1))
     (should (memq #'font-lock-fontify-region jit-lock-functions))
@@ -10771,7 +10771,9 @@ fixture; a test may dynamically override it inside FUNCTION."
              (file-name-directory path))
             (setq pilish--input-buffer input)
             (let ((inhibit-read-only t))
-              (insert path)))
+              (insert path))
+            ;; Initialize parser/fontification state before passive-open snapshots.
+            (font-lock-ensure))
           (with-current-buffer input
             (pilish-input-mode)
             (setq pilish--chat-buffer chat))
@@ -14409,6 +14411,52 @@ Exact hook values and local/inherited status survive normal and error exits."
                         (set-default 'after-change-functions
                                      default-after)))))))))))))
 
+(ert-deftest pilish-test-history-replay-warns-once-for-renamed-md-ts-hook ()
+  "A renamed md-ts hook keeps running and reports its replay cost once."
+  (let ((recorder (symbol-function 'md-ts--font-lock-record-dirty-side-effect-bounds))
+        (calls 0)
+        notices)
+    (cl-letf (((symbol-function 'md-ts--renamed-change-recorder)
+               (lambda (&rest args)
+                 (cl-incf calls)
+                 (apply recorder args)))
+              ((symbol-function 'message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) notices))))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (dolist (hook '(before-change-functions after-change-functions))
+          (remove-hook hook #'md-ts--font-lock-record-dirty-side-effect-bounds t)
+          (add-hook hook #'md-ts--renamed-change-recorder nil t))
+        (dotimes (_ 2)
+          (let ((previous calls))
+            (pilish--display-session-history
+             [(:role "user" :content "Replay stays complete.")])
+            (should (> calls previous))))
+        (should (string-match-p "Replay stays complete" (buffer-string)))
+        (should (memq #'md-ts--renamed-change-recorder before-change-functions))
+        (should (memq #'md-ts--renamed-change-recorder after-change-functions))))
+    (should (= (length notices) 1))
+    (should (string-match-p "md-ts--renamed-change-recorder" (car notices)))
+    (should (string-match-p "slow" (car notices)))))
+
+(ert-deftest pilish-test-history-replay-ignores-unrelated-and-absent-md-ts-hooks ()
+  "Only an unknown installed md-ts hook warrants a replay warning."
+  (let ((calls 0) notices)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format &rest args)
+                 (push (apply #'format format args) notices))))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (add-hook 'after-change-functions (lambda (&rest _) (cl-incf calls)) nil t)
+        (pilish--display-session-history [])
+        ;; A missing hook cannot slow replay: no unknown work runs.
+        (remove-hook 'before-change-functions
+                     #'md-ts--font-lock-record-stale-side-effect-bounds t)
+        (pilish--display-session-history [])
+        (should (> calls 0))))
+    (should-not notices)))
+
 (ert-deftest pilish-test-md-ts-expensive-hooks-suspended-keeps-dirty-tick ()
   "Expensive-hook suspension keeps md-ts's dirty-tick hook installed."
   (pilish-test--assert-md-ts-04-change-hook-capabilities)
@@ -17388,7 +17436,7 @@ invisible, or markdown face properties."
     (pilish--display-tool-start "bash" '(:command "echo"))
     (pilish--display-tool-update-header
      "bash" '(:command "echo \"# Build\"\necho \"**done**\"\necho \"__init__.py\""))
-    ;; Simulate jit-lock: font-lock + registered cleanup
+    ;; Fontification runs the header-property restoration wrapper.
     (font-lock-ensure (point-min) (point-max))
     (pilish--restore-tool-properties (point-min) (point-max))
     (dolist (pattern '("**done**" "__init__"))
@@ -17399,6 +17447,66 @@ invisible, or markdown face properties."
         (should-not (get-text-property pos 'invisible))
         (should (eq (get-text-property pos 'face)
                     'pilish-tool-command))))))
+
+(ert-deftest pilish-test-tool-header-narrow-fontification-keeps-literal-backticks ()
+  "A narrow md-ts pass repairs the full header it actually fontifies."
+  (dolist (completed '(nil t))
+    (ert-info ((if completed "finalized header" "live header"))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (let* ((command "printf '%s\\n' '``` **bold**'; printf '%s\\n' '``` tail'")
+               (args (list :command command))
+               (block (pilish--display-tool-start "bash" args))
+               (header-end (marker-position (pilish--tool-block-header-end block))))
+          (when completed
+            (pilish--display-tool-end
+             "bash" args '((:type "text" :text "body text\n")) nil nil block))
+          (let ((result (font-lock-fontify-region (1- header-end) header-end)))
+            (should (eq (car result) 'jit-lock-bounds))
+            (should (< (cadr result) (1- header-end))))
+          (let ((start (overlay-start (pilish--tool-block-overlay block)))
+                (end (1- header-end)))
+            (should (equal (substring-no-properties (pilish--visible-text start end))
+                           (concat "$ " command)))
+            (cl-loop for pos from start below end do
+                     (should (eq (get-text-property pos 'face)
+                                 (get-text-property pos 'font-lock-face)))))
+          (when completed
+            ;; The repair owns the header, not the body's hidden wrapper.
+            (goto-char header-end)
+            (search-forward "```")
+            (should (invisible-p (match-beginning 0)))))))))
+
+(ert-deftest pilish-test-fontify-fallback-preserves-header-on-return-or-error ()
+  "Without returned bounds, repair the requested header on return or error."
+  (dolist (outcome '(nil done error))
+    (ert-info ((format "fontifier outcome: %S" outcome))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (let* ((command "printf '%s\\n' '``` **bold**'; printf '%s\\n' '``` tail'")
+               (block (pilish--display-tool-start "bash" (list :command command)))
+               (start (overlay-start (pilish--tool-block-overlay block)))
+               (end (marker-position (pilish--tool-block-header-end block)))
+               (fontifier
+                (lambda (beg end &rest args)
+                  ;; Run the real backend, changing only its return/error contract.
+                  (apply #'md-ts--font-lock-fontify-region beg end args)
+                  (if (eq outcome 'error)
+                      (error "Fontifier failed")
+                    outcome))))
+          (pilish--set-hover-help start end "Tool fallback")
+          (if (eq outcome 'error)
+              (should (equal (should-error
+                              (pilish--fontify-preserving-properties fontifier start end))
+                             '(error "Fontifier failed")))
+            (should (eq (pilish--fontify-preserving-properties fontifier start end)
+                        outcome)))
+          (should (equal (substring-no-properties (pilish--visible-text start (1- end)))
+                         (concat "$ " command)))
+          (cl-loop for pos from start below (1- end) do
+                   (should (eq (get-text-property pos 'face)
+                               (get-text-property pos 'font-lock-face))))
+          (should (equal (get-text-property start 'help-echo) "Tool fallback")))))))
 
 (ert-deftest pilish-test-restore-tool-properties-restores-all-live-tool-headers ()
   "restore-tool-properties repairs every overlapping live tool header."
