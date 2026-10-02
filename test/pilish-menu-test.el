@@ -746,7 +746,9 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
             (pilish-chat-mode)
             (setq pilish--state '(:session-file "/tmp/test-session.json"))
             (setq old-proc (start-process "test-reload-failure-old" nil "cat")
-                  pilish--process old-proc))
+                  pilish--process old-proc
+                  pilish--status 'sending
+                  pilish--aborted t))
           (cl-letf (((symbol-function 'pilish--start-process)
                      (lambda (_dir)
                        (setq new-proc
@@ -764,6 +766,7 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
               (should (process-live-p old-proc))
               (should-not (process-live-p new-proc))
               (should-not (pilish--session-transition-active-p))
+              (should pilish--aborted)
               (should (equal shown-message
                              "Pi: Failed to reload - nope")))))
       (when (and old-proc (process-live-p old-proc))
@@ -786,7 +789,9 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
             (pilish-chat-mode)
             (setq pilish--state '(:session-file "/tmp/test-session.json"))
             (setq old-proc (start-process "test-reload-cancelled-old" nil "cat")
-                  pilish--process old-proc))
+                  pilish--process old-proc
+                  pilish--status 'sending
+                  pilish--aborted t))
           (cl-letf (((symbol-function 'pilish--start-process)
                      (lambda (_dir)
                        (setq new-proc
@@ -804,6 +809,7 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
               (should (process-live-p old-proc))
               (should-not (process-live-p new-proc))
               (should-not (pilish--session-transition-active-p))
+              (should pilish--aborted)
               (should (equal shown-message "Pi: Reload cancelled")))))
       (when (and old-proc (process-live-p old-proc))
         (delete-process old-proc))
@@ -944,6 +950,65 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
           (when (and pilish--process (process-live-p pilish--process))
             (delete-process pilish--process)))
         (kill-buffer chat-buf)))))
+
+(ert-deftest pilish-test-reload-after-stop-makes-preserved-draft-sendable ()
+  "Successful process adoption releases old Stop intent and keeps the draft."
+  (let* ((dir (pilish-test--make-temp-directory "pilish-test-reload-stop-"))
+         (session-file (expand-file-name "current.jsonl" dir))
+         new-proc)
+    (unwind-protect
+        (pilish-test-with-rpc-session (chat input proc commands)
+          (with-temp-file session-file (insert ""))
+          (with-current-buffer chat
+            (pilish--set-chat-session-identity dir)
+            (setq pilish--state (list :session-file session-file)))
+          (cl-letf (((symbol-function 'pilish--start-process)
+                     (lambda (_dir)
+                       (setq new-proc (start-process "pilish-reload-stop" nil "cat"))
+                       (set-process-query-on-exit-flag new-proc nil)
+                       new-proc))
+                    ((symbol-function 'message) #'ignore))
+            (pilish-test--stdout proc '(:type "agent_start")
+                                '(:type "agent_end" :messages []))
+            (with-current-buffer input
+              (pilish-abort)
+              (insert "  draft kept through reload\n ")
+              (pilish-reload))
+            (should (buffer-local-value 'pilish--aborted chat))
+            (should (eq proc (buffer-local-value 'pilish--process chat)))
+            (with-current-buffer input
+              (pilish-send)
+              (should (equal (buffer-string) "  draft kept through reload\n ")))
+            (should (equal (plist-get (car commands) :type) "switch_session"))
+            (pilish-test--stdout
+             new-proc (list :type "response" :id (plist-get (car commands) :id)
+                            :command "switch_session" :success t
+                            :data '(:cancelled :false)))
+            (dolist (command (copy-sequence commands))
+              (when-let* ((data (pcase (plist-get command :type)
+                                 ("get_state"
+                                  (list :isStreaming :false :isCompacting :false
+                                        :sessionFile session-file))
+                                 ("get_messages" '(:messages []))
+                                 ("get_commands" '(:commands [])))))
+                (pilish-test--stdout
+                 new-proc (list :type "response" :id (plist-get command :id)
+                                :command (plist-get command :type)
+                                :success t :data data))))
+            (should (eq new-proc (buffer-local-value 'pilish--process chat)))
+            (should-not (process-live-p proc))
+            (should-not (pilish--session-transition-active-p chat))
+            (with-current-buffer input
+              (should (equal (buffer-string) "  draft kept through reload\n "))
+              (pilish-send)
+              (should (string-empty-p (buffer-string))))
+            (should (equal (plist-get (car commands) :type) "prompt"))
+            (should (equal (plist-get (car commands) :message)
+                           "draft kept through reload"))
+            (should (pilish--command-pending-p new-proc "prompt"))))
+      (when (and new-proc (process-live-p new-proc))
+        (delete-process new-proc))
+      (delete-directory dir t))))
 
 (ert-deftest pilish-test-reload-transition-waits-for-state-and-history ()
   "Reload keeps sends blocked until both state and history callbacks settle."

@@ -54,7 +54,10 @@ Locally initiated manual compaction reserves submission via the existing pending
 RPC table until its correlated response. Prompt request records separately track
 acceptance and observed start/echo, since an extension's acknowledgment can follow
 its run's settlement. Stop sends `clear_queue` before `abort` and reapplies its
-latch on delayed agent/compaction starts.
+latch on delayed agent/compaction starts. Adopting a replacement process clears
+old Stop intent. New submissions retain their drafts while Stop is pending.
+Steering consumes only the unchanged draft after its correlated success
+response; pending steering prevents duplicate submissions.
 
 ## Source Files
 

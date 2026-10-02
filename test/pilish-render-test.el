@@ -17742,7 +17742,7 @@ events where the header text hasn't changed."
                proc `(:type "compaction_end" :reason ,(car case) :aborted t))
               (should (eq (caddr case) (buffer-local-value 'pilish--status chat)))
               (pilish-test--assert-inactivity input nil)
-              (if (eq (caddr case) 'streaming)
+              (if (memq (caddr case) '(sending streaming))
                   (progn
                     (should (memq timer timer-list))
                     (setq now 1600.0)
@@ -17770,6 +17770,12 @@ events where the header text hasn't changed."
             (pilish-test--stdout proc '(:type "agent_end" :messages [])))
           (should (eq 'sending (buffer-local-value 'pilish--status chat)))
           (pilish-test--assert-inactivity input nil)
+          (should (memq timer timer-list))
+          (setq now 1600.0)
+          (pilish-test--fire-timer timer)
+          (pilish-test--assert-inactivity input "idle (no output 5m)")
+          (pilish-test--stdout proc '(:type "agent_settled"))
+          (should (eq 'idle (buffer-local-value 'pilish--status chat)))
           (should-not (memq timer timer-list))
           (should-not (buffer-local-value 'pilish--inactivity-timer chat))))
       (should (equal notices
