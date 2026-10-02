@@ -46,6 +46,37 @@
       (pilish--decorate-tables-in-region (point-min) (point-max) 40)
       (should (equal before (buffer-string))))))
 
+(ert-deftest pilish-test-table-query-failure-keeps-raw-text-and-is-cached ()
+  "Either compilation failure leaves raw tables intact without retrying queries."
+  (dolist (failed-call '(1 2))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((inhibit-read-only t)) (insert pilish-test--wide-table))
+      (let ((pilish--treesit-table-query nil)
+            (pilish--treesit-data-row-query nil)
+            (original-compile (symbol-function 'treesit-query-compile))
+            (compilations 0)
+            warnings)
+        (cl-letf (((symbol-function 'treesit-query-compile)
+                   (lambda (language query &rest args)
+                     (cl-incf compilations)
+                     (if (= compilations failed-call)
+                         (signal 'treesit-query-error '("unsupported table node"))
+                       (apply original-compile language query args))))
+                  ((symbol-function 'display-warning)
+                   (lambda (_type text &rest _) (push text warnings))))
+          (dotimes (_ 2)
+            (pilish--decorate-tables-in-region (point-min) (point-max) 40)
+            (should-not (pilish--table-has-data-row-p (point-min) (point-max)))))
+        (should (= compilations failed-call))
+        (should (= 1 (length warnings)))
+        (should (string-match-p "Incompatible Markdown" (car warnings)))
+        (should (equal pilish-test--wide-table
+                       (buffer-substring-no-properties (point-min) (point-max))))
+        (should-not pilish--treesit-data-row-query)
+        (should-not (cl-some (lambda (ov) (overlay-get ov 'pilish-table-display))
+                            (overlays-in (point-min) (point-max))))))))
+
 (ert-deftest pilish-test-decorate-tables-is-idempotent ()
   "Running decoration twice does not accumulate extra overlays."
   (with-temp-buffer

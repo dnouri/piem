@@ -152,31 +152,38 @@ On Emacs 29, which lacks that parameter, we filter manually."
              :key #'treesit-parser-language)))
 
 (defvar pilish--treesit-table-query nil
-  "Pre-compiled tree-sitter query for pipe_table nodes.")
+  "Compiled query for pipe_table nodes, or `unsupported' after a query error.")
 
 (defvar pilish--treesit-data-row-query nil
   "Pre-compiled tree-sitter query for pipe_table data rows.")
 
 (defun pilish--ensure-treesit-queries ()
-  "Ensure tree-sitter table queries are compiled.
-Compiles both queries once against the current buffer's markdown
-language, avoiding the per-call sexp→compiled compilation overhead
-that thrashes tree-sitter's single-entry query cache."
+  "Compile both table queries once and return non-nil when supported.
+Publish the pair only after both compilations succeed.  An incompatible
+Markdown grammar leaves raw tables visible and is not queried again."
   (unless pilish--treesit-table-query
-    (let ((lang (treesit-parser-language
-                 (pilish--markdown-parser))))
-      (setq pilish--treesit-table-query
-            (treesit-query-compile lang '((pipe_table) @table)))
-      (setq pilish--treesit-data-row-query
-            (treesit-query-compile lang '((pipe_table (pipe_table_row) @row)))))))
+    (condition-case nil
+        (let* ((lang (treesit-parser-language (pilish--markdown-parser)))
+               (table (treesit-query-compile lang '((pipe_table) @table)))
+               (rows (treesit-query-compile
+                      lang '((pipe_table (pipe_table_row) @row)))))
+          (setq pilish--treesit-table-query table
+                pilish--treesit-data-row-query rows))
+      (treesit-query-error
+       (setq pilish--treesit-table-query 'unsupported
+             pilish--treesit-data-row-query nil)
+       (display-warning 'pilish
+                        (pilish--incompatible-markdown-grammar-message)
+                        :warning))))
+  (not (eq pilish--treesit-table-query 'unsupported)))
 
 (defun pilish--treesit-table-regions (beg end)
   "Find pipe-table regions between BEG and END using tree-sitter.
 Returns a list of (START . END) pairs for each `pipe_table' node
 whose start position falls within the range."
   (let ((regions nil))
-    (when-let* ((parser (pilish--markdown-parser)))
-      (pilish--ensure-treesit-queries)
+    (when-let* ((parser (pilish--markdown-parser))
+                ((pilish--ensure-treesit-queries)))
       (let ((captures (treesit-query-capture
                        (treesit-parser-root-node parser)
                        pilish--treesit-table-query
@@ -199,8 +206,8 @@ whose start position falls within the range."
   "Return non-nil if the pipe_table between BEG and END has data rows.
 A table needs at least one `pipe_table_row' child to be worth
 decorating (header + separator alone is not enough)."
-  (when-let* ((parser (pilish--markdown-parser)))
-    (pilish--ensure-treesit-queries)
+  (when-let* ((parser (pilish--markdown-parser))
+              ((pilish--ensure-treesit-queries)))
     (let ((captures (treesit-query-capture
                      (treesit-parser-root-node parser)
                      pilish--treesit-data-row-query

@@ -1132,7 +1132,13 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
           (funcall state-cb '(:success :false :error "state failed"))
           (with-current-buffer chat-buf
             (should (pilish--session-transition-active-p)))
-          (funcall history-cb '(:success :false :error "history failed"))
+          (let (diagnostic)
+            (cl-letf (((symbol-function 'message)
+                       (lambda (format-string &rest args)
+                         (setq diagnostic (apply #'format format-string args)))))
+              (funcall history-cb '(:success :false :error "history failed")))
+            (should (equal diagnostic
+                           "Pi: Session history load failed: history failed; run M-x pilish-reload")))
           (with-current-buffer chat-buf
             (should-not (pilish--session-transition-active-p))))
       (pilish-test--kill-live-buffers chat-buf))))
@@ -1169,6 +1175,224 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
                        new-generation))
             (pilish--finish-session-transition new-generation)))
       (pilish-test--kill-live-buffers chat-buf))))
+
+(ert-deftest pilish-test-load-session-history-render-failure-finishes-transition ()
+  "Failed replay unlocks resume but never announces that history was loaded."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (let (succeeded diagnostics)
+      (with-current-buffer chat
+        (let ((generation (pilish--begin-session-transition proc)))
+          (pilish--refresh-transition-state-and-history
+           proc chat generation nil (lambda (_) (setq succeeded t)))))
+      (let ((history-request (car commands))
+            (state-request (cadr commands)))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get state-request :id)
+                    :command "get_state" :success t
+                    :data '(:isStreaming :false :isCompacting :false)))
+        (cl-letf (((symbol-function 'pilish--render-history-assistant-content)
+                   (lambda (&rest _) (error "resume render failed")))
+                  ((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) diagnostics))))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get history-request :id)
+                      :command "get_messages" :success t
+                      :data '(:messages [(:role "assistant" :content "Reply")])))))
+      (should-not succeeded)
+      (with-current-buffer chat
+        (should-not (pilish--session-transition-active-p))
+        (should (string-match-p "Session history could not be displayed"
+                                (buffer-string))))
+      (should (cl-some (lambda (text)
+                        (string-match-p "resume render failed" text)) diagnostics)))))
+
+(ert-deftest pilish-test-load-session-history-invalidated-by-new-work ()
+  "A send, session transition, or process replacement invalidates a snapshot."
+  (dolist (action '(send transition process))
+    (pilish-test-with-rpc-session (chat _input proc commands)
+      (with-current-buffer chat
+        (let ((inhibit-read-only t)) (insert "Keep current display"))
+        (pilish--load-session-history proc nil chat)
+        (let ((request (car commands)))
+          (pcase action
+            ('send (pilish--prepare-and-send "New prompt"))
+            ('transition (pilish--begin-session-transition proc))
+            ('process (pilish--set-process nil)))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get request :id)
+                      :command "get_messages" :success t
+                      :data '(:messages [(:role "assistant" :content "Stale history")])))
+          (should (string-match-p "Keep current display" (buffer-string)))
+          (should-not (string-match-p "Stale history" (buffer-string))))))))
+
+(ert-deftest pilish-test-load-session-history-transition-defers-until-newer-run-settles ()
+  "Resume recovers an invalidated load in either state/history reply order."
+  (dolist (order '(state-first history-first))
+    (pilish-test-with-rpc-session (chat _input proc commands)
+      (with-current-buffer chat
+        (let ((inhibit-read-only t)) (insert "Previous session display"))
+        (let ((generation (pilish--begin-session-transition proc)))
+          (pilish--refresh-transition-state-and-history proc chat generation))
+        (let ((history-request (car commands))
+              (state-response
+               (list :type "response" :id (plist-get (cadr commands) :id)
+                     :command "get_state" :success t
+                     :data '(:isStreaming :false :isCompacting :false))))
+          (when (eq order 'state-first)
+            (pilish-test--stdout proc state-response))
+          (pilish--handle-display-event '(:type "agent_start"))
+          (pilish--handle-display-event
+           '(:type "message_start" :message (:role "assistant")))
+          (pilish-test--send-assistant-message-update
+           '(:type "text_delta" :delta "New session answer"))
+          (pilish--handle-display-event '(:type "agent_end" :messages []))
+          (pilish--handle-display-event '(:type "agent_settled"))
+          (should (= 2 (length commands)))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get history-request :id)
+                      :command "get_messages" :success t
+                      :data '(:messages [(:role "assistant" :content "Obsolete snapshot")])))
+          (when (eq order 'history-first)
+            (should (pilish--session-transition-active-p))
+            (should (= 2 (length commands)))
+            (pilish-test--stdout proc state-response))
+          (should-not (pilish--session-transition-active-p))
+          (should-not (string-match-p "Obsolete snapshot" (buffer-string)))
+          (should (= 3 (length commands)))
+          (should (equal (plist-get (car commands) :type) "get_messages"))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get (car commands) :id)
+                      :command "get_messages" :success t
+                      :data '(:messages [(:role "user" :content "New session question")
+                                         (:role "assistant" :content "New session answer")])))
+          (should-not (string-match-p "Previous session display" (buffer-string)))
+          (should (= 1 (pilish-test--count-matches "New session answer" (buffer-string)))))))))
+
+(ert-deftest pilish-test-history-recovery-after-new-session-cancellation ()
+  "Cancelling a new session resumes recovery of its interrupted history load."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish--load-session-history proc nil chat)
+      (let ((history-request (car commands)) diagnostic)
+        (pilish-new-session)
+        (let ((new-request (car commands)))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get history-request :id)
+                      :command "get_messages" :success t
+                      :data '(:messages [(:role "assistant" :content "Stale history")])))
+          (should-not (string-match-p "Stale history" (buffer-string)))
+          (should (= 2 (length commands)))
+          (cl-letf (((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (setq diagnostic (apply #'format format-string args)))))
+            (pilish-test--stdout
+             proc (list :type "response" :id (plist-get new-request :id)
+                        :command "new_session" :success t :data '(:cancelled t)))))
+        (should (equal diagnostic "Pi: New session cancelled"))
+        (should-not (pilish--session-transition-active-p))
+        (should (= 3 (length commands)))
+        (should (equal (plist-get (car commands) :type) "get_messages"))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "get_messages" :success t
+                    :data '(:messages [(:role "assistant" :content "Recovered history")])))
+        (should (string-match-p "Recovered history" (buffer-string)))
+        (should-not (string-match-p "display incomplete" (pilish--header-line-string)))))))
+
+(ert-deftest pilish-test-history-recovery-after-resume-failure ()
+  "A failed session switch resumes recovery of the unchanged session."
+  (let* ((dir (pilish-test--make-temp-directory "pilish-recovery-resume-"))
+         (path (expand-file-name "target.jsonl" dir)))
+    (unwind-protect
+        (pilish-test-with-rpc-session (chat _input proc commands)
+          (pilish-test--write-session-file path "target" (directory-file-name dir))
+          (with-current-buffer chat
+            (pilish--load-session-history proc nil chat)
+            (let ((history-request (car commands)) diagnostic)
+              (pilish--resume-selected-session proc chat path)
+              (let ((switch-request (car commands)))
+                (pilish-test--stdout
+                 proc (list :type "response" :id (plist-get history-request :id)
+                            :command "get_messages" :success t
+                            :data '(:messages [(:role "assistant" :content "Stale history")])))
+                (should-not (string-match-p "Stale history" (buffer-string)))
+                (should (= 2 (length commands)))
+                (cl-letf (((symbol-function 'message)
+                           (lambda (format-string &rest args)
+                             (setq diagnostic (apply #'format format-string args)))))
+                  (pilish-test--stdout
+                   proc (list :type "response" :id (plist-get switch-request :id)
+                              :command "switch_session" :success :false :error "unreadable"))))
+              (should (equal diagnostic "Pi: Failed to resume session"))
+              (should-not (pilish--session-transition-active-p))
+              (should (= 3 (length commands)))
+              (should (equal (plist-get (car commands) :type) "get_messages"))
+              (pilish-test--stdout
+               proc (list :type "response" :id (plist-get (car commands) :id)
+                          :command "get_messages" :success t
+                          :data '(:messages [(:role "assistant" :content "Original session history")])))
+              (should (string-match-p "Original session history" (buffer-string)))
+              (should-not (string-match-p "display incomplete" (pilish--header-line-string))))))
+      (delete-directory dir t))))
+
+(ert-deftest pilish-test-history-recovery-reset-does-not-reload-old-session ()
+  "A fresh reset drops pending recovery before releasing its transition."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish--load-session-history proc nil chat)
+      (pilish--begin-session-transition proc)
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "get_messages" :success t
+                  :data '(:messages [(:role "assistant" :content "Old session history")])))
+      (should (string-match-p "display incomplete" (pilish--header-line-string)))
+      (pilish--reset-session-state)
+      (should (= 1 (length commands)))
+      (should-not (pilish--session-transition-active-p))
+      (should-not (string-match-p "display incomplete" (pilish--header-line-string))))))
+
+(ert-deftest pilish-test-load-session-history-deferred-by-manual-compaction ()
+  "A compact reservation defers recovery until its response, including failure."
+  (dolist (success '(t :false))
+    (pilish-test-with-rpc-session (chat _input proc commands)
+      (with-current-buffer chat
+        (let ((inhibit-read-only t)) (insert "Current display"))
+        (pilish--load-session-history proc nil chat)
+        (let ((request (car commands)) diagnostics)
+          (cl-letf (((symbol-function 'message)
+                     (lambda (format-string &rest args)
+                       (push (apply #'format format-string args) diagnostics))))
+            (pilish-compact)
+            (let ((compact-request (car commands)))
+              (pilish-test--stdout
+               proc (list :type "response" :id (plist-get request :id)
+                          :command "get_messages" :success t
+                          :data '(:messages [(:role "assistant" :content "Old snapshot")])))
+              (should (string-match-p "Current display" (buffer-string)))
+              (should (= 2 (length commands)))
+              (pilish-test--stdout
+               proc (list :type "response" :id (plist-get compact-request :id)
+                          :command "compact" :success success
+                          :error "compaction unavailable"))))
+          (should (= 3 (length commands)))
+          (should (equal (plist-get (car commands) :type) "get_messages"))
+          (should (member "Pi: Compacting..." diagnostics))
+          (when (eq success :false)
+            (should (member "Pi: Compact failed: compaction unavailable" diagnostics))))))))
+
+(ert-deftest pilish-test-load-session-history-scheduling-failure-is-not-pending ()
+  "A scheduling error does not leave the header promising a nonexistent load."
+  (pilish-test-with-rpc-session (chat _input proc _commands)
+    (with-current-buffer chat
+      (cl-letf (((symbol-function 'pilish--send-string)
+                 (lambda (&rest _) (error "cannot send history request"))))
+        (should-error (pilish--load-session-history proc nil chat)
+                      :type 'error))
+      (should (string-match-p "display incomplete.*pilish-reload"
+                              (pilish--header-line-string)))
+      (should-not (string-match-p "waiting to reload"
+                                  (pilish--header-line-string))))))
 
 (ert-deftest pilish-test-load-session-history-ignores-stale-older-response ()
   "Only the newest in-flight history request may rebuild the chat buffer."

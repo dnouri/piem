@@ -838,7 +838,7 @@ Timer callback for `pilish--stream-delta-flush-timer'.  Also called
 synchronously before any non-delta event so text, thinking, and tool blocks
 keep their authoritative order.  If rendering signals, log once and discard
 the rest of the staged batch rather than risk duplicating partial output;
-canonical history or reload is the recovery path."
+a fresh history load at a safe idle boundary is the recovery path."
   (let ((buffer (or buffer (current-buffer))))
     ;; Cheap pre-check without switching buffers: high-frequency non-delta
     ;; events call this on every token.
@@ -874,6 +874,7 @@ canonical history or reload is the recovery path."
                             ('thinking
                              (pilish--display-thinking-delta text))))))))
               (error
+               (pilish--set-history-recovery t)
                (message "pilish: stream delta flush failed: %s"
                         (error-message-string err))
                nil))))))))
@@ -1025,10 +1026,11 @@ transitions; prompt submission marks the local pre-event window as busy."
 (defun pilish--process-followup-queue ()
   "Send the oldest follow-up only when it is safe to become the next prompt.
 Messages are processed in FIFO order and dropped only after preflight accepts
-them."
+them.  After giving queued input priority, recover an incomplete idle display."
   (when (pilish--ready-to-drain-followups-p)
     (when-let* ((text (pilish--peek-followup)))
-      (pilish--prepare-and-send text 'queued))))
+      (pilish--prepare-and-send text 'queued)))
+  (pilish--maybe-recover-history))
 
 (defun pilish--display-compaction-failure (error-message)
   "Display failed compaction ERROR-MESSAGE without changing the queue."
@@ -1060,7 +1062,8 @@ Extension cancellation is not a local stop; core events own status transitions."
         (pilish--clear-followup-queue)
         (pilish--set-aborted nil))
        ((and result (not cancelled)) (pilish--process-followup-queue))
-       (t (pilish--restore-followup-queue-to-input))))))
+       (t (pilish--restore-followup-queue-to-input))))
+    (pilish--maybe-recover-history)))
 
 (defun pilish--display-retry-start (event)
   "Display retry notice from auto_retry_start EVENT.
@@ -1518,6 +1521,7 @@ Updates buffer-local state and renders display updates."
     ;; Then handle display
     (pcase (plist-get event :type)
     ("agent_start"
+     (pilish--invalidate-history-loads)
      (pilish--hover-clear-live-state)
      (pilish--note-prompt-start)
      (pilish--display-agent-start)
@@ -1690,6 +1694,7 @@ Updates buffer-local state and renders display updates."
          ;; No toolCallId: render through the legacy compatibility block.
          (pilish--display-tool-update partial-result nil))))
     ("compaction_start"
+     (pilish--invalidate-history-loads)
      (when pilish--aborted
        (pilish--send-abort))
      (pilish--set-activity-phase "compact")
@@ -1702,8 +1707,6 @@ Updates buffer-local state and renders display updates."
      ;; Defensively drop pending tool previews and cancel their flush timer; any
      ;; tool still running here is aborted and its block is finalized below.
      (pilish--cancel-tool-update-flush)
-     (pilish--set-canonical-messages
-      (plist-get pilish--state :messages))
      (pilish--display-agent-end)
      (pilish--hover-clear-live-state)
      (pilish--update-hot-tail-boundary)
@@ -1801,17 +1804,29 @@ Returns a plist with:
 
 (defun pilish--clear-render-artifacts ()
   "Delete pi-owned render artifacts in the current chat buffer.
-This removes completed/pending tool overlays, diff overlays, and lightweight
-cold-tool metadata before buffer reset or history rebuild, then clears keyed
-live-tool state, cached execution args, pending coalesced tool updates, and
-the compatibility pending overlay slot so buffer and render state stay
-consistent.  Pending deferred cooling is invalidated first.  Tree-sitter
-overlays are left alone."
+This removes completed/pending tool, table and diff overlays and lightweight
+cold-tool metadata before reset or history rebuild.  Stream markers, recovery
+state, keyed live tools, cached execution args, coalesced updates and the
+compatibility pending overlay slot are cleared to keep display state consistent.
+Pending deferred cooling is invalidated first.  Tree-sitter overlays are left
+alone."
   (pilish--cancel-tool-update-flush)
   (pilish--cancel-stream-delta-flush)
   (pilish--cancel-tool-cooling)
+  (pilish--set-history-recovery nil)
+  (dolist (marker (list pilish--message-start-marker pilish--streaming-marker))
+    (when (markerp marker) (set-marker marker nil)))
+  (pilish--set-message-start-marker nil)
+  (pilish--set-streaming-marker nil)
+  (pilish--reset-thinking-state)
+  (setq pilish--in-thinking-block nil
+        pilish--in-code-block nil
+        pilish--line-parse-state 'line-start
+        pilish--streaming-table-candidate nil
+        pilish--assistant-header-shown nil)
   (remove-overlays (point-min) (point-max) 'pilish-tool-block t)
   (remove-overlays (point-min) (point-max) 'pilish-diff-overlay t)
+  (remove-overlays (point-min) (point-max) 'pilish-table-display t)
   (let ((inhibit-read-only t))
     (remove-text-properties
      (point-min) (point-max) '(pilish-cold-tool-block nil)))
@@ -7546,6 +7561,65 @@ MAP-POSITION is passed to `pilish--restore-window-rewrite-state'."
           (pilish--restore-window-rewrite-state
            window-state map-position))))))
 
+(defun pilish--load-session-history
+    (proc callback &optional chat-buf completion-callback)
+  "Load and display full session history from PROC.
+Call CALLBACK with message count only after a successful rebuild.
+CHAT-BUF defaults to `pilish--get-chat-buffer'; pass it in async callers.
+COMPLETION-CALLBACK runs after the response, including failures or stale loads."
+  (let ((chat-buf (or chat-buf (pilish--get-chat-buffer))))
+    (when (and chat-buf (buffer-live-p chat-buf))
+      (with-current-buffer chat-buf
+        (let ((generation (pilish--invalidate-history-loads)))
+          (pilish--set-history-recovery t)
+          (condition-case err
+              (pilish--rpc-async
+               proc '(:type "get_messages")
+               (lambda (response)
+                 (unwind-protect
+                     (when (buffer-live-p chat-buf)
+                       (with-current-buffer chat-buf
+                         (when (and (eq pilish--process proc)
+                                    (= generation pilish--history-load-generation)
+                                    (pilish--canonical-rerender-safe-p))
+                           (if (eq (plist-get response :success) t)
+                               (let ((messages (plist-get (plist-get response :data)
+                                                          :messages)))
+                                 (when (pilish--with-window-rewrite-preservation
+                                         (pilish--display-session-history messages chat-buf))
+                                   (pilish--refresh-header)
+                                   (when callback (funcall callback (length messages)))))
+                             (pilish--set-history-recovery 'failed)
+                             (message "Pi: Session history load failed: %s; run M-x pilish-reload"
+                                      (or (plist-get response :error) "unknown error"))))))
+                   (when completion-callback
+                     (funcall completion-callback response))
+                   ;; A transition latch may only now release the safe boundary.
+                   ;; Replaced processes and newer in-flight loads are untouched.
+                   (when (buffer-live-p chat-buf)
+                     (with-current-buffer chat-buf
+                       (when (eq pilish--process proc)
+                         (pilish--maybe-recover-history)))))))
+            (error
+             (pilish--set-history-recovery 'failed)
+             (signal (car err) (cdr err)))))))))
+
+(defun pilish--maybe-recover-history ()
+  "Fetch fresh history for an incomplete display at a safe idle boundary.
+The pending RPC table prevents duplicate requests.  Existing history-load
+checks reject stale snapshots; failure requires explicit reload, not a loop."
+  (when (and (eq pilish--history-recovery t)
+             (not (pilish--command-pending-p pilish--process "get_messages"))
+             (not (pilish--session-busy-p))
+             (pilish--canonical-rerender-safe-p)
+             (processp pilish--process)
+             (process-live-p pilish--process))
+    (condition-case err
+        (pilish--load-session-history pilish--process nil (current-buffer))
+      (error
+       (message "Pi: Session history load failed: %s; run M-x pilish-reload"
+                (error-message-string err))))))
+
 (defun pilish--rerender-canonical-history ()
   "Rebuild the current chat buffer from cached canonical messages.
 Visible chat windows keep useful context after the rewrite: windows already at
@@ -7631,11 +7705,12 @@ Tool calls are rendered with headers, output, overlays, and toggles."
   "Display session history MESSAGES in the chat buffer.
 MESSAGES is a vector of message plists from get_messages RPC.
 CHAT-BUF is the target buffer; if nil, uses `pilish--get-chat-buffer'.
-Note: When called from async callbacks, pass CHAT-BUF explicitly."
+Return non-nil only after the complete rebuild succeeds.  On failure, clear
+partial output and show an explicit failure notice with reload instructions.
+When called from async callbacks, pass CHAT-BUF explicitly."
   (setq chat-buf (or chat-buf (pilish--get-chat-buffer)))
   (when (and chat-buf (buffer-live-p chat-buf))
     (with-current-buffer chat-buf
-      (pilish--set-canonical-messages messages)
       (let ((inhibit-read-only t)
             ;; A full resume/reload rebuild allocates many short strings,
             ;; overlays, and display properties.  Keep GC out of the hot path;
@@ -7647,22 +7722,40 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
         ;; rewrites.  Suspend every known md-ts 0.4 per-change hook for the
         ;; whole rebuild.  This is one untracked epoch, so md-ts records one
         ;; dirty range and jit-lock fontifies visible text at the next redisplay.
-        (pilish--with-md-ts-change-hooks-suspended
-            #'pilish--md-ts-change-hook-p
-          (pilish--clear-render-artifacts)
-          (erase-buffer)
-          (insert (pilish--format-startup-header) "\n")
-          (when (vectorp messages)
-            (let ((pilish--defer-history-postprocessing t))
-              (pilish--display-history-messages messages)))
-          (goto-char (point-max))
-          (unless (bolp) (insert "\n"))
-          (pilish--set-message-start-marker nil)
-          (pilish--set-streaming-marker nil)
-          (pilish--update-hot-tail-boundary)
-          (pilish--cool-completed-tool-blocks-outside-hot-tail)
-          (pilish--postprocess-history-buffer)
-          (goto-char (point-max)))))))
+        (condition-case err
+            (pilish--with-md-ts-change-hooks-suspended
+                #'pilish--md-ts-change-hook-p
+              (unless (vectorp messages)
+                (error "Session history is not a message vector"))
+              (pilish--set-canonical-messages messages)
+              (pilish--clear-render-artifacts)
+              (erase-buffer)
+              (insert (pilish--format-startup-header) "\n")
+              (let ((pilish--defer-history-postprocessing t))
+                (pilish--display-history-messages messages))
+              (goto-char (point-max))
+              (unless (bolp) (insert "\n"))
+              (pilish--set-message-start-marker nil)
+              (pilish--set-streaming-marker nil)
+              (pilish--update-hot-tail-boundary)
+              (pilish--cool-completed-tool-blocks-outside-hot-tail)
+              (pilish--postprocess-history-buffer)
+              (goto-char (point-max))
+              t)
+          (error
+           ;; The same change hook may still fail.  Bypass it only while
+           ;; replacing the unusable partial display with this plain notice.
+           (let ((inhibit-modification-hooks t))
+             (pilish--clear-render-artifacts)
+             (erase-buffer)
+             (insert (propertize "Session history could not be displayed.\n"
+                                 'face 'error)
+                     "Run M-x pilish-reload to try again.\n")
+             (set-marker pilish--hot-tail-start (point-min)))
+           (pilish--set-history-recovery 'failed)
+           (message "Pi: Session history replay failed: %s; run M-x pilish-reload"
+                    (error-message-string err))
+           nil))))))
 
 (provide 'pilish-render)
 
