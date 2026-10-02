@@ -6716,6 +6716,8 @@ filters without bypassing the observed command path."
             (pilish-test--session-command-at-point
              item #'pilish-session-browser-delete))
           (should (string-prefix-p "Move session file to trash" prompt))
+          (should (string-match-p "Other Emacs.*external processes.*not checked"
+                                  prompt))
           (should (string-match-p "Disposable session" prompt))
           (should (string-match-p (regexp-quote "project \"acme\"")
                                   prompt))
@@ -7109,22 +7111,11 @@ and an invisible cwd component must not enter the prompt verbatim."
                           :name "Invisible project" :messageCount 1
                           :modified "2026-03-02T12:00:00Z"))
          (items (list alice bob invisible))
-         alice-prompt bob-prompt invisible-prompt)
-    (cl-letf (((symbol-function 'y-or-n-p)
-               (lambda (text) (setq alice-prompt text) nil)))
-      (pilish-test--session-command-at-point
-       alice #'pilish-session-browser-delete items
-       (lambda () (setq pilish--session-browser-scope 'all))))
-    (cl-letf (((symbol-function 'y-or-n-p)
-               (lambda (text) (setq bob-prompt text) nil)))
-      (pilish-test--session-command-at-point
-       bob #'pilish-session-browser-delete items
-       (lambda () (setq pilish--session-browser-scope 'all))))
-    (cl-letf (((symbol-function 'y-or-n-p)
-               (lambda (text) (setq invisible-prompt text) nil)))
-      (pilish-test--session-command-at-point
-       invisible #'pilish-session-browser-delete items
-       (lambda () (setq pilish--session-browser-scope 'all))))
+         ;; Exercise contextual formatting without contacting fixture hosts.
+         (alice-prompt (pilish--session-delete-prompt alice items nil nil))
+         (bob-prompt (pilish--session-delete-prompt bob items nil nil))
+         (invisible-prompt
+          (pilish--session-delete-prompt invisible items nil nil)))
     (let ((context
            (lambda (prompt)
              (when (string-match "in project " prompt)
@@ -7334,6 +7325,148 @@ and an invisible cwd component must not enter the prompt verbatim."
           (should (equal (pilish-test--file-contents target-b) "retargeted")))
       (when (file-directory-p base)
         (delete-directory base t)))))
+
+(ert-deftest pilish-test-session-delete-rejects-changed-file ()
+  "Confirmation does not authorize a changed or removed session file."
+  (dolist (change '(mtime size replacement missing))
+    (let* ((path (make-temp-file "pilish-delete-changed-" nil ".jsonl"))
+           (item (list :path path :name "Changed session"))
+           (time (seconds-to-time 100000))
+           (refreshes 0))
+      (unwind-protect
+          (progn
+            (write-region "original" nil path nil 'silent)
+            (set-file-times path time)
+            (cl-letf (((symbol-function 'y-or-n-p)
+                       (lambda (_prompt)
+                         (pcase change
+                           ('mtime (set-file-times
+                                    path (seconds-to-time 100001)))
+                           ('size
+                            (write-region " appended" nil path 'append 'silent)
+                            (set-file-times path time))
+                           ('replacement
+                            (let ((replacement (make-temp-file
+                                                "pilish-delete-replacement-")))
+                              (write-region "original" nil replacement nil 'silent)
+                              (set-file-times replacement time)
+                              (rename-file replacement path t)))
+                           ('missing (delete-file path nil)))
+                         t))
+                      ((symbol-function 'pilish--session-browser-fetch-and-render)
+                       (lambda () (cl-incf refreshes))))
+              (should-error
+               (pilish-test--session-command-at-point
+                item #'pilish-session-browser-delete)
+               :type 'user-error))
+            (should (= refreshes 0))
+            (if (eq change 'missing)
+                (should-not (file-exists-p path))
+              (should (equal (pilish-test--file-contents path)
+                             (if (eq change 'size)
+                                 "original appended"
+                               "original")))))
+        (when (file-exists-p path) (delete-file path nil))))))
+
+(ert-deftest pilish-test-session-delete-rejects-changed-symlink-target ()
+  "A write through the selected alias vetoes deleting that alias."
+  (let* ((directory (pilish-test--make-temp-directory "pilish-delete-alias-"))
+         (target (expand-file-name "target.jsonl" directory))
+         (link (expand-file-name "alias.jsonl" directory))
+         (item (list :path link :name "Changing alias"))
+         (refreshes 0))
+    (unwind-protect
+        (progn
+          (write-region "original" nil target nil 'silent)
+          (make-symbolic-link target link)
+          (cl-letf (((symbol-function 'y-or-n-p)
+                     (lambda (_prompt)
+                       (write-region " appended" nil target 'append 'silent)
+                       t))
+                    ((symbol-function 'pilish--session-browser-fetch-and-render)
+                     (lambda () (cl-incf refreshes))))
+            (should-error
+             (pilish-test--session-command-at-point
+              item #'pilish-session-browser-delete)
+             :type 'user-error))
+          (should (file-symlink-p link))
+          (should (equal (pilish-test--file-contents target)
+                         "original appended"))
+          (should (= refreshes 0)))
+      (delete-directory directory t))))
+
+(ert-deftest pilish-test-session-delete-rejects-cached-remote-change ()
+  "Confirmation checks fresh TRAMP metadata, not a cached pre-prompt stat."
+  (require 'tramp-sh)
+  (let* ((backing (make-temp-file "pilish-delete-remote-" nil ".jsonl"))
+         (path "/ssh:pilish-test@example.invalid:/sessions/file.jsonl")
+         (item (list :path path :name "Remote session"))
+         (tramp-cache-data (make-hash-table :test #'equal))
+         (tramp-verbose 0)
+         ;; Keep cache entries valid indefinitely so this test has no deadline.
+         (remote-file-name-inhibit-cache nil)
+         (real-delete (symbol-function 'delete-file))
+         (refreshes 0))
+    (unwind-protect
+        (progn
+          (write-region "original" nil backing nil 'silent)
+          ;; Attribute conversion and caching stay real.  The remote stat
+          ;; transport and destructive dispatch use the backing fixture.
+          (cl-letf (((symbol-function 'tramp-get-remote-stat)
+                     (lambda (_vec) "stat"))
+                    ((symbol-function 'tramp-get-remote-gid)
+                     (lambda (_vec _format) 1000))
+                    ((symbol-function 'tramp-get-device)
+                     (lambda (_vec) 1))
+                    ((symbol-function 'tramp-do-file-attributes-with-stat)
+                     (lambda (_vec _localname)
+                       (let ((attributes (file-attributes backing)))
+                         (setf (nth 2 attributes) '("test" . 1000)
+                               (nth 3 attributes) '("test" . 1000))
+                         attributes)))
+                    ((symbol-function 'delete-file)
+                     (lambda (selected &optional trash)
+                       (should (equal selected path))
+                       (funcall real-delete backing trash)))
+                    ((symbol-function 'y-or-n-p)
+                     (lambda (_prompt)
+                       (write-region " appended" nil backing 'append 'silent)
+                       t))
+                    ((symbol-function 'pilish--session-browser-fetch-and-render)
+                     (lambda () (cl-incf refreshes)))
+                    ((symbol-function 'message) #'ignore))
+            (should-error
+             (pilish-test--session-command-at-point
+              item #'pilish-session-browser-delete)
+             :type 'user-error))
+          (should (equal (pilish-test--file-contents backing)
+                         "original appended"))
+          (should (= refreshes 0)))
+      (when (file-exists-p backing) (funcall real-delete backing nil)))))
+
+(ert-deftest pilish-test-session-delete-ignores-access-time ()
+  "Reading the file during confirmation is not a content change."
+  (let* ((path (make-temp-file "pilish-delete-read-" nil ".jsonl"))
+         (item (list :path path :name "Read session"))
+         (refreshes 0))
+    (unwind-protect
+        (progn
+          (write-region "original" nil path nil 'silent)
+          (set-file-times path (seconds-to-time 100000))
+          (let ((delete-by-moving-to-trash nil))
+            (cl-letf (((symbol-function 'y-or-n-p)
+                       (lambda (_prompt)
+                         (should (equal (pilish-test--file-contents path)
+                                        "original"))
+                         t))
+                      ((symbol-function 'pilish--session-browser-fetch-and-render)
+                       (lambda () (cl-incf refreshes)))
+                      ((symbol-function 'message) #'ignore))
+              (pilish-test--session-command-at-point
+               item #'pilish-session-browser-delete)))
+          (should-not (file-exists-p path))
+          (should (= refreshes 1)))
+      (when (file-exists-p path) (delete-file path nil)))))
 
 (ert-deftest pilish-test-session-delete-ignores-non-session-section ()
   "Delete on a grouping header does not treat its value as a file path."
@@ -9951,6 +10084,121 @@ just the session browser (V14)."
     (let ((this-command 'magit-section-backward))
       (magit-section-backward))
     (should (= (point) (pilish-test--browse-fold-row-start "root")))))
+
+(ert-deftest pilish-test-session-fold-hidden-actions-refused ()
+  "A hidden row cannot be deleted, renamed, or switched before redisplay."
+  (let* ((directory (pilish-test--make-temp-directory "pilish-fold-actions-"))
+         (parent (expand-file-name "parent.jsonl" directory))
+         (child (expand-file-name "child.jsonl" directory)))
+    (unwind-protect
+        (progn
+          (dolist (path (list parent child))
+            (pilish-test--write-session-lines
+             path (list (pilish-test--make-session-header "session")
+                        (pilish-test--user-line "user" nil "Question"))))
+          (with-temp-buffer
+            (pilish-session-browser-mode)
+            (setq pilish--session-browser-items
+                  (list (list :path parent :name "Parent")
+                        (list :path child :name "Child" :parentSessionPath parent))
+                  pilish--session-browser-view 'threaded
+                  pilish--session-browser-scope 'all)
+            (pilish--session-browser-rerender)
+            (goto-char (pilish-test--browse-fold-row-start parent))
+            (pilish-browse-toggle-fold)
+            (let* ((hidden (pilish-test--browse-fold-row-start child))
+                   (section (plist-get (pilish-test--browse-fold-row child) :section))
+                   (before (pilish-test--file-contents child))
+                   prompts switches messages)
+              (should (invisible-p hidden))
+              (cl-letf (((symbol-function 'y-or-n-p)
+                         (lambda (prompt) (push prompt prompts) t))
+                        ((symbol-function 'read-string)
+                         (lambda (prompt &rest _) (push prompt prompts) "Renamed"))
+                        ((symbol-function 'pilish--browse-switch-session)
+                         (lambda (path) (push path switches)))
+                        ((symbol-function 'pilish--session-browser-fetch-and-render)
+                         #'ignore)
+                        ((symbol-function 'message)
+                         (lambda (fmt &rest args)
+                           (push (apply #'format fmt args) messages))))
+                ;; The command boundary must work even when redisplay has
+                ;; not repaired point, or Magit's context target is hidden.
+                (dolist (context '(point current stale))
+                  (let ((magit--context-menu-section
+                         (unless (eq context 'point) section)))
+                    (when (eq context 'stale)
+                      (pilish--session-browser-rerender)
+                      (should (invisible-p
+                               (pilish-test--browse-fold-row-start child))))
+                    (dolist (command '(pilish-session-browser-delete
+                                       pilish-session-browser-rename
+                                       pilish-session-browser-switch))
+                      (goto-char (if (eq context 'point) hidden (point-max)))
+                      (funcall command)
+                      (should (file-exists-p child))
+                      (should (equal (pilish-test--file-contents child) before))
+                      (should-not prompts)
+                      (should-not switches))))
+                (should (= (length messages) 9))
+                (should (cl-every (lambda (text)
+                                    (equal text "Pi: No session at point"))
+                                  messages))))))
+      (delete-directory directory t))))
+
+(ert-deftest pilish-test-tree-fold-hidden-actions-refused ()
+  "Hidden tree nodes cannot be labeled or selected for continuation."
+  (let* ((path (make-temp-file "pilish-fold-tree-actions-" nil ".jsonl"))
+         (chat (generate-new-buffer " *pilish-fold-tree-chat*")))
+    (unwind-protect
+        (progn
+          (pilish-test--write-session-lines
+           path (list (pilish-test--make-session-header "session")
+                      (pilish-test--user-line "root" nil "Root")
+                      (pilish-test--user-line "child" "root" "Child")))
+          (with-current-buffer chat
+            (setq pilish--state (list :session-file path)))
+          (with-temp-buffer
+            (pilish-tree-browser-mode)
+            (setq pilish--chat-buffer chat
+                  pilish--tree-browser-loaded-file path
+                  pilish--tree-browser-tree
+                  [(:id "root" :type "message" :role "user" :preview "Root"
+                    :children [(:id "child" :type "message" :role "user"
+                                :preview "Child" :children [])])]
+                  pilish--tree-browser-filter 'default)
+            (pilish--tree-browser-rerender)
+            (goto-char (pilish-test--browse-fold-row-start "root"))
+            (pilish-browse-toggle-fold)
+            (let* ((hidden (pilish-test--browse-fold-row-start "child"))
+                   (section (plist-get (pilish-test--browse-fold-row "child")
+                                       :section))
+                   (before (pilish-test--file-contents path))
+                   prompts navigations messages)
+              (should (invisible-p hidden))
+              (cl-letf (((symbol-function 'read-string)
+                         (lambda (prompt &rest _) (push prompt prompts) "Label"))
+                        ((symbol-function 'pilish--browse-navigate)
+                         (lambda (id) (push id navigations)))
+                        ((symbol-function 'message)
+                         (lambda (fmt &rest args)
+                           (push (apply #'format fmt args) messages))))
+                (dolist (context '(point current stale))
+                  (let ((magit--context-menu-section
+                         (unless (eq context 'point) section)))
+                    (when (eq context 'stale)
+                      (pilish--tree-browser-rerender)
+                      (should (invisible-p
+                               (pilish-test--browse-fold-row-start "child"))))
+                    (goto-char (if (eq context 'point) hidden (point-max)))
+                    (pilish-tree-browser-set-label)
+                    (should (equal (pilish-test--file-contents path) before))
+                    (should-not prompts)
+                    (pilish-tree-browser-navigate)
+                    (should-not navigations)))
+                (should (member "Pi: No tree node at point" messages))))))
+      (kill-buffer chat)
+      (delete-file path nil))))
 
 (ert-deftest pilish-test-tree-fold-ambiguous-row-is-never-target ()
   "A canonical ambiguous-id display row has no fold action or state."

@@ -878,5 +878,57 @@ keep their recovery keys on screen too."
       (when (and frame (frame-live-p frame))
         (delete-frame frame)))))
 
+(defun pilish-gui-test--folded-browser-motions (down up &optional evil)
+  "Check DOWN and UP skip a folded session family on a real display.
+When EVIL is non-nil, enable Evil locally before exercising its motions."
+  (let (frame buffer)
+    (unwind-protect
+        (progn
+          (setq frame (make-frame '((width . 80) (height . 22)))
+                buffer (generate-new-buffer " *pilish-gui-fold-motion*"))
+          (with-selected-frame frame
+            (switch-to-buffer buffer)
+            (pilish-session-browser-mode)
+            (when evil
+              (evil-local-mode 1)
+              (evil-motion-state))
+            (setq pilish--session-browser-scope 'all
+                  pilish--session-browser-view 'threaded
+                  pilish--session-browser-items
+                  '((:path "/tmp/pilish-gui-fold-parent.jsonl" :name "Parent"
+                     :modified "2026-01-02T00:00:00Z")
+                    (:path "/tmp/pilish-gui-fold-child.jsonl" :name "Child"
+                     :parentSessionPath "/tmp/pilish-gui-fold-parent.jsonl"
+                     :modified "2026-01-02T00:00:00Z")
+                    (:path "/tmp/pilish-gui-fold-other.jsonl" :name "Other"
+                     :modified "2026-01-01T00:00:00Z")))
+            (pilish--session-browser-rerender)
+            (goto-char (point-min))
+            (search-forward "Parent")
+            (beginning-of-line)
+            (pilish-browse-toggle-fold)
+            (redisplay t)
+            (let ((this-command down)) (call-interactively down))
+            (redisplay t)
+            (should-not (invisible-p (point)))
+            (should (equal (oref (magit-current-section) value)
+                           "/tmp/pilish-gui-fold-other.jsonl"))
+            (let ((this-command up)) (call-interactively up))
+            (redisplay t)
+            (should-not (invisible-p (point)))
+            (should (equal (oref (magit-current-section) value)
+                           "/tmp/pilish-gui-fold-parent.jsonl"))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (when (and frame (frame-live-p frame)) (delete-frame frame)))))
+
+(ert-deftest pilish-gui-test-browser-fold-plain-motions ()
+  "Ordinary line motions do not strand the cursor on folded session rows."
+  (pilish-gui-test--folded-browser-motions #'next-line #'previous-line))
+
+(ert-deftest pilish-gui-test-browser-fold-evil-motions ()
+  "Evil j/k leave point on a visible row after redisplay."
+  (unless (require 'evil nil t) (ert-skip "Evil not installed"))
+  (pilish-gui-test--folded-browser-motions #'evil-next-line #'evil-previous-line t))
+
 (provide 'pilish-gui-tests)
 ;;; pilish-gui-tests.el ends here
