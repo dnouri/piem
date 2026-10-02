@@ -680,11 +680,12 @@ project-local Pi files for Emacs sessions.
 #+html: <details>
 #+html: <summary><strong>The header shows <code>thinking (no output 5m)</code></strong></summary>
 
-While streaming or compacting, five minutes without output from Pi
-changes only the existing input activity status, using Emacs's
-=warning= face; the phase stays visible.  Idle and sending sessions
-are not monitored, and hiding the input also hides the warning.  The
-warning never aborts, polls Pi, or changes session state.
+While sending, streaming or compacting, five minutes without output
+from Pi changes only the existing input activity status, using Emacs's
+=warning= face; the phase stays visible.  Idle sessions are not
+monitored, and hiding the input also hides the warning.  The warning
+never aborts, polls Pi, or changes session state; it suggests
+=M-x pilish-reload= when stopping never finishes.
 
 Any nonempty parent stdout counts — ordinary replies, repeated tool
 progress, even partial or malformed output; stderr does not.  Silence

@@ -134,7 +134,7 @@ Some operations like model loading may need more time."
 
 (defcustom pilish-session-inactivity-timeout 300
   "Seconds without Pi stdout before warning in the input activity status.
-Use a positive number, or nil to disable.  Only streaming and compacting
+Use a positive number, or nil to disable.  Sending, streaming and compacting
 sessions are monitored.  Any nonempty stdout counts, even partial output
 or RPC responses; silence does not prove Pi has stopped working.
 Changes take effect at the next header refresh, retaining the output age.
@@ -1176,6 +1176,7 @@ CHAT-BUFFER defaults to the current buffer."
 
 (defun pilish--set-process (process)
   "Set the pi RPC subprocess PROCESS for this session.
+Changing the process clears Stop intent owned by the previous process.
 Resets cached process version and starts a delayed version probe for
 new live processes in interactive sessions."
   (unless (eq process pilish--process)
@@ -1184,6 +1185,7 @@ new live processes in interactive sessions."
       (process-put process 'pilish-last-output-time (float-time)))
     (pilish--invalidate-model-change)
     (pilish--invalidate-prompt-start-wait)
+    (pilish--set-aborted nil)
     ;; Reload can replace a process without its exit handler or a successful
     ;; subsequent history refresh.  End live measurements at this boundary.
     (when (fboundp 'pilish--hover-clear-live-state)
@@ -1375,10 +1377,10 @@ Keep refreshing even when the warning option is nil, so reenabling it
 while Pi is silent needs neither a setter nor an RPC.")
 
 (defun pilish--inactivity-eligible-p ()
-  "Return whether this chat owns a live streaming or compacting process."
+  "Return whether this chat owns a live sending, streaming or compacting process."
   (and (processp pilish--process)
        (process-live-p pilish--process)
-       (memq pilish--status '(streaming compacting))
+       (memq pilish--status '(sending streaming compacting))
        (not pilish--session-transition-active)))
 
 (defun pilish--cancel-inactivity-timer ()
@@ -1441,7 +1443,8 @@ Arming never overwrites the stdout receipt that preceded a state event."
        (format (concat "No stdout received from Pi for %d seconds. "
                        "Pi may still be working. Use M-x pilish-abort "
                        "(normally C-c C-k) in this session to stop and "
-                       "discard queued continuations.")
+                       "discard queued continuations. If Stop does not finish, "
+                       "use M-x pilish-reload to restart this session.")
                (floor age))))))
 
 (defun pilish--run-activity-phase-functions
@@ -1492,7 +1495,7 @@ Updated after each agent turn completes.")
 (defvar-local pilish--aborted nil
   "Non-nil while an explicit local stop still owns the current operation.
 Retained across compaction and delayed agent_start until settlement, prompt
-rejection, no-turn completion, or process exit.")
+rejection, no-turn completion, process exit, or process replacement.")
 
 (defun pilish--set-aborted (value)
   "Set the aborted flag to VALUE."
@@ -3063,6 +3066,7 @@ Call ON-NO-AGENT-START after releasing local ownership."
         (when pilish--aborted
           (pilish--clear-followup-queue))
         (setq pilish--aborted nil)
+        (pilish--reconcile-inactivity-timer)
         (when on-no-agent-start
           (funcall on-no-agent-start))))))
 
@@ -3152,7 +3156,8 @@ ON-NO-AGENT-START runs only for accepted requests confirmed to have no turn."
         (with-current-buffer chat-buf
           (setq wait (pilish--begin-prompt-start-wait))
           (setq pilish--status 'sending)
-          (pilish--set-activity-phase "thinking")))
+          (pilish--set-activity-phase "thinking")
+          (pilish--reconcile-inactivity-timer)))
       (condition-case err
           (pilish--rpc-async
            proc
@@ -3220,7 +3225,8 @@ or compaction retain their activity and stop intent, even if restoration fails."
               (setq pilish--status 'idle)))
           (when (eq pilish--status 'idle)
             (setq pilish--pre-compaction-status nil pilish--aborted nil)
-            (pilish--set-activity-phase "idle")))))))
+            (pilish--set-activity-phase "idle"))
+          (pilish--reconcile-inactivity-timer))))))
 
 
 (provide 'pilish-ui)

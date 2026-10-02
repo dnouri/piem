@@ -413,10 +413,21 @@ Adds only TEXT to history, resets history navigation, and clears input."
   (with-current-buffer chat-buf
     (pilish--push-followup text)))
 
+(defun pilish--input-submission-refusal (chat-buf)
+  "Return a reason to keep the draft instead of submitting to CHAT-BUF."
+  (when (buffer-live-p chat-buf)
+    (with-current-buffer chat-buf
+      (cond
+       (pilish--aborted
+        "Pi: Still stopping; draft kept in the input buffer")
+       ((pilish--command-pending-p (pilish--get-process) "steer")
+        "Pi: A steering response is pending; draft kept in the input buffer")))))
+
 (defun pilish-send ()
   "Send the current input buffer contents to pi.
 Clears the input buffer after sending.  Does nothing if buffer is empty.
 If pi is busy (sending, streaming, or compacting), queues a local follow-up.
+While Stop or a steering response is pending, keep the draft.
 An attached image is accepted only with a direct, ordinary, idle prompt.
 All built-in slash commands are handled locally; other slash commands are
 sent to pi."
@@ -427,13 +438,16 @@ sent to pi."
          (transitioning (and chat-buf
                              (pilish--session-transition-active-p
                               chat-buf)))
-         (busy (and chat-buf (pilish--session-busy-p chat-buf))))
+         (busy (and chat-buf (pilish--session-busy-p chat-buf)))
+         (refusal (pilish--input-submission-refusal chat-buf)))
     (cond
      ((string-empty-p text)
       (when prompt-image
         (message "Pi: Add prompt text before sending the attached image")))
      (transitioning
       (message "Pi: Cannot send while session is switching"))
+     (refusal
+      (message "%s" refusal))
      ((and prompt-image
            (pilish--model-change-pending-p chat-buf))
       (message "Pi: Wait for the pending model change before sending an image"))
@@ -670,21 +684,37 @@ Skips / at buffer start to allow slash command completion."
 ;;;; Editor Features: Message Queuing
 
 (defun pilish--send-steer-message (text)
-  "Send TEXT as a steering message via RPC.
-Returns t if message was sent, nil if process unavailable.
-Shows error message if RPC fails."
-  (let ((proc (pilish--get-process)))
+  "Submit input TEXT as steering; consume the draft only on acknowledgment.
+A successful response records TEXT in history and clears only an unchanged
+input draft without a newly attached image.  Ignore responses from an older
+session or process.  Failed requests leave the draft untouched."
+  (let* ((input-buf (current-buffer))
+         (chat-buf (pilish--get-chat-buffer))
+         (proc (pilish--get-process))
+         (generation (and chat-buf
+                          (buffer-local-value
+                           'pilish--session-transition-generation chat-buf)))
+         (tick (buffer-chars-modified-tick)))
     (if (and proc (process-live-p proc))
         (progn
-          (pilish--rpc-async proc
-                                      (list :type "steer" :message text)
-                                      (lambda (response)
-                                        (unless (eq (plist-get response :success) t)
-                                          (message "Pi: Steering failed: %s"
-                                                   (or (plist-get response :error) "unknown error")))))
-          t)
-      (message "Pi: Cannot send steering - process unavailable")
-      nil)))
+          (message "Pi: Sending steering message...")
+          (pilish--rpc-async
+           proc (list :type "steer" :message text)
+           (lambda (response)
+             (when (and (buffer-live-p input-buf)
+                        (pilish--session-transition-current-p chat-buf proc generation)
+                        (eq input-buf (buffer-local-value 'pilish--input-buffer chat-buf)))
+               (with-current-buffer input-buf
+                 (if (eq (plist-get response :success) t)
+                     (progn
+                       (if (and (= tick (buffer-chars-modified-tick))
+                                (not (pilish--get-prompt-image)))
+                           (pilish--accept-input-text text)
+                         (pilish--history-add text))
+                       (message "Pi: Steering message sent"))
+                   (message "Pi: Steering failed: %s"
+                            (or (plist-get response :error) "unknown error"))))))))
+      (message "Pi: Cannot send steering - process unavailable"))))
 
 (defun pilish-queue-steering ()
   "Send current input as a steering message.
@@ -696,33 +726,34 @@ assistant output completes).
 
 During compaction or while awaiting run settlement, steering text is queued
 as a local follow-up.  It is sent after the surrounding run and any local
-command reservation finish.  Steering refuses a draft image."
+command reservation finish.  Keep the draft while Stop or a steering response
+is pending.  Successful steering clears only the unchanged, acknowledged draft.
+Steering refuses a draft image."
   (interactive)
-  (let ((text (string-trim (buffer-string))))
-    (if (pilish--get-prompt-image)
-        (message "Pi: Cannot steer with an attached image")
-      (unless (string-empty-p text)
-        (let ((chat-buf (pilish--get-chat-buffer)))
-          (when chat-buf
-            (let ((status (buffer-local-value 'pilish--status chat-buf)))
-              (cond
-               ((pilish--session-transition-active-p chat-buf)
-                (message "Pi: Cannot send steering while session is switching"))
-               ((and (eq status 'idle)
-                     (not (pilish--session-busy-p chat-buf)))
-                (message "Pi: Nothing to interrupt - use C-c C-c to send"))
-               ((or (eq status 'compacting)
-                    (and (memq status '(idle sending))
-                         (not (pilish--session-steerable-p chat-buf))))
-                (pilish--queue-followup-text chat-buf text)
-                (message "Pi: Steering queued (will send when Pi is ready)"))
-               ((memq status '(sending streaming))
-                (when (pilish--send-steer-message text)
-                  (pilish--accept-input-text text)
-                  (message "Pi: Steering message sent")))
-               (t
-                (message "Pi: Cannot steer while session status is %s"
-                         status))))))))))
+  (let* ((text (string-trim (buffer-string)))
+         (chat-buf (pilish--get-chat-buffer))
+         (status (and chat-buf (buffer-local-value 'pilish--status chat-buf)))
+         (refusal (pilish--input-submission-refusal chat-buf)))
+    (cond
+     (refusal
+      (message "%s" refusal))
+     ((pilish--get-prompt-image)
+      (message "Pi: Cannot steer with an attached image"))
+     ((or (string-empty-p text) (null chat-buf)))
+     ((pilish--session-transition-active-p chat-buf)
+      (message "Pi: Cannot send steering while session is switching"))
+     ((and (eq status 'idle)
+           (not (pilish--session-busy-p chat-buf)))
+      (message "Pi: Nothing to interrupt - use C-c C-c to send"))
+     ((or (eq status 'compacting)
+          (and (memq status '(idle sending))
+               (not (pilish--session-steerable-p chat-buf))))
+      (pilish--queue-followup-text chat-buf text)
+      (message "Pi: Steering queued (will send when Pi is ready)"))
+     ((memq status '(sending streaming))
+      (pilish--send-steer-message text))
+     (t
+      (message "Pi: Cannot steer while session status is %s" status)))))
 
 (defun pilish-queue-followup ()
   "Queue current input as a follow-up message.

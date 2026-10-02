@@ -1149,6 +1149,72 @@ not claim to distinguish those otherwise identical sending-state traces."
           (should (= 1 (cl-count "abort" commands :test #'equal)))
           (should (eq pilish--status 'streaming)))))))
 
+(ert-deftest pilish-test-stop-keeps-new-input-until-settlement ()
+  "Send and Steer refuse new drafts while Stop is still pending."
+  (dolist (command '(pilish-send pilish-queue-steering))
+    (dolist (phase '(sending streaming compacting))
+      (dolist (attach-image '(nil t))
+        (pilish-test-with-rpc-session (chat input proc commands)
+          (let ((image (and attach-image
+                            (pilish--make-prompt-image :name "draft.png"
+                                                      :mime-type "image/png"
+                                                      :byte-size 1 :data "AA==")))
+                notice)
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args)
+                         (setq notice (apply #'format fmt args)))))
+              (pilish-test--stdout proc '(:type "agent_start"))
+              (pcase phase
+                ('sending
+                 (pilish-test--stdout proc '(:type "agent_end" :messages [])))
+                ('compacting
+                 (pilish-test--stdout proc '(:type "compaction_start"
+                                                 :reason "threshold"))))
+              (with-current-buffer chat (setq pilish--followup-queue '("before Stop")))
+              (with-current-buffer input (pilish-abort))
+              (should (buffer-local-value 'pilish--aborted chat))
+              (should-not (buffer-local-value 'pilish--followup-queue chat))
+              (setq commands nil)
+              (with-current-buffer input
+                (pilish--history-add "older input")
+                (setq pilish--input-ring-index 0 pilish--input-saved "saved draft")
+                (pilish--set-prompt-image image)
+                (insert "  keep this draft\n ")
+                (funcall command)
+                (should (equal (buffer-string) "  keep this draft\n "))
+                (should (= 1 (ring-length pilish--input-ring)))
+                (should (= pilish--input-ring-index 0))
+                (should (equal pilish--input-saved "saved draft"))
+                (should (eq image (pilish--get-prompt-image))))
+              (should (string-match-p "stopping.*draft" notice))
+              (should-not commands)
+              (should-not (buffer-local-value 'pilish--followup-queue chat))
+              ;; Delayed completion must not take the draft either.
+              (pilish-test--stdout proc '(:type "agent_end" :messages []))
+              (pilish-test--stdout proc '(:type "agent_settled"))
+              (should-not (buffer-local-value 'pilish--aborted chat))
+              (with-current-buffer input
+                (should (equal (buffer-string) "  keep this draft\n "))
+                (should (eq image (pilish--get-prompt-image)))))))))))
+
+(ert-deftest pilish-test-stop-refusal-keeps-on-demand-input-visible ()
+  "Refusing a draft during Stop does not hide its input window."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let ((pilish-input-window-display 'on-demand))
+      (save-window-excursion
+        (set-window-buffer (selected-window) chat)
+        (let ((input-window (split-window-below)))
+          (set-window-buffer input-window input)
+          (select-window input-window)
+          (cl-letf (((symbol-function 'message) #'ignore))
+            (pilish-test--stdout proc '(:type "agent_start"))
+            (pilish-abort)
+            (insert "still composing")
+            (pilish-send))
+          (should (window-live-p input-window))
+          (should (eq (selected-window) input-window))
+          (should (eq (window-buffer input-window) input)))))))
+
 (ert-deftest pilish-test-abort-noop-when-idle ()
   "pilish-abort does nothing when idle."
   (with-temp-buffer
@@ -1205,34 +1271,215 @@ When user aborts, they want to stop everything - including queued messages."
 
 ;;; Message Queuing
 
+(ert-deftest pilish-test-steering-rejection-keeps-draft-for-retry ()
+  "A rejected steering request keeps its draft until a retry is accepted."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (notice)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (setq notice (apply #'format fmt args)))))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input
+          (insert "  retry this steer\n ")
+          (pilish-queue-steering)
+          (should (equal (buffer-string) "  retry this steer\n "))
+          (should (ring-empty-p (pilish--input-ring))))
+        (should (= 1 (length commands)))
+        (should (equal (plist-get (car commands) :type) "steer"))
+        (should (equal (plist-get (car commands) :message) "retry this steer"))
+        (should-not (string-match-p "message sent" notice))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success :false :error "Queue rejected"))
+        (should (string-match-p "Steering failed.*Queue rejected" notice))
+        (with-current-buffer input
+          (should (equal (buffer-string) "  retry this steer\n "))
+          (should (ring-empty-p (pilish--input-ring)))
+          (pilish-queue-steering))
+        (should (= 2 (length commands)))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success t))
+        (with-current-buffer input
+          (should (string-empty-p (buffer-string)))
+          (should (equal (ring-elements pilish--input-ring) '("retry this steer"))))
+        (should (equal notice "Pi: Steering message sent"))
+        (with-current-buffer chat
+          (should-not pilish--followup-queue)
+          (should-not (string-match-p "retry this steer" (buffer-string))))))))
+
+(ert-deftest pilish-test-steering-pending-refuses-duplicate-submission ()
+  "Send and Steer cannot submit again before a steering response arrives."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (notice)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (setq notice (apply #'format fmt args)))))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input
+          (insert "pending steer")
+          (pilish-queue-steering)
+          (dolist (command '(pilish-send pilish-queue-steering))
+            (funcall command)
+            (should (string-match-p "steering.*pending.*draft" notice))
+            (should (equal (buffer-string) "pending steer"))
+            (should (ring-empty-p (pilish--input-ring)))))
+        (should (= 1 (length commands)))
+        (should-not (buffer-local-value 'pilish--followup-queue chat))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success :false :error "Rejected"))
+        (with-current-buffer input
+          (pilish-send)
+          (should (string-empty-p (buffer-string))))
+        (should (equal (buffer-local-value 'pilish--followup-queue chat)
+                       '("pending steer")))))))
+
+(ert-deftest pilish-test-steering-success-keeps-edited-draft ()
+  "Delayed success accepts the submitted text, not a newer draft."
+  (dolist (new-draft '("new draft" "original steer"))
+    (pilish-test-with-rpc-session (chat input proc commands)
+      (cl-letf (((symbol-function 'message) #'ignore))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input
+          (insert "original steer")
+          (pilish-queue-steering)
+          (should (equal (buffer-string) "original steer"))
+          (erase-buffer)
+          (insert new-draft)
+          (setq pilish--input-ring-index 0 pilish--input-saved "working draft"))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success t))
+        (with-current-buffer input
+          (should (equal (buffer-string) new-draft))
+          (should (= pilish--input-ring-index 0))
+          (should (equal pilish--input-saved "working draft"))
+          (should (equal (ring-elements pilish--input-ring) '("original steer"))))))))
+
+(ert-deftest pilish-test-steering-success-keeps-new-image-draft ()
+  "An image attached after steering submission keeps the text as its draft."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let ((image (pilish--make-prompt-image :name "new.png" :mime-type "image/png"
+                                          :byte-size 1 :data "AA==")))
+      (cl-letf (((symbol-function 'message) #'ignore))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input
+          (insert "original steer")
+          (pilish-queue-steering)
+          (pilish--set-prompt-image image))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success t))
+        (with-current-buffer input
+          (should (equal (buffer-string) "original steer"))
+          (should (eq image (pilish--get-prompt-image)))
+          (should (equal (ring-elements pilish--input-ring) '("original steer"))))))))
+
+(ert-deftest pilish-test-steering-old-response-does-not-touch-new-session ()
+  "A response from an older session or process cannot consume its new draft."
+  (dolist (change '(session process))
+    (dolist (success '(t :false))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let (notices replacement)
+          (unwind-protect
+              (cl-letf (((symbol-function 'message)
+                         (lambda (fmt &rest args)
+                           (push (apply #'format fmt args) notices))))
+                (pilish-test--stdout proc '(:type "agent_start"))
+                (with-current-buffer input
+                  (insert "old steering")
+                  (pilish-queue-steering))
+                (with-current-buffer chat
+                  (if (eq change 'session)
+                      (pilish--finish-session-transition
+                       (pilish--begin-session-transition proc))
+                    (setq replacement (start-process "pilish-new-rpc" nil "cat"))
+                    (set-process-query-on-exit-flag replacement nil)
+                    (pilish--set-process replacement)))
+                (setq notices nil)
+                (with-current-buffer input
+                  (erase-buffer)
+                  (insert "new session draft"))
+                (pilish-test--stdout
+                 proc (list :type "response" :id (plist-get (car commands) :id)
+                            :command "steer" :success success :error "Old failure"))
+                (should-not notices)
+                (with-current-buffer input
+                  (should (equal (buffer-string) "new session draft"))
+                  (should (ring-empty-p (pilish--input-ring)))))
+            (when (and replacement (process-live-p replacement))
+              (delete-process replacement))))))))
+
+(ert-deftest pilish-test-steering-response-after-input-kill-is-harmless ()
+  "A late response cannot accept input into a dead composition buffer."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (notices)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) notices))))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input
+          (insert "vanished input")
+          (pilish-queue-steering)
+          (should (equal (buffer-string) "vanished input")))
+        (pilish-test--kill-live-buffers input)
+        (setq notices nil)
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success t))
+        (should-not notices)
+        (should-not (pilish--command-pending-p proc "steer"))))))
+
+(ert-deftest pilish-test-steering-transport-error-keeps-draft-and-releases-submission ()
+  "A failed pipe write leaves no steering reservation or consumed draft."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (pilish-test--stdout proc '(:type "agent_start"))
+      (with-current-buffer input
+        (insert "retry transport")
+        (cl-letf (((symbol-function 'pilish--send-string)
+                   (lambda (_proc _line) (error "Broken pipe"))))
+          (should-error (pilish-queue-steering) :type 'error))
+        (should (equal (buffer-string) "retry transport"))
+        (should (ring-empty-p (pilish--input-ring)))
+        (should-not (pilish--command-pending-p proc "steer"))
+        (pilish-queue-steering)
+        (should (equal (buffer-string) "retry transport")))
+      (should (= 1 (length commands)))
+      (should (equal (plist-get (car commands) :message) "retry transport")))))
+
+(ert-deftest pilish-test-steering-process-exit-keeps-draft ()
+  "Process-exit rejection releases steering without consuming its draft."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (pilish-test--stdout proc '(:type "agent_start"))
+      (with-current-buffer input
+        (insert "keep after exit")
+        (pilish-queue-steering))
+      (delete-process proc)
+      (pilish--handle-process-exit proc "connection closed\n")
+      (should-not (pilish--command-pending-p proc "steer"))
+      (with-current-buffer input
+        (should (equal (buffer-string) "keep after exit"))
+        (should (ring-empty-p (pilish--input-ring)))))))
+
 (ert-deftest pilish-test-queue-steering-when-streaming-sends-steer ()
-  "Queue steering sends steer RPC command when agent is streaming."
-  (let ((chat-buf (get-buffer-create "*pilish-test-queue-steer*"))
-        (input-buf (get-buffer-create "*pilish-test-queue-steer-input*"))
-        (sent-command nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer chat-buf
-            (pilish-chat-mode)
-            (setq pilish--status 'streaming)
-            (setq pilish--input-buffer input-buf))
-          (with-current-buffer input-buf
-            (pilish-input-mode)
-            (setq pilish--chat-buffer chat-buf)
-            (insert "Please stop and focus on X")
-            (cl-letf (((symbol-function 'pilish--get-process) (lambda () 'mock-proc))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'pilish--rpc-async)
-                       (lambda (_proc cmd _cb) (setq sent-command cmd))))
-              (pilish-queue-steering))
-            ;; Should send steer command
-            (should sent-command)
-            (should (equal (plist-get sent-command :type) "steer"))
-            (should (equal (plist-get sent-command :message) "Please stop and focus on X"))
-            ;; Input should be cleared
-            (should (string-empty-p (buffer-string)))))
-      (kill-buffer chat-buf)
-      (kill-buffer input-buf))))
+  "Steering submits an RPC and clears its draft after acknowledgment."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (pilish-test--stdout proc '(:type "agent_start"))
+      (with-current-buffer input
+        (insert "Please stop and focus on X")
+        (pilish-queue-steering)
+        (should (equal (buffer-string) "Please stop and focus on X")))
+      (should (equal (plist-get (car commands) :type) "steer"))
+      (should (equal (plist-get (car commands) :message) "Please stop and focus on X"))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "steer" :success t))
+      (with-current-buffer input
+        (should (string-empty-p (buffer-string)))))))
 
 (ert-deftest pilish-test-queue-steering-when-sending-sends-steer ()
   "Steer an unstarted prompt or an announced retry, not a bare sending status."
@@ -1257,10 +1504,15 @@ When user aborts, they want to stop everything - including queued messages."
           (with-current-buffer input
             (insert "Steer the upcoming run")
             (pilish-queue-steering)
-            (should (string-empty-p (buffer-string))))
+            (should (equal (buffer-string) "Steer the upcoming run")))
           (should (= 2 (length commands)))
           (should (equal (plist-get (car commands) :type) "steer"))
           (should (equal (plist-get (car commands) :message) "Steer the upcoming run"))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get (car commands) :id)
+                      :command "steer" :success t))
+          (with-current-buffer input
+            (should (string-empty-p (buffer-string))))
           (should (equal notice "Pi: Steering message sent")))))))
 
 (defun pilish-test--retry-steering-after-state-refresh (path)
@@ -1300,11 +1552,16 @@ When user aborts, they want to stop everything - including queued messages."
             (with-current-buffer input
               (insert (if retrying "steer the retry" "after the run"))
               (pilish-queue-steering)
-              (should (string-empty-p (buffer-string))))
+              (should (equal (buffer-string) (if retrying "steer the retry" ""))))
             (if retrying
                 (progn
                   (should (equal (plist-get (car commands) :type) "steer"))
                   (should (equal (plist-get (car commands) :message) "steer the retry"))
+                  (pilish-test--stdout
+                   proc (list :type "response" :id (plist-get (car commands) :id)
+                              :command "steer" :success t))
+                  (with-current-buffer input
+                    (should (string-empty-p (buffer-string))))
                   (should (equal notice "Pi: Steering message sent"))
                   (should (= 2 (length commands)))
                   (should-not pilish--followup-queue))
@@ -1596,29 +1853,20 @@ When user aborts, they want to stop everything - including queued messages."
       (kill-buffer input-buf))))
 
 (ert-deftest pilish-test-queue-steering-adds-to-history ()
-  "Queue steering adds input to history."
-  (let ((chat-buf (get-buffer-create "*pilish-test-queue-hist*"))
-        (input-buf (get-buffer-create "*pilish-test-queue-hist-input*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer chat-buf
-            (pilish-chat-mode)
-            (setq pilish--status 'streaming)
-            (setq pilish--input-buffer input-buf))
-          (with-current-buffer input-buf
-            (pilish-input-mode)
-            (setq pilish--chat-buffer chat-buf)
-            (setq pilish--input-ring (make-ring 10))
-            (insert "History test message")
-            (cl-letf (((symbol-function 'pilish--get-process) (lambda () 'mock-proc))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'pilish--rpc-async) #'ignore))
-              (pilish-queue-steering))
-            ;; Should be in history
-            (should (not (ring-empty-p pilish--input-ring)))
-            (should (equal (ring-ref pilish--input-ring 0) "History test message"))))
-      (kill-buffer chat-buf)
-      (kill-buffer input-buf))))
+  "Only acknowledged steering adds its submitted text to history."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (pilish-test--stdout proc '(:type "agent_start"))
+      (with-current-buffer input
+        (setq pilish--input-ring (make-ring 10))
+        (insert "History test message")
+        (pilish-queue-steering)
+        (should (ring-empty-p pilish--input-ring)))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "steer" :success t))
+      (with-current-buffer input
+        (should (equal (ring-elements pilish--input-ring) '("History test message")))))))
 
 (ert-deftest pilish-test-queue-empty-input-does-nothing ()
   "Queue with empty input does nothing."
@@ -1688,37 +1936,22 @@ correct position in the conversation."
     (should (eq (key-binding (kbd "C-c C-c")) 'pilish-send))))
 
 (ert-deftest pilish-test-queue-handles-rpc-error ()
-  "Queue handles RPC error response by showing message to user."
-  (let ((chat-buf (get-buffer-create "*pilish-test-queue-error*"))
-        (input-buf (get-buffer-create "*pilish-test-queue-error-input*"))
-        (captured-callback nil)
-        (error-shown nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer chat-buf
-            (pilish-chat-mode)
-            (setq pilish--status 'streaming)
-            (setq pilish--input-buffer input-buf))
-          (with-current-buffer input-buf
-            (pilish-input-mode)
-            (setq pilish--chat-buffer chat-buf)
-            (insert "Test message")
-            (cl-letf (((symbol-function 'pilish--get-process) (lambda () 'mock-proc))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'pilish--rpc-async)
-                       (lambda (_proc _cmd cb) (setq captured-callback cb)))
-                      ((symbol-function 'message)
-                       (lambda (fmt &rest args)
-                         (when (and fmt (string-match-p "error\\|fail" (downcase fmt)))
-                           (setq error-shown t)))))
-              (pilish-queue-steering)
-              ;; Simulate error response from RPC
-              (when captured-callback
-                (funcall captured-callback '(:success :false :error "Queue limit reached")))))
-          ;; Should have shown an error message
-          (should error-shown))
-      (kill-buffer chat-buf)
-      (kill-buffer input-buf))))
+  "A rejected steering request reports the backend error and keeps input."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (notice)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (setq notice (apply #'format fmt args)))))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input
+          (insert "Test message")
+          (pilish-queue-steering))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "steer" :success :false :error "Queue limit reached"))
+        (should (equal notice "Pi: Steering failed: Queue limit reached"))
+        (with-current-buffer input
+          (should (equal (buffer-string) "Test message")))))))
 
 (ert-deftest pilish-test-queue-with-dead-process-shows-error ()
   "Queue with dead process shows error message."
@@ -3692,60 +3925,29 @@ Pi handles command expansion on the server side."
 
 (ert-deftest pilish-test-no-turn-prompt-retracts-local-echo ()
   "An extension-handled prompt leaves no speculative user turn behind."
-  (let ((chat-buf (generate-new-buffer "*pi-no-turn-retract-chat*"))
-        (input-buf (generate-new-buffer "*pi-no-turn-retract-input*"))
-        (fake-proc (start-process "test-no-turn-retract" nil "cat"))
-        prompt-callback state-callback fallback-callback fallback-args)
-    (unwind-protect
-        (progn
-          (with-current-buffer chat-buf
-            (pilish-chat-mode)
-            (setq pilish--process fake-proc
-                  pilish--input-buffer input-buf))
-          (with-current-buffer input-buf
-            (pilish-input-mode)
-            (setq pilish--chat-buffer chat-buf)
-            (insert "Handle this without a turn"))
-          (cl-letf (((symbol-function 'pilish--get-process)
-                     (lambda () fake-proc))
-                    ((symbol-function 'pilish--get-chat-buffer)
-                     (lambda () chat-buf))
-                    ((symbol-function 'pilish--rpc-async)
-                     (lambda (_process command callback)
-                       (pcase (plist-get command :type)
-                         ("prompt" (setq prompt-callback callback))
-                         ("get_state" (setq state-callback callback)))))
-                    ((symbol-function 'run-at-time)
-                     (lambda (_seconds _repeat function &rest args)
-                       (if (eq function
-                               'pilish--clear-sending-if-no-agent-start)
-                           (setq fallback-callback function
-                                 fallback-args args)
-                         'fake-timer)
-                       'fake-prompt-start-timer))
-                    ((symbol-function 'message) #'ignore))
-            (with-current-buffer input-buf
-              (pilish-send))
-            (funcall prompt-callback '(:success t))
-            (with-current-buffer chat-buf
-              (should (equal pilish--local-user-message
-                             "Handle this without a turn"))
-              (narrow-to-region (1+ (point-min)) (point-max)))
-            (apply fallback-callback fallback-args)
-            (funcall state-callback
-                     '(:success t
-                       :data (:isStreaming :false :isCompacting :false))))
-          (with-current-buffer chat-buf
-            (widen)
-            (should (eq pilish--status 'idle))
-            (should-not pilish--local-user-message)
-            (should-not pilish--local-user-message-region)
-            (should-not (string-match-p "Handle this without a turn"
-                                        (buffer-string)))))
-      (when (process-live-p fake-proc)
-        (delete-process fake-proc))
-      (kill-buffer chat-buf)
-      (kill-buffer input-buf))))
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (with-current-buffer input
+        (insert "Handle this without a turn")
+        (pilish-send))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "prompt" :success t))
+      (with-current-buffer chat
+        (should (equal pilish--local-user-message "Handle this without a turn"))
+        (narrow-to-region (1+ (point-min)) (point-max)))
+      (pilish-test--fire-timer (buffer-local-value 'pilish--prompt-start-timer chat))
+      (should (equal (plist-get (car commands) :type) "get_state"))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "get_state" :success t
+                  :data '(:isStreaming :false :isCompacting :false)))
+      (with-current-buffer chat
+        (widen)
+        (should (eq pilish--status 'idle))
+        (should-not pilish--local-user-message)
+        (should-not pilish--local-user-message-region)
+        (should-not (string-match-p "Handle this without a turn" (buffer-string)))))))
 
 (ert-deftest pilish-test-send-prompt-marks-sending-until-preflight-fails ()
   "pilish--send-prompt closes the local pre-agent_start idle gap."
@@ -3923,65 +4125,31 @@ Pi handles command expansion on the server side."
 
 (ert-deftest pilish-test-no-turn-prompt-fallback-drains-queued-followup ()
   "Successful no-turn commands release follow-ups queued while sending."
-  (let* ((rpc-callbacks nil)
-         (prompt-fallback-callback nil)
-         (prompt-fallback-args nil)
-         (sent-messages nil)
-         (chat-buf (get-buffer-create "*pilish-test-no-turn-drain*"))
-         (input-buf (get-buffer-create "*pilish-test-no-turn-drain-input*"))
-         (fake-proc (start-process "test" nil "cat")))
-    (unwind-protect
-        (progn
-          (with-current-buffer chat-buf
-            (pilish-chat-mode)
-            (setq pilish--status 'idle
-                  pilish--activity-phase "idle"
-                  pilish--process fake-proc
-                  pilish--input-buffer input-buf))
-          (with-current-buffer input-buf
-            (pilish-input-mode)
-            (setq pilish--chat-buffer chat-buf))
-          (cl-letf (((symbol-function 'pilish--get-process)
-                     (lambda () fake-proc))
-                    ((symbol-function 'pilish--get-chat-buffer)
-                     (lambda () chat-buf))
-                    ((symbol-function 'pilish--rpc-async)
-                     (lambda (_proc cmd cb)
-                       (pcase (plist-get cmd :type)
-                         ("prompt"
-                          (push (plist-get cmd :message) sent-messages)
-                          (push cb rpc-callbacks))
-                         ("get_state"
-                          (funcall cb
-                                   '(:success t
-                                     :data (:isStreaming :false
-                                            :isCompacting :false)))))))
-                    ((symbol-function 'run-at-time)
-                     (lambda (_secs _repeat fn &rest args)
-                       (cond
-                        ((eq fn 'pilish--clear-sending-if-no-agent-start)
-                         (setq prompt-fallback-callback fn
-                               prompt-fallback-args args)
-                         'fake-prompt-start-timer)
-                        (t 'fake-timer))))
-                    ((symbol-function 'message) #'ignore))
-            (with-current-buffer chat-buf
-              (pilish--prepare-and-send "/test-noop"))
-            (with-current-buffer input-buf
-              (insert "follow-up after noop")
-              (pilish-send))
-            (with-current-buffer chat-buf
-              (should (eq pilish--status 'sending))
-              (should (equal pilish--followup-queue
-                             '("follow-up after noop"))))
-            (funcall (car rpc-callbacks) '(:success t))
-            (should (functionp prompt-fallback-callback))
-            (apply prompt-fallback-callback prompt-fallback-args)
-            (should (equal (reverse sent-messages)
-                           '("/test-noop" "follow-up after noop")))))
-      (delete-process fake-proc)
-      (kill-buffer chat-buf)
-      (kill-buffer input-buf))))
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (with-current-buffer chat (pilish--prepare-and-send "/test-noop"))
+      (with-current-buffer input
+        (insert "follow-up after noop")
+        (pilish-send))
+      (with-current-buffer chat
+        (should (eq pilish--status 'sending))
+        (should (equal pilish--followup-queue '("follow-up after noop"))))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "prompt" :success t))
+      (pilish-test--fire-timer (buffer-local-value 'pilish--prompt-start-timer chat))
+      (should (equal (plist-get (car commands) :type) "get_state"))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "get_state" :success t
+                  :data '(:isStreaming :false :isCompacting :false)))
+      (should (equal (mapcar (lambda (cmd) (plist-get cmd :type)) (reverse commands))
+                     '("prompt" "get_state" "prompt")))
+      (should (equal (plist-get (car commands) :message) "follow-up after noop"))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "prompt" :success t))
+      (should-not (buffer-local-value 'pilish--followup-queue chat)))))
 
 (ert-deftest pilish-test-stale-prompt-start-fallback-does-not-clear-newer-send ()
   "A stale no-turn fallback timer cannot clear a newer sending prompt."

@@ -1261,6 +1261,22 @@ other family names there."
       (should-not (pilish--model-change-current-p token))
       (should-not (pilish--model-change-pending-p)))))
 
+(ert-deftest pilish-test-same-process-assignment-keeps-stop-intent ()
+  "Reassigning the current process cannot release Stop or consume a draft."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (pilish-test--stdout proc '(:type "agent_start"))
+      (with-current-buffer input
+        (pilish-abort)
+        (insert "keep while stopping"))
+      (with-current-buffer chat (pilish--set-process proc))
+      (should (buffer-local-value 'pilish--aborted chat))
+      (with-current-buffer input
+        (pilish-send)
+        (should (equal (buffer-string) "keep while stopping")))
+      (should (= 2 (length commands)))
+      (should-not (buffer-local-value 'pilish--followup-queue chat)))))
+
 (ert-deftest pilish-test-set-process-probes-version-for-current-process ()
   "Setting process starts version probe and stores result for current process."
   (let ((callback nil)
@@ -2878,6 +2894,92 @@ Binds `chat-win' and `input-win' for use in BODY."
 
 ;;; Active-session stdout silence, in the existing input status only
 
+(ert-deftest pilish-test-inactivity-missing-settlement-warns-with-explicit-recovery ()
+  "A missing settlement stays busy but shows silence and reload guidance."
+  (pilish-test-with-inactivity-session (chat input proc commands now)
+    (let (notice)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (setq notice (apply #'format fmt args)))))
+        (pilish-test--stdout proc '(:type "agent_start")
+                            '(:type "agent_end" :messages []))
+        (let ((observer (buffer-local-value 'pilish--inactivity-timer chat)))
+          (should (memq observer timer-list))
+          (with-current-buffer chat (setq pilish--followup-queue '("queued input")))
+          (setq now 1300.0)
+          (pilish-test--fire-timer observer)
+          (let* ((header (pilish-test--assert-inactivity input "thinking (no output 5m)"))
+                 (start (string-match "thinking (no output" header))
+                 (help (get-text-property start 'help-echo header)))
+            (should (string-match-p "Pi may still be working" help))
+            (should (string-match-p "M-x pilish-reload" help)))
+          (should-not commands)
+          (should-not notice)
+          (should (eq 'sending (buffer-local-value 'pilish--status chat)))
+          (should (equal (buffer-local-value 'pilish--followup-queue chat)
+                         '("queued input")))
+          (with-current-buffer input (pilish-abort))
+          (should (equal notice "Pi: Aborting..."))
+          (should (equal (mapcar (lambda (cmd) (plist-get cmd :type))
+                                (reverse commands))
+                         '("clear_queue" "abort")))
+          (dolist (command commands)
+            (pilish-test--stdout
+             proc (list :type "response" :id (plist-get command :id)
+                        :success t)))
+          (pilish-test--assert-inactivity input nil)
+          (setq now 1600.0)
+          (pilish-test--fire-timer observer)
+          (pilish-test--assert-inactivity input "thinking (no output 5m)")
+          (should (= 2 (length commands)))
+          (should (eq 'sending (buffer-local-value 'pilish--status chat)))
+          (should (buffer-local-value 'pilish--aborted chat))
+          (should-not (buffer-local-value 'pilish--followup-queue chat)))))))
+
+(ert-deftest pilish-test-inactivity-sending-before-agent-start-is-observed ()
+  "An unanswered prompt is monitored before any agent_start is received."
+  (pilish-test-with-inactivity-session (chat input proc commands now)
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (with-current-buffer input
+        (insert "unanswered prompt")
+        (pilish-send))
+      (let ((observer (buffer-local-value 'pilish--inactivity-timer chat)))
+        (should (memq observer timer-list))
+        (setq now 1300.0)
+        (pilish-test--fire-timer observer)
+        (pilish-test--assert-inactivity input "thinking (no output 5m)")
+        (should (eq 'sending (buffer-local-value 'pilish--status chat)))
+        (should (= 1 (length commands)))
+        (should (equal (plist-get (car commands) :message) "unanswered prompt"))
+        (with-current-buffer chat
+          (should (pilish--prompt-start-wait-active-p)))))))
+
+(ert-deftest pilish-test-inactivity-unstarted-prompt-completion-stops-observer ()
+  "Rejected and no-turn prompts retire their local sending observer."
+  (dolist (accepted '(nil t))
+    (pilish-test-with-inactivity-session (chat input proc commands now)
+      (cl-letf (((symbol-function 'message) #'ignore))
+        (with-current-buffer input
+          (insert "/extension-command")
+          (pilish-send))
+        (let ((observer (buffer-local-value 'pilish--inactivity-timer chat)))
+          (should (memq observer timer-list))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get (car commands) :id)
+                      :command "prompt" :success (if accepted t :false)
+                      :error "Rejected"))
+          (when accepted
+            (pilish-test--fire-timer
+             (buffer-local-value 'pilish--prompt-start-timer chat))
+            (should (equal (plist-get (car commands) :type) "get_state"))
+            (pilish-test--stdout
+             proc (list :type "response" :id (plist-get (car commands) :id)
+                        :command "get_state" :success t
+                        :data '(:isStreaming :false :isCompacting :false))))
+          (should (eq 'idle (buffer-local-value 'pilish--status chat)))
+          (should-not (buffer-local-value 'pilish--inactivity-timer chat))
+          (should-not (memq observer timer-list)))))))
+
 (ert-deftest pilish-test-inactivity-header-threshold-phase-face-and-help ()
   "At the exact threshold only the existing status slot changes."
   (dolist (case '(((:type "agent_start") "thinking")
@@ -3010,8 +3112,8 @@ Binds `chat-win' and `input-win' for use in BODY."
             (should (eq 'streaming (buffer-local-value 'pilish--status chat)))
             (should (equal '("wait") (buffer-local-value 'pilish--followup-queue chat)))
             (pilish-test--stdout proc '(:type "agent_end" :messages []))
-            (should-not (memq observer timer-list))
-            (should-not (buffer-local-value 'pilish--inactivity-timer chat))
+            (should (memq observer timer-list))
+            (should (eq observer (buffer-local-value 'pilish--inactivity-timer chat)))
             (should (eq 'sending (buffer-local-value 'pilish--status chat)))
             (pilish-test--assert-inactivity input nil)
             ;; Do not drain the deliberately held followup in fixture teardown.
@@ -3086,7 +3188,8 @@ Binds `chat-win' and `input-win' for use in BODY."
       (pilish-test--assert-inactivity bi nil)
       ;; Match the baseline reload candidate route.  Ordinary events still
       ;; render there; the observer must independently guard its source.
-      (pilish-test--stdout ap '(:type "agent_end" :messages []))
+      (pilish-test--stdout ap '(:type "agent_end" :messages [])
+                          '(:type "agent_settled"))
       (let ((observer (buffer-local-value 'pilish--inactivity-timer b)))
         (process-put bp 'pilish-chat-buffer a)
         (pilish-test--stdout bp '(:type "agent_start"))
