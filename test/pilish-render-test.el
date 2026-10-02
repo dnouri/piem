@@ -14739,6 +14739,54 @@ SYNCHRONOUS feeds and paints each delta with the current assembler and renderer.
         (should (equal '("final line" "partial")
                        (pilish-test--tool-content-lines-by-id "call_1")))))))
 
+(ert-deftest pilish-test-toolcall-final-write-retains-unterminated-line ()
+  "Final write previews retain complete arguments within the preview limits."
+  (dolist (boundary '("toolcall_end" "message_end"))
+    (dolist (path '("final.txt" "final.el"))
+      (dolist (fixture '(("single" ("single") 10 80 nil)
+                         ("first\nlast" ("first" "last") 10 80 nil)
+                         ("first\nlast\n" ("first" "last") 10 80 nil)
+                         ("first\nsecond\nlast" ("second" "last") 2 80 t)
+                         ("12345678901234567890EXTRA"
+                          ("12345678901234567890") 2 10 t)))
+        (ert-info ((format "%s %s %S" boundary path (car fixture)))
+          (cl-destructuring-bind (content expected max-lines width hidden) fixture
+            (pilish-test--with-streaming-assistant
+              (let ((pilish-tool-preview-lines max-lines)
+                    (call (pilish-test--toolcall
+                           "call_1" "write" (list :path path :content content))))
+                (cl-letf (((symbol-function 'pilish--chat-window-width)
+                           (lambda () width)))
+                  (pilish-test--send-assistant-message-update
+                   '(:type "toolcall_start" :contentIndex 0
+                     :id "call_1" :toolName "write"))
+                  (pilish-test--send-raw-toolcall-delta
+                   0 "{\"path\":\"old.txt\",\"content\":\"obsolete\\n")
+                  (should (timerp pilish--stream-delta-flush-timer))
+                  (if (equal boundary "toolcall_end")
+                      (pilish-test--send-assistant-message-update
+                       `(:type "toolcall_end" :contentIndex 0 :toolCall ,call))
+                    (pilish--handle-display-event
+                     `(:type "message_end"
+                       :message (:role "assistant" :content [,call]))))
+                  (should (equal expected
+                                 (pilish-test--tool-content-lines-by-id "call_1")))
+                  (should (equal content
+                                 (plist-get (plist-get call :arguments) :content)))
+                  (let ((body (pilish-test--tool-stream-body-by-id "call_1")))
+                    (should (eq hidden
+                                (string-prefix-p "... (earlier output)\n" body)))
+                    (should (string-match-p
+                             (regexp-quote
+                              (if (equal path "final.txt") "```text\n" "```emacs-lisp\n"))
+                             body)))
+                  (should-not (string-match-p "obsolete" (buffer-string)))
+                  (should-not pilish--pending-stream-deltas)
+                  (should-not pilish--stream-delta-flush-timer)
+                  (let ((tick (buffer-modified-tick)))
+                    (pilish--flush-stream-deltas)
+                    (should (= tick (buffer-modified-tick)))))))))))))
+
 (ert-deftest pilish-test-toolcall-coalescing-execution-start-flushes ()
   "Execution authority wins over a pending paint of its keyed preview."
   (pilish-test--with-streaming-assistant
@@ -14880,28 +14928,76 @@ SYNCHRONOUS feeds and paints each delta with the current assembler and renderer.
     (should (equal "$ command 1 repainted" (pilish-test--tool-header-by-id "call_1")))))
 
 (ert-deftest pilish-test-toolcall-coalescing-abort-clears-pending-paints ()
-  "Abort flushes the old preview and cannot leak its paint into a new run."
-  (pilish-test--with-streaming-assistant
-    (pilish-test--send-assistant-message-update
-     '(:type "toolcall_start" :contentIndex 0 :id "old" :toolName "bash"))
-    (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"old command")
-    (let ((timer pilish--stream-delta-flush-timer))
-      (should (timerp timer))
-      (setq pilish--aborted t)
-      (pilish--handle-display-event '(:type "agent_end"))
-      (should-not (memq timer timer-list)))
-    (should-not pilish--pending-stream-deltas)
-    (should-not pilish--stream-delta-flush-timer)
-    (should (= 0 (hash-table-count pilish--toolcall-streams)))
-    (pilish--handle-display-event '(:type "agent_settled"))
-    (pilish--handle-display-event '(:type "agent_start"))
-    (pilish--handle-display-event '(:type "message_start" :message (:role "assistant")))
-    (pilish-test--send-assistant-message-update
-     '(:type "toolcall_start" :contentIndex 0 :id "new" :toolName "bash"))
-    (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"new command\"}")
-    (pilish--flush-stream-deltas)
-    (should (equal "$ new command" (pilish-test--tool-header-by-id "new")))
-    (should (= 1 (pilish-test--count-matches "old command" (buffer-string))))))
+  "Abort preserves the old header boundary and cannot leak its pending paint."
+  (dolist (final-command '(nil "old command ENDZ"))
+    (pilish-test--with-streaming-assistant
+      (pilish-test--send-assistant-message-update
+       '(:type "toolcall_start" :contentIndex 0 :id "old" :toolName "bash"))
+      (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"old command")
+      (let* ((timer pilish--stream-delta-flush-timer)
+             (overlay (pilish-test--tool-block-overlay-by-id "old"))
+             (block (pilish--tool-block-from-overlay overlay))
+             (expected (concat "$ " (or final-command "old command"))))
+        (should (timerp timer))
+        (setq pilish--aborted t)
+        (when final-command
+          (pilish--handle-display-event
+           `(:type "message_end"
+             :message (:role "assistant" :stopReason "aborted"
+                       :content [,(pilish-test--toolcall
+                                   "old" "bash" (list :command final-command))]))))
+        (pilish--handle-display-event '(:type "agent_end"))
+        (should-not (memq timer timer-list))
+        (should (equal expected (pilish-test--tool-header-from-overlay overlay)))
+        (should (eq ?\n (char-before (pilish--tool-block-header-end block))))
+        (should (= (pilish--tool-block-header-end block) (overlay-end overlay)))
+        (should (= (pilish--tool-block-end-marker block) (overlay-end overlay)))
+        (should (equal "\n[Aborted]\n"
+                       (buffer-substring-no-properties (overlay-end overlay) (point-max))))
+        (should-not pilish--pending-stream-deltas)
+        (should-not pilish--stream-delta-flush-timer)
+        (should (= 0 (hash-table-count pilish--toolcall-streams)))
+        (let ((old-end (overlay-end overlay)))
+          (pilish--handle-display-event '(:type "agent_settled"))
+          (pilish--handle-display-event '(:type "agent_start"))
+          (pilish--handle-display-event '(:type "message_start" :message (:role "assistant")))
+          (pilish-test--send-assistant-message-update
+           '(:type "toolcall_start" :contentIndex 0 :id "new" :toolName "bash"))
+          (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"new command\"}")
+          (pilish--flush-stream-deltas)
+          (should (equal "$ new command" (pilish-test--tool-header-by-id "new")))
+          (should (= 1 (pilish-test--count-matches "old command" (buffer-string))))
+          (should (= old-end (overlay-end overlay)))
+          (should (equal expected (pilish-test--tool-header-from-overlay overlay))))))))
+
+(ert-deftest pilish-test-toolcall-agent-end-preserves-tool-boundaries ()
+  "Run-end spacing trims outside tool blocks without moving their boundaries."
+  (dolist (aborted '(nil t))
+    (dolist (fixture '(("bash" (:command "keep ENDZ \t"))
+                       ("write" (:path "file.txt" :content "first\nlast\n"))))
+      (pilish-test--with-streaming-assistant
+        (pilish-test--send-assistant-message-update
+         `(:type "toolcall_start" :contentIndex 0 :id "call_1"
+           :toolName ,(car fixture)))
+        (pilish-test--send-assistant-message-update
+         `(:type "toolcall_end" :contentIndex 0
+           :toolCall ,(pilish-test--toolcall "call_1" (car fixture) (cadr fixture))))
+        (let* ((overlay (pilish-test--tool-block-overlay-by-id "call_1"))
+               (block (pilish--tool-block-from-overlay overlay))
+               (end (overlay-end overlay))
+               (header-end (marker-position (pilish--tool-block-header-end block)))
+               (text (buffer-substring-no-properties (overlay-start overlay) end)))
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert (if aborted " \t\n\n" "\n\n")))
+          (setq pilish--aborted aborted)
+          (pilish--handle-display-event '(:type "agent_end"))
+          (should (= header-end (pilish--tool-block-header-end block)))
+          (should (= end (pilish--tool-block-end-marker block)))
+          (should (= end (overlay-end overlay)))
+          (should (equal text (buffer-substring-no-properties (overlay-start overlay) end)))
+          (should (equal (if aborted "\n[Aborted]\n" "")
+                         (buffer-substring-no-properties end (point-max)))))))))
 
 (ert-deftest pilish-test-toolcall-coalescing-reset-discards-paint ()
   "Session/history reset cancels the shared timer and drops old tool paints."

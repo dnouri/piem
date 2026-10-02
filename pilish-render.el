@@ -912,21 +912,26 @@ the unpainted batch."
     (pilish--reset-toolcall-streams)
     (when pilish--tool-args-cache
       (clrhash pilish--tool-args-cache))
-    ;; Keep stop intent until settlement: Pi may still start a continuation.
-    (when pilish--aborted
-      (pilish--with-scroll-preservation
-        (save-excursion
-          (goto-char (point-max))
-          (skip-chars-backward " \t\n")
-          (delete-region (point) (point-max))
-          (insert "\n\n" (propertize "[Aborted]" 'face 'error) "\n")))
-      (pilish--clear-followup-queue))
     (pilish--with-scroll-preservation
       (save-excursion
         (goto-char (point-max))
-        (skip-chars-backward "\n")
-        (delete-region (point) (point-max))
-        (insert "\n"))))
+        (skip-chars-backward (if pilish--aborted " \t\n" "\n"))
+        ;; Tool blocks own their separator and body newlines.  Normalize only
+        ;; whitespace outside them, leaving their fixed markers untouched.
+        (let ((trim-start (point)))
+          (dolist (overlay (pilish--tool-block-overlays-in-region
+                            trim-start (point-max)))
+            (setq trim-start (max trim-start (overlay-end overlay))))
+          (delete-region trim-start (point-max))
+          (goto-char trim-start))
+        (when pilish--aborted
+          (pilish--ensure-blank-line-before-block)
+          (insert (propertize "[Aborted]" 'face 'error) "\n"))
+        (unless (eq (char-before) ?\n)
+          (insert "\n"))))
+    ;; Keep stop intent until settlement: Pi may still start a continuation.
+    (when pilish--aborted
+      (pilish--clear-followup-queue)))
   (pilish--set-activity-phase
    (if (eq pilish--status 'sending) "thinking" "idle"))
   (pilish--refresh-header))
@@ -3220,7 +3225,7 @@ Suspend expensive md-ts hooks for immediate starts as well as queued paints."
                  (complete-content
                   (pilish--toolcall-complete-content content)))
             (if (stringp content)
-                (pilish--display-tool-streaming-text
+                (pilish--display-tool-preview-text
                  (or complete-content "")
                  pilish-tool-preview-lines
                  (pilish--path-to-language
@@ -3345,8 +3350,9 @@ Each element is a plist `(:content-index N :tool-call TOOL-CALL)'."
 (defun pilish--reconcile-toolcall-preview-block
     (content-index tool-call &optional event-type block)
   "Create or update BLOCK for TOOL-CALL at CONTENT-INDEX.
-EVENT-TYPE selects streaming or authoritative presentation.  When BLOCK is
-nil, reuse a keyed block or create one."
+EVENT-TYPE selects streaming or authoritative presentation.  Streaming write
+previews omit unfinished lines; authoritative calls show their full content.
+When BLOCK is nil, reuse a keyed block or create one."
   (let* ((tool-call-id (plist-get tool-call :id))
          (tool-name (plist-get tool-call :name))
          (args (plist-get tool-call :arguments))
@@ -3367,27 +3373,19 @@ nil, reuse a keyed block or create one."
        tool-name args block preview-state))
     (let ((content (pilish--tool-arg-get args :content)))
       (cond
-       ((equal event-type "toolcall_end")
-        (if (and (equal tool-name "write") (stringp content))
-            (pilish--display-tool-streaming-text
-             content
-             pilish-tool-preview-lines
-             (pilish--path-to-language
-              (pilish--tool-path-string
-               (pilish--tool-arg-path args)))
-             block)
-          (pilish--clear-toolcall-preview-body block)))
-       ((and (equal tool-name "write")
-             (pilish--tool-arg-member args :content))
-        (if (stringp content)
-            (pilish--display-tool-streaming-text
-             content
-             pilish-tool-preview-lines
-             (pilish--path-to-language
-              (pilish--tool-path-string
-               (pilish--tool-arg-path args)))
-             block)
-          (pilish--clear-toolcall-preview-body block)))))
+       ((and (equal tool-name "write") (stringp content))
+        (pilish--display-tool-preview-text
+         (if streaming-p (or (pilish--toolcall-complete-content content) "")
+           content)
+         pilish-tool-preview-lines
+         (pilish--path-to-language
+          (pilish--tool-path-string
+           (pilish--tool-arg-path args)))
+         block))
+       ((or (equal event-type "toolcall_end")
+            (and (equal tool-name "write")
+                 (pilish--tool-arg-member args :content)))
+        (pilish--clear-toolcall-preview-body block))))
     block))
 
 (defun pilish--prune-stale-toolcall-previews (tool-call-ids)
@@ -3613,28 +3611,19 @@ LANG is passed to `pilish--wrap-in-src-block' for fence construction."
             (set-marker end-marker (+ body-start new-length))
             (pilish--tool-block-refresh-overlay block))))))))
 
-(defun pilish--display-tool-streaming-text
+(defun pilish--display-tool-preview-text
     (raw-text max-lines &optional lang block source-truncated)
-  "Display RAW-TEXT as streaming content in BLOCK.
+  "Display caller-selected RAW-TEXT as a preview in BLOCK.
 Shows a rolling tail truncated to MAX-LINES visual lines.
 When BLOCK is nil, fall back to the current compatibility tool block.
 SOURCE-TRUNCATED means the argument assembler already dropped an older prefix.
 
 When LANG is non-nil, wrap the tail in a markdown fenced code block so
 that `md-ts-mode' language injection handles syntax highlighting.
-Skips redraw when only the trailing partial line changed (the preview
-shows complete lines only)."
+Skips redraw when the displayed tail is unchanged."
   (let ((raw-text (pilish--render-safe-string raw-text)))
     (when-let* ((block (or block (pilish--current-tool-block))))
-      (let* (;; For language-aware streaming, only show complete lines
-             ;; (exclude trailing partial line) to keep the preview
-             ;; stable across partial-token deltas.
-             (complete-text
-              (if (and lang (not (string-suffix-p "\n" raw-text)))
-                  (let ((last-nl (cl-position ?\n raw-text :from-end t)))
-                    (if last-nl (substring raw-text 0 (1+ last-nl)) ""))
-                raw-text))
-             (tail-result (pilish--get-tail-lines complete-text max-lines))
+      (let* ((tail-result (pilish--get-tail-lines raw-text max-lines))
              (tail-content (or (car tail-result) ""))
              (has-hidden (cdr tail-result))
              (truncation (pilish--truncate-to-visual-lines
@@ -3751,11 +3740,11 @@ timer or preview survives a session transition."
 When BLOCK is nil, fall back to the current compatibility tool block.
 PARTIAL-RESULT has the same structure as a tool result plist with
 `:content'.  Extracts text from content blocks and delegates to
-`pilish--display-tool-streaming-text'."
+`pilish--display-tool-preview-text'."
   (when partial-result
     (let* ((content-blocks (plist-get partial-result :content))
            (raw-output (pilish--extract-text-from-content content-blocks)))
-      (pilish--display-tool-streaming-text
+      (pilish--display-tool-preview-text
        raw-output pilish-bash-preview-lines nil block))))
 
 (defun pilish--markdown-fence-delimiter (content)
