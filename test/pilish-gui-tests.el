@@ -689,6 +689,7 @@ buffer (jit-lock active) to verify under real GUI conditions."
           (pilish-test--send-assistant-message-update
            '(:type "toolcall_delta" :contentIndex 0
              :delta "{\"path\":\"/tmp/test.py\",\"content\":\"def hello():\\n    return 42\\n\"}"))
+          (pilish--flush-stream-deltas)
           (font-lock-ensure)
           ;; Fences are in the buffer (for tree-sitter) but invisible
           (let ((visible (pilish--visible-text
