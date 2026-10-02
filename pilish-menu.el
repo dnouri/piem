@@ -374,6 +374,7 @@ Call this when starting a new session to ensure no stale state persists."
   (pilish--invalidate-model-change)
   (pilish--clear-unsupported-extension-ui-warnings)
   (pilish--invalidate-history-loads)
+  (pilish--set-history-recovery nil)
   (pilish--finish-session-transition
    pilish--session-transition-generation)
   ;; Use accessors for cross-module state
@@ -400,42 +401,6 @@ Used when starting a new session."
         (insert "\n")
         (pilish--reset-session-state)
         (goto-char (point-max))))))
-
-(defun pilish--load-session-history
-    (proc callback &optional chat-buf completion-callback)
-  "Load and display session history from PROC.
-Calls CALLBACK with message count when history is applied successfully.
-CHAT-BUF is the target buffer; if nil, uses `pilish--get-chat-buffer'.
-Optional COMPLETION-CALLBACK is called after a current RPC response is handled,
-even when the response failed or was not safe to render.  Note: When called
-from async callbacks, pass CHAT-BUF explicitly."
-  (let ((chat-buf (or chat-buf (pilish--get-chat-buffer))))
-    (when (and chat-buf (buffer-live-p chat-buf))
-      (with-current-buffer chat-buf
-        (let ((generation (pilish--invalidate-history-loads)))
-          (pilish--rpc-async proc '(:type "get_messages")
-                         (lambda (response)
-                           (unwind-protect
-                               (when (and (eq (plist-get response :success) t)
-                                          (buffer-live-p chat-buf))
-                                 (with-current-buffer chat-buf
-                                   (when (and (eq pilish--process proc)
-                                              (= generation
-                                                 pilish--history-load-generation)
-                                              (pilish--canonical-rerender-safe-p))
-                                     (let* ((messages (plist-get (plist-get response :data)
-                                                                 :messages))
-                                            (count (if (vectorp messages)
-                                                       (length messages)
-                                                     0)))
-                                       (pilish--display-session-history
-                                        messages chat-buf)
-                                       ;; Refresh header after loading history (resume/fork).
-                                       (pilish--refresh-header)
-                                       (when callback
-                                         (funcall callback count))))))
-                             (when completion-callback
-                               (funcall completion-callback response))))))))))
 
 (defun pilish--session-transition-ready-p (chat-buf action)
   "Return non-nil when CHAT-BUF may ACTION another session.
@@ -1029,7 +994,8 @@ and own activity; this callback must not idle independently started work."
           (pilish--set-aborted nil)
           (if success
               (pilish--process-followup-queue)
-            (pilish--restore-followup-queue-to-input)))))))
+            (pilish--restore-followup-queue-to-input))
+          (pilish--maybe-recover-history))))))
 
 (defun pilish-compact (&optional custom-instructions)
   "Compact idle conversation context to reduce token usage.

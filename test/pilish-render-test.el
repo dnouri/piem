@@ -14237,6 +14237,273 @@ hooks, including `kill-buffer-hook'."
       (should-not pilish--stream-delta-flush-timer)
       (should (eq pilish--status 'idle)))))
 
+(ert-deftest pilish-test-stream-recovery-fetches-complete-history-once ()
+  "A failed batch recovers all turns without retrying partially inserted text."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (let* ((earlier [(:role "user" :content "Earlier question")
+                      (:role "assistant" :content "Earlier answer")])
+             (reply '(:role "assistant"
+                      :content [(:type "text" :text "First Partial ")
+                                (:type "thinking" :thinking "Missing thought")
+                                (:type "text" :text "Missing Last")]))
+             (history (vconcat earlier (vector reply)))
+             (fail-once t)
+             (hook (lambda (&rest _)
+                     (when fail-once
+                       (setq fail-once nil)
+                       (error "one-shot change hook"))))
+             diagnostics)
+        (pilish--display-session-history earlier chat)
+        (pilish--handle-display-event '(:type "agent_start"))
+        (pilish--handle-display-event
+         '(:type "message_start" :message (:role "assistant")))
+        (pilish-test--send-text-delta "First ")
+        (pilish--flush-stream-deltas)
+        (pilish-test--send-text-delta "Partial ")
+        (pilish-test--send-thinking-delta "Missing thought")
+        (pilish-test--send-text-delta "Missing ")
+        (add-hook 'after-change-functions hook nil t)
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) diagnostics))))
+          (pilish--flush-stream-deltas))
+        (remove-hook 'after-change-functions hook t)
+        (should (string-match-p "Partial" (buffer-string)))
+        (should-not (string-match-p "Missing" (buffer-string)))
+        (should (string-match-p "display incomplete"
+                                (pilish--header-line-string)))
+        (pilish-test--send-text-delta "Last")
+        (pilish--handle-display-event
+         (list :type "message_end" :message reply))
+        (pilish--handle-display-event
+         (list :type "agent_end" :messages (vector reply)))
+        (should-not commands)
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (should (= 1 (length commands)))
+        (should (equal (plist-get (car commands) :type) "get_messages"))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "get_messages" :success t
+                    :data (list :messages history)))
+        (dolist (text '("Earlier question" "Earlier answer" "First Partial"
+                        "Missing thought" "Missing Last"))
+          (should (= 1 (pilish-test--count-matches
+                        (regexp-quote text) (buffer-string)))))
+        (should (equal pilish--canonical-messages history))
+        (should-not (string-match-p "display incomplete"
+                                    (pilish--header-line-string)))
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (should (= 1 (length commands)))
+        (should (equal diagnostics
+                       '("pilish: stream delta flush failed: one-shot change hook")))))))
+
+(defun pilish-test--fail-assistant-stream ()
+  "Leave a failed assistant flush awaiting settlement in the current chat."
+  (pilish--handle-display-event '(:type "agent_start"))
+  (pilish--handle-display-event
+   '(:type "message_start" :message (:role "assistant")))
+  (pilish-test--send-text-delta "missing")
+  (let (diagnostic)
+    (cl-letf (((symbol-function 'pilish--display-message-delta)
+               (lambda (_) (error "render failed")))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq diagnostic (apply #'format format-string args)))))
+      (pilish--handle-display-event '(:type "agent_end" :messages [])))
+    (should (equal diagnostic "pilish: stream delta flush failed: render failed"))))
+
+(ert-deftest pilish-test-stream-recovery-rejection-does-not-loop ()
+  "A rejected recovery leaves a lasting warning and does not keep requesting."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish-test--fail-assistant-stream)
+      (let (diagnostics)
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) diagnostics))))
+          (pilish--handle-display-event '(:type "agent_settled"))
+          (should (= 1 (length commands)))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get (car commands) :id)
+                      :command "get_messages" :success :false
+                      :error "history unavailable"))
+          (pilish--handle-display-event '(:type "agent_settled")))
+        (should (= 1 (length commands)))
+        (should (string-match-p "display incomplete.*pilish-reload"
+                                (pilish--header-line-string)))
+        (should (cl-some (lambda (text)
+                          (string-match-p "history unavailable" text))
+                        diagnostics))))))
+
+(ert-deftest pilish-test-stream-recovery-ignores-completed-newer-run ()
+  "A run that starts and settles before an old reply still invalidates it."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish-test--fail-assistant-stream)
+      (pilish--handle-display-event '(:type "agent_settled"))
+      (should (= 1 (length commands)))
+      (let ((old-request (car commands)))
+        (pilish--handle-display-event '(:type "agent_start"))
+        (pilish--handle-display-event
+         '(:type "message_start" :message (:role "assistant")))
+        (pilish-test--send-text-delta "Newer answer")
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (pilish--handle-display-event '(:type "agent_settled"))
+        ;; The existing pending RPC owns the one in-flight history load.
+        (should (= 1 (length commands)))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get old-request :id)
+                    :command "get_messages" :success t
+                    :data '(:messages [(:role "assistant"
+                                        :content "Stale snapshot")])))
+        (should (string-match-p "Newer answer" (buffer-string)))
+        (should-not (string-match-p "Stale snapshot" (buffer-string)))
+        (should (= 2 (length commands)))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get (car commands) :id)
+                    :command "get_messages" :success t
+                    :data '(:messages [(:role "assistant" :content "Recovered old answer")
+                                       (:role "user" :content "Newer question")
+                                       (:role "assistant" :content "Newer answer")])))
+        (should (string-match-p "Recovered old answer" (buffer-string)))
+        (should (= 1 (pilish-test--count-matches
+                      "Newer answer" (buffer-string))))))))
+
+(ert-deftest pilish-test-stream-recovery-waits-for-queued-followup ()
+  "Queue ownership wins over a history rewrite; the following settlement recovers."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish-test--fail-assistant-stream)
+      (setq pilish--followup-queue '("Followup"))
+      (pilish--handle-display-event '(:type "agent_settled"))
+      (should (equal (mapcar (lambda (cmd) (plist-get cmd :type)) commands)
+                     '("prompt")))
+      (pilish--handle-display-event '(:type "agent_start"))
+      (pilish-test--stdout
+       proc (list :type "response" :id (plist-get (car commands) :id)
+                  :command "prompt" :success t))
+      (should-not pilish--followup-queue)
+      (pilish--handle-display-event '(:type "agent_end" :messages []))
+      (pilish--handle-display-event '(:type "agent_settled"))
+      (should (equal (plist-get (car commands) :type) "get_messages")))))
+
+(ert-deftest pilish-test-stream-recovery-waits-for-late-prompt-acceptance ()
+  "A late prompt acknowledgment is also a safe recovery boundary."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish--prepare-and-send "Question")
+      (let ((prompt-request (car commands)))
+        (pilish-test--fail-assistant-stream)
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (should (= 1 (length commands)))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get prompt-request :id)
+                    :command "prompt" :success t))
+        (should (= 2 (length commands)))
+        (should (equal (plist-get (car commands) :type) "get_messages"))))))
+
+(ert-deftest pilish-test-stream-recovery-reset-cancels-old-request ()
+  "A fresh session forgets a failed display and cannot apply its old snapshot."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish-test--fail-assistant-stream)
+      (pilish--handle-display-event '(:type "agent_settled"))
+      (should (= 1 (length commands)))
+      (let ((request (car commands)))
+        (pilish--clear-chat-buffer)
+        (should-not (string-match-p "display incomplete"
+                                    (pilish--header-line-string)))
+        (pilish-test--stdout
+         proc (list :type "response" :id (plist-get request :id)
+                    :command "get_messages" :success t
+                    :data '(:messages [(:role "assistant" :content "Old session")])))
+        (should-not (string-match-p "Old session" (buffer-string)))
+        (pilish--handle-display-event '(:type "agent_settled"))
+        (should (= 1 (length commands)))))))
+
+(ert-deftest pilish-test-stream-recovery-failed-replay-does-not-loop ()
+  "A failing automatic history repaint shows a notice instead of retrying."
+  (pilish-test-with-rpc-session (chat _input proc commands)
+    (with-current-buffer chat
+      (pilish-test--fail-assistant-stream)
+      (let (diagnostics)
+        (cl-letf (((symbol-function 'pilish--render-history-assistant-content)
+                   (lambda (&rest _) (error "replay failed")))
+                  ((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) diagnostics))))
+          (pilish--handle-display-event '(:type "agent_settled"))
+          (pilish-test--stdout
+           proc (list :type "response" :id (plist-get (car commands) :id)
+                      :command "get_messages" :success t
+                      :data '(:messages [(:role "assistant" :content "Full reply")])))
+          (pilish--handle-display-event '(:type "agent_settled")))
+        (should (= 1 (length commands)))
+        (should (string-match-p "Session history could not be displayed"
+                                (buffer-string)))
+        (should (string-match-p "display incomplete.*pilish-reload"
+                                (pilish--header-line-string)))
+        (should (cl-some (lambda (text) (string-match-p "replay failed" text))
+                        diagnostics))))))
+
+(ert-deftest pilish-test-session-history-failure-is-explicit-and-cleans-state ()
+  "Replay and postprocessing errors cannot leave a plausible partial transcript."
+  (dolist (stage '(message postprocessing hook malformed))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let* ((messages [(:role "assistant"
+                        :content [(:type "toolCall" :name "bash" :id "t1"
+                                   :arguments (:command "echo tool"))])
+                       (:role "assistant" :content "Last answer")])
+             (original (symbol-function 'pilish--render-history-assistant-content))
+             (calls 0)
+             diagnostics
+             (hook (lambda (&rest _) (error "persistent change hook"))))
+        (pilish--set-message-start-marker (copy-marker (point-max)))
+        (pilish--set-streaming-marker (copy-marker (point-max) t))
+        (when (eq stage 'hook)
+          (add-hook 'before-change-functions hook nil t))
+        (cl-letf (((symbol-function 'pilish--render-history-assistant-content)
+                   (lambda (message results)
+                     (cl-incf calls)
+                     (if (and (eq stage 'message) (= calls 2))
+                         (error "second message failed")
+                       (funcall original message results))))
+                  ((symbol-function 'pilish--postprocess-history-buffer)
+                   (lambda ()
+                     (when (eq stage 'postprocessing)
+                       (error "postprocessing failed"))))
+                  ((symbol-function 'message)
+                   (lambda (format-string &rest args)
+                     (push (apply #'format format-string args) diagnostics))))
+          (should-not (pilish--display-session-history
+                       (if (eq stage 'malformed) nil messages) (current-buffer))))
+        (remove-hook 'before-change-functions hook t)
+        (should (string-match-p "Session history could not be displayed"
+                                (buffer-string)))
+        (should (string-match-p "pilish-reload" (buffer-string)))
+        (should-not (string-match-p "echo tool\\|Last answer" (buffer-string)))
+        (should-not pilish--message-start-marker)
+        (should-not pilish--streaming-marker)
+        (should-not pilish--thinking-marker)
+        (should-not pilish--pending-tool-overlay)
+        (should-not pilish--pending-stream-deltas)
+        (should-not pilish--stream-delta-flush-timer)
+        (should (= 0 (hash-table-count pilish--live-tool-blocks)))
+        (should (= (point-min) (marker-position pilish--hot-tail-start)))
+        (should-not (cl-some (lambda (ov) (overlay-get ov 'pilish-tool-block))
+                            (overlays-in (point-min) (point-max))))
+        (should (cl-some (lambda (text)
+                          (string-match-p "history.*failed" text)) diagnostics))
+        ;; A later successful load removes both the notice and warning.
+        (should (pilish--display-session-history
+                 [(:role "assistant" :content "Healthy history")]
+                 (current-buffer)))
+        (should (string-match-p "Healthy history" (buffer-string)))
+        (should-not (string-match-p "display incomplete"
+                                    (pilish--header-line-string)))))))
+
 (ert-deftest pilish-test-stream-delta-flush-suspends-expensive-md-ts-hooks ()
   "A coalesced flush suppresses stale tracking but keeps required md-ts hooks.
 The cheap dirty-tick hook and reference-definition before/after pair must stay

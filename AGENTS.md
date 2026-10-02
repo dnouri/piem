@@ -63,7 +63,7 @@ latch on delayed agent/compaction starts.
 | `pilish.el` | Entry point, autoloads, `--setup-session` |
 | `pilish-core.el` | JSON parsing, line buffering, RPC request correlation, and process protocol |
 | `pilish-ui.el` | Shared session/buffer state, accessors, faces, customization, chat/input modes and keymaps, header/activity UI, and local slash-command dispatch; requires core and grammars, not jsonl |
-| `pilish-render.el` | Streaming and history rendering for user, assistant, branch-summary, and compaction messages; tool output, deferred completed-tool cooling outside the hot tail, fontification, diffs, and deferred history table postprocessing |
+| `pilish-render.el` | Streaming and history rendering for user, assistant, branch-summary, and compaction messages; guarded full-history RPC loading and recovery after stream errors; tool output, deferred completed-tool cooling outside the hot tail, fontification, diffs, and deferred history table postprocessing |
 | `pilish-table.el` | Display-only pipe table decoration, wrapping, overlay management, and resize refresh over UI visible-text/scroll seams |
 | `pilish-input.el` | Input history/isearch, send/abort, file/path/slash completion, queuing, and local `/resume` dispatch to the session browser |
 | `pilish-menu.el` | Transient menu; guarded new/reload/resume transitions; canonical jsonl cwd/name metadata; model, thinking, command, export, and stats actions; `r` sessions and `w` tree entries |
@@ -78,7 +78,7 @@ latch on delayed agent/compaction starts.
 |------|--------|
 | `test/pilish-core-test.el` | Core/RPC protocol, framing, request lifecycle, and JSON normalization |
 | `test/pilish-ui-test.el` | Buffer naming/modes, session directories, direct browser key bindings, startup header, slash dispatch, and grammar install |
-| `test/pilish-render-test.el` | Streaming/history response display, branch summaries, tools, tables, file actions, fontification, and diffs |
+| `test/pilish-render-test.el` | Streaming/history response display, error recovery and replay failures, branch summaries, tools, tables, file actions, fontification, and diffs |
 | `test/pilish-table-test.el` | Table decoration, overlays, streaming, resize |
 | `test/pilish-input-test.el` | History, send/abort, queuing, completion, and local `/resume` browser routing |
 | `test/pilish-menu-test.el` | Session transitions and cwd guards, canonical jsonl name metadata, transient browser entries, model/command actions, and reconnect |

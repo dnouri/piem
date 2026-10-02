@@ -60,6 +60,7 @@
 (declare-function pilish--dispatch-button "pilish-render")
 (declare-function pilish--cleanup-on-kill "pilish-render")
 (declare-function pilish--process-followup-queue "pilish-render")
+(declare-function pilish--maybe-recover-history "pilish-render")
 (declare-function pilish--restore-tool-properties "pilish-render")
 (declare-function pilish--fontify-with-hover-help "pilish-render")
 (declare-function pilish--hover-clear-live-state "pilish-render")
@@ -1184,6 +1185,8 @@ new live processes in interactive sessions."
       (process-put process 'pilish-last-output-time (float-time)))
     (pilish--invalidate-model-change)
     (pilish--invalidate-prompt-start-wait)
+    (pilish--invalidate-history-loads)
+    (pilish--set-history-recovery nil)
     ;; Reload can replace a process without its exit handler or a successful
     ;; subsequent history refresh.  End live measurements at this boundary.
     (when (fboundp 'pilish--hover-clear-live-state)
@@ -1243,11 +1246,9 @@ Temporary per-block TAB toggles do not change this buffer-local preference.")
       'visible))
 
 (defvar-local pilish--canonical-messages nil
-  "Canonical session messages cached for idle history rebuilds.
-This is updated from successful history loads and completed agent turns.  It is
-used when the buffer needs a canonical transcript again, such as reload,
-resume, fork, or explicit history rerenders, so the buffer does not have to
-parse rendered text back into message structure.")
+  "Full session snapshot from the last get_messages history load.
+Live turns are not appended here; agent_end carries only that run's messages.
+Recovery must request fresh history rather than repaint this older snapshot.")
 
 (defun pilish--set-canonical-messages (messages)
   "Set canonical session MESSAGES for the current chat buffer."
@@ -1268,6 +1269,16 @@ callbacks cannot rebuild the chat buffer over newer session state.")
     (pilish--set-history-load-generation next)
     next))
 
+(defvar-local pilish--history-recovery nil
+  "Display recovery state: nil, t, or `failed'.
+Nil means no known loss.  t waits for a safe history load; `failed' requires
+explicit reload instead of repeated automatic requests.")
+
+(defun pilish--set-history-recovery (state)
+  "Set history recovery STATE and refresh its persistent header warning."
+  (setq pilish--history-recovery state)
+  (force-mode-line-update t))
+
 (defvar-local pilish--session-transition-generation 0
   "Monotonic generation for async session-transition callbacks.
 Each session switch, fork, or reset bumps this counter so stale callbacks
@@ -1287,6 +1298,7 @@ cannot apply older session identity or header state over a newer session view.")
   "Invalidate pending session-transition callbacks and return the new generation.
 Optional PROC may complete the transition before it becomes the current process."
   (pilish--cancel-inactivity-timer)
+  (pilish--invalidate-history-loads)
   (let ((next (1+ (or pilish--session-transition-generation 0))))
     (pilish--set-session-transition-generation next)
     (setq pilish--session-transition-active t
@@ -1294,11 +1306,13 @@ Optional PROC may complete the transition before it becomes the current process.
     next))
 
 (defun pilish--finish-session-transition (generation)
-  "Mark session transition GENERATION finished when it is still current."
+  "Finish current session transition GENERATION and resume pending recovery."
   (when (= generation pilish--session-transition-generation)
     (setq pilish--session-transition-active nil
           pilish--session-transition-process nil)
-    (pilish--reconcile-inactivity-timer)))
+    (pilish--reconcile-inactivity-timer)
+    (when (eq pilish--history-recovery t)
+      (pilish--maybe-recover-history))))
 
 (defun pilish--session-transition-active-p (&optional chat-buf)
   "Return non-nil when CHAT-BUF is switching sessions or forking."
@@ -2939,7 +2953,14 @@ Accesses state from the linked chat buffer."
      (pilish--header-format-context-group session-name)
      (pilish--header-format-extension-group ext-status working-message)
      (pilish--header-format-prompt-image
-      (pilish--get-prompt-image)))))
+      (pilish--get-prompt-image))
+     (when-let* ((recovery (and chat-buf
+                               (buffer-local-value 'pilish--history-recovery
+                                                   chat-buf))))
+       (propertize (if (eq recovery 'failed)
+                       " │ display incomplete: M-x pilish-reload"
+                     " │ display incomplete: waiting to reload history")
+                   'face 'warning)))))
 
 ;;; State Management
 
