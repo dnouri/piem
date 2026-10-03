@@ -1338,6 +1338,105 @@ section anchor.  Preview text and an expanded sibling retain their views."
   ;; section offset even though the wrapper fence does not change.
   (pilish-test--nested-short-output-collapse-view "\nFIRST\nHIDDEN" "FIRST" t))
 
+(defun pilish-test--nested-output-collapse-before-update (latest-output latest-preview)
+  "Collapse displayed output before LATEST-OUTPUT's queued paint.
+The fold keeps FIRST and both readers' views; the paint then shows the
+literal LATEST-PREVIEW without losing the closed fold."
+  (let ((buffer (generate-new-buffer " *pi-nested-pending-collapse*"))
+        (pilish-quit-without-confirmation t)
+        (pilish-tool-preview-lines 1))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (pilish-chat-mode)
+          (pilish-test--nested-event
+           "tool_execution_start" "pending-root" nil :toolName "runner" :args '(:job "pending"))
+          (pilish-test--nested-event
+           "tool_execution_start" "stable-child" "pending-root" :toolName "read" :args '(:path "stable.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" "stable-child" "pending-root" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
+          (pilish-test--nested-event
+           "tool_execution_update" "pending-root" nil
+           :partialResult '(:content [(:type "text" :text "FIRST\nOLD-HIDDEN")]))
+          (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish--flush-tool-updates buffer))
+          (pilish-test--nested-tab "pending-root" '(child . "stable-child"))
+          (pilish-test--nested-tab "pending-root" 'output)
+          (let* ((root (pilish--nested-tool-owner "pending-root"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (start (marker-position (pilish--tool-block-header-end root)))
+                 (selected (selected-window))
+                 (other (split-window-right)))
+            (set-window-buffer other buffer)
+            (cl-labels ((position (text)
+                          (save-excursion (goto-char start) (search-forward text) (match-beginning 0))))
+              (goto-char (+ (position "FIRST") 2))
+              (set-window-start selected (position "FIRST") t)
+              (set-window-point other (position "UNCHANGED-OFFSET"))
+              (set-window-start other (position "UNCHANGED-OFFSET") t)
+              (let ((displayed (buffer-substring-no-properties start (overlay-end overlay))))
+                ;; The event retains facts now but intentionally does not paint.
+                (pilish-test--nested-event
+                 "tool_execution_update" "pending-root" nil
+                 :partialResult (list :content (vector (list :type "text" :text latest-output))))
+                (should (equal displayed (buffer-substring-no-properties start (overlay-end overlay))))
+                (should (equal latest-output
+                               (pilish--extract-text-from-content
+                                (plist-get (pilish--tool-block-result root) :content)))))
+              (let ((timer pilish--tool-update-flush-timer))
+                (should (timerp timer))
+                (button-activate
+                 (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))
+                ;; A fold acts on the displayed snapshot, not unpainted facts.
+                (should (string-match-p "FIRST" (buffer-string)))
+                (should (= (point) (+ (position "FIRST") 2)))
+                (should (= (window-point selected) (point)))
+                (should (looking-at-p "RST"))
+                (should (= (window-start selected) (position "FIRST")))
+                (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+                (should (= (window-start other) (position "UNCHANGED-OFFSET")))
+                (should-not (string-match-p "OLD-HIDDEN\\|NEW-HIDDEN" (buffer-string)))
+                (should (eq root (cdr (assoc "pending-root" pilish--pending-tool-updates))))
+                (should (eq timer pilish--tool-update-flush-timer))
+                ;; The same queued paint still delivers the latest snapshot.
+                (cancel-timer timer)
+                (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+                  (pilish--flush-tool-updates buffer)))
+              (should (string-match-p (regexp-quote latest-preview) (buffer-string)))
+              (unless (equal latest-preview "FIRST")
+                (should-not (string-match-p "FIRST" (buffer-string))))
+              (should-not (string-match-p "OLD-HIDDEN\\|NEW-HIDDEN" (buffer-string)))
+              (should-not pilish--pending-tool-updates)
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+              (should (= (window-start other) (position "UNCHANGED-OFFSET")))
+              (pilish-test--nested-tab "pending-root" 'output)
+              (should (string-match-p "NEW-HIDDEN" (buffer-string)))
+              (should-not (string-match-p "OLD-HIDDEN" (buffer-string)))
+              ;; The next fold uses the newly painted snapshot, not the old one.
+              (goto-char (+ (position latest-preview) 2))
+              (set-window-start selected (position latest-preview) t)
+              (button-activate
+               (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))
+              (should (= (point) (+ (position latest-preview) 2)))
+              (should (= (window-point selected) (point)))
+              (should (= (window-start selected) (position latest-preview)))
+              (should-not (string-match-p "NEW-HIDDEN" (buffer-string)))
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET")))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest pilish-test-nested-output-collapse-before-pending-update-retains-displayed-snapshot ()
+  "A queued parent's shifted rows cannot invalidate a public collapse."
+  ;; Latest-result row 3 does not index the two currently displayed rows.
+  (pilish-test--nested-output-collapse-before-update "\n\nFIRST\nNEW-HIDDEN" "FIRST"))
+
+(ert-deftest pilish-test-nested-output-collapse-before-same-size-update-keeps-source-identity ()
+  "Equal row counts cannot make a fold map FIRST onto unrelated OTHER."
+  ;; A bounds check alone would silently associate these different source rows.
+  (pilish-test--nested-output-collapse-before-update "OTHER\nNEW-HIDDEN" "OTHER"))
+
 (ert-deftest pilish-test-nested-mid-buffer-rewrite-preserves-view ()
   "Late expansion keeps two windows' text, section offsets and tail following."
   ;; Restoring unmapped positions or body-wide offsets moves readers after
@@ -1541,6 +1640,7 @@ section anchor.  Preview text and an expanded sibling retain their views."
                (body-start (marker-position header))
                (displayed (buffer-substring-no-properties body-start (marker-position end))))
           (should (pilish--tool-block-last-tail root))
+          (should (pilish--tool-block-displayed-output root))
           (should (string-match-p "PARENT-B" displayed))
           (should (string-match-p "OPEN-VISIBLE" displayed))
           (should-not (string-match-p (regexp-opt '("PARENT-HIDDEN" "CLOSED-SECRET")) displayed))
@@ -1574,6 +1674,7 @@ section anchor.  Preview text and an expanded sibling retain their views."
           (should-not (pilish--tool-block-nested-calls root))
           (should-not (pilish--tool-block-args root))
           (should-not (pilish--tool-block-result root))
+          (should-not (pilish--tool-block-displayed-output root))
           (dolist (call calls)
             (should-not (pilish--nested-call-arguments call))
             (should-not (pilish--nested-call-result call))))))))
@@ -6330,6 +6431,7 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
               (should (eq root (cdr (assoc "reused-root" pilish--pending-tool-updates))))
               (should (marker-buffer header))
               (should (marker-buffer end))
+              (should (pilish--tool-block-displayed-output root))
               (pcase boundary
                 ('clear (pilish--clear-render-artifacts))
                 ('history
@@ -6347,6 +6449,7 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
               (should-not (pilish--tool-block-folds root))
               (should-not (pilish--tool-block-args root))
               (should-not (pilish--tool-block-result root))
+              (should-not (pilish--tool-block-displayed-output root))
               (should-not (pilish--tool-block-nested-calls root))
               (should-not (pilish--nested-call-result completed))
               (should-not (pilish--nested-call-arguments completed))

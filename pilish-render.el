@@ -1909,6 +1909,7 @@ overlays are left alone."
   compound-p
   args
   result
+  displayed-output                   ; Parent presentation used by the last paint.
   nested-calls
   folds)
 
@@ -2049,18 +2050,21 @@ HISTORY-P distinguishes saved unfinished work from a stopped live process."
                       'follow-link t 'pilish-tool-toggle t
                       'pilish-tool-section section))
 
-(defun pilish--insert-compound-tool-body (block)
+(defun pilish--insert-compound-tool-body (block &optional output-presentation)
   "Insert BLOCK's compound body at point without child tool overlays.
-Reuse ordinary result selection and rich-output insertion directly."
-  (let ((folds (pilish--tool-block-folds block))
-        (result (pilish--tool-block-result block)))
-    (when result
+Reuse ordinary result selection and rich-output insertion directly.
+OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
+  (let* ((folds (pilish--tool-block-folds block))
+         (presentation
+          (or output-presentation
+              (when-let* ((result (pilish--tool-block-result block)))
+                (pilish--tool-result-presentation
+                 (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
+                 (pilish--tool-block-args block)
+                 (plist-get result :content) (plist-get result :details)
+                 (plist-get result :isError))))))
+    (when presentation
       (let* ((start (point))
-             (presentation (pilish--tool-result-presentation
-                            (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
-                            (pilish--tool-block-args block)
-                            (plist-get result :content) (plist-get result :details)
-                            (plist-get result :isError)))
              (text (plist-get presentation :text))
              (truncation (pilish--truncate-to-visual-lines
                           text (plist-get presentation :preview-limit)
@@ -2121,7 +2125,8 @@ Reuse ordinary result selection and rich-output insertion directly."
                  (string-trim-right text "\n+") (plist-get presentation :lang)
                  (plist-get presentation :is-edit-diff)))
               (pilish--insert-image-previews images))
-            (add-text-properties child-start (point) (list 'pilish-tool-section section))))))))
+            (add-text-properties child-start (point) (list 'pilish-tool-section section))))))
+    (setf (pilish--tool-block-displayed-output block) presentation)))
 
 (defun pilish--toggle-compound-tool-section (button)
   "Toggle only BUTTON's compound fold key."
@@ -2199,7 +2204,10 @@ in that section clamp to its anchor, regardless of fence or fold text."
 
 (defun pilish--redraw-compound-tool (block &optional collapsing-section)
   "Rewrite compound BLOCK within retained bounds and preserve each reader's view.
-COLLAPSING-SECTION identifies the fold whose removed text must clamp."
+COLLAPSING-SECTION identifies the fold whose removed text must clamp.
+Output collapse uses the last painted presentation so captured row spans
+and the preview line map share one source.  Pending updates still paint
+newer retained facts through the existing queue."
   (when-let* ((overlay (pilish--tool-block-overlay block))
               ((eq (overlay-buffer overlay) (current-buffer)))
               (header (pilish--tool-block-header-end block))
@@ -2210,13 +2218,15 @@ COLLAPSING-SECTION identifies the fold whose removed text must clamp."
            (old-content-lines
             (when-let* ((section (and collapsing-section (assoc collapsing-section old-sections))))
               (pilish--tool-section-content-lines section)))
+           (displayed-output (and (eq collapsing-section 'output)
+                                  (pilish--tool-block-displayed-output block)))
            (view (pilish--capture-tool-cooling-view))
            (inhibit-read-only t))
       (save-excursion
         (remove-overlays start old-end 'pilish-diff-overlay t)
         (delete-region start old-end)
         (goto-char start)
-        (pilish--insert-compound-tool-body block)
+        (pilish--insert-compound-tool-body block displayed-output)
         (set-marker header start)
         (set-marker end (point))
         (pilish--tool-block-refresh-overlay block)
@@ -2259,6 +2269,7 @@ COLLAPSING-SECTION identifies the fold whose removed text must clamp."
           (pilish--nested-call-pending-end-p call) nil))
   (setf (pilish--tool-block-args block) nil
         (pilish--tool-block-result block) nil
+        (pilish--tool-block-displayed-output block) nil
         (pilish--tool-block-nested-calls block) nil
         (pilish--tool-block-folds block) nil
         (pilish--tool-block-last-tail block) nil
