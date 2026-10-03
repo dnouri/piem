@@ -200,7 +200,8 @@ NEW-PHASE when session buffers are relinked or reset."
   :group 'pilish)
 
 (defcustom pilish-tool-preview-lines 10
-  "Maximum visual lines to show before collapsing tool output."
+  "Maximum visual lines before collapsing tool output or JavaScript.
+Also the maximum child summaries shown in a collapsed tool call list."
   :type 'natnum
   :group 'pilish)
 
