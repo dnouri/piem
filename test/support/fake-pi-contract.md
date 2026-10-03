@@ -29,8 +29,9 @@ special fake-only branch.
 - Scenario fixture format notes: `test/fixtures/fake-pi/README.md`
 - One-off experiments: `tmp/`
 
-The harness should speak strict JSONL on the wire while using a simpler,
-more expressive internal scenario DSL.
+The harness speaks strict JSONL on the wire with a small set of data-driven
+prompt behaviors. Its one nested-tool scenario replays literal wire records;
+it is not a general event-program framework.
 
 ## Why this fake exists
 
@@ -206,7 +207,8 @@ request and persisted/emitted after the prompt's text block in request order.
 
 For `text_stream`, images belong only to the initial user turn; steering is
 text-only and image-bearing `steer` commands fail.  `tool_stream` preserves
-prompt images on its ordinary user message.  The extension-owned
+prompt images on its ordinary user message, as does the initial user echo in
+`nested_tools`.  The extension-owned
 `extension_dialog` and `custom_message` prompt behaviors reject nonempty image
 arrays before reporting prompt success.  No new scenario type is implied.
 
@@ -280,6 +282,67 @@ Required fields currently consumed by Emacs rendering:
 - `partialResult`
 - `result`
 - `isError`
+
+### One literal nested-tool replay
+
+`nested-tools.json` uses `prompt.type: "nested_tools"` and an ordered
+`prompt.records` array of literal wire objects. The harness acknowledges with
+`started`, emits `agent_start` and the initial persisted user echo, then
+replays those objects unchanged. Only authoritative assistant and parent
+`toolResult` `message_end` payloads append conversation entries. Child tool
+execution events do not create messages or disk entries.
+
+This fixture pins two different upstream records:
+
+- Nested execution events carry the immediate `parentToolCallId: "parent"`.
+  Three real children use `parent/1` (read `/tmp/CHILD-READ`), `parent/2`
+  (bash `CHILD-ERROR`), and `parent/3` (bash `CHILD-LATE`).
+- Codemode's parent details-only update has `content: []` and display-string
+  `args`. Its running tool rows share the placeholder `parent/?`. Model rows
+  use `parent/models.classify/1` (`fake/classifier`, `ok`, cost `0.002`) and
+  `parent/models.generateImages/2` (`fake/image`, `cancelled`). These are
+  details only, not fictional child tool events or tool results. The classifier
+  usage is retained on the parent result.
+
+The parent result message already carries the authoritative `nestedCalls`
+snapshot at `message_start`; the same payload is persisted at `message_end`.
+Saved rows use `arguments` or `argumentsBytes`, and only `ok`, `error`, or
+`unfinished`. The error child's compact argument JSON is exactly 9000 UTF-8
+bytes, so that saved row has `argumentsBytes: 9000` and no `arguments`. The
+late child is saved as `unfinished`. Both conditions make `complete: false`;
+there is no `totalCount` or omitted-call count. The late child's real error end
+follows `FINAL-AFTER-PARENT`, `agent_end`, and `agent_settled`, without rewriting
+that snapshot or any disk bytes.
+
+`isStreaming` stays true through tool results and `agent_end`, then becomes
+false at the literal `agent_settled`. The existing worker remains owned until
+playback actually returns. `abort`, `new_session`, and successful
+`switch_session` join it even when streaming is already false, so no old
+records arrive after their success response. A second nested prompt while
+that worker is alive is rejected; this bounded fake does not model overlapping
+runs. Interrupted playback drops the remaining records and, if still
+streaming, closes the lifecycle through the existing aborted-run helper. It
+does not manufacture child cancellations, results, or partial messages.
+
+Playback uses fixed 30 ms spacing and a 500 ms pause after settlement so tests
+can inspect disk or stop the late replay. These are fixture pacing, not Pi
+ordering/timing guarantees. IDs, assistant metadata, message timestamps, and
+`agent_end.messages` are literal; the latter contains the fixture's two
+assistant messages and parent result, not the separately echoed input. Real
+Pi includes the initial prompt in a normal run's `agent_end.messages`. No
+input, model, or thinking substitutions occur inside the records. This is one
+representative wire flow, not a complete capture of every callback a script
+would generate. The script, tools, model calls, extensions, and MCP never run.
+
+Source authority: `~/co/pi-mono` at `v1.0.0` (`a13d35a74`), especially
+`packages/coding-agent/src/core/nested-tool-calls.ts`,
+`src/core/agent-session.ts:1075–1135`, `src/extensions/codemode/tool.ts:103–126`,
+`src/extensions/codemode/execute.ts:342–400,572–588`, and
+`packages/ai/src/types.ts:573–607`. Saved summaries are copies; late execution
+completion does not mutate the message's snapshot. The source's limits are
+256 calls, 8192 bytes per call, 32768 argument bytes total, and 500 error
+characters; this fixture exercises per-call omission and unfinished work,
+not every limit boundary.
 
 ### Fork messages
 

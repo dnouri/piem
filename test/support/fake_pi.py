@@ -13,7 +13,7 @@ Manual usage examples:
     ./test/support/fake_pi.py --scenario extension-confirm \
         --extension-timeout-ms 10000 --log-file /tmp/fake-pi.log
 
-Scenario files live in ``test/fixtures/fake-pi/`` and currently support four
+Scenario files live in ``test/fixtures/fake-pi/`` and currently support five
 prompt behaviors:
 
 ``text_stream``
@@ -33,6 +33,10 @@ prompt behaviors:
 ``tool_stream``
     Emits the streamed tool-call and tool-execution event surface, then ends
     with optional assistant text.
+
+``nested_tools``
+    Replays one literal nested-tool wire flow, including a parent result
+    snapshot and a child end after settlement.  It executes no tools or scripts.
 """
 
 from __future__ import annotations
@@ -139,8 +143,20 @@ class ToolStreamPrompt:
     echo_user: bool = True
 
 
+@dataclass(frozen=True)
+class NestedToolPrompt:
+    """Scenario data for one literal nested-tool wire replay."""
+
+    type: Literal["nested_tools"]
+    records: tuple[JsonDict, ...]
+
+
 PromptBehavior = (
-    TextStreamPrompt | ExtensionDialogPrompt | CustomMessagePrompt | ToolStreamPrompt
+    TextStreamPrompt
+    | ExtensionDialogPrompt
+    | CustomMessagePrompt
+    | ToolStreamPrompt
+    | NestedToolPrompt
 )
 
 
@@ -283,6 +299,10 @@ def load_scenario(path: Path, name: str) -> Scenario:
             assistant_text=prompt_data.get("assistant_text", ""),
             delay_ms=int(prompt_data.get("delay_ms", 30)),
             echo_user=bool(prompt_data.get("echo_user", True)),
+        )
+    elif prompt_type == "nested_tools":
+        prompt = NestedToolPrompt(
+            type="nested_tools", records=tuple(prompt_data["records"])
         )
     else:
         raise ValueError(f"Unsupported prompt type: {prompt_type}")
@@ -476,8 +496,13 @@ class FakePiHarness:
             else:
                 self._queue_steer(command)
             return
-        if isinstance(behavior, ExtensionDialogPrompt) and self._run_thread is not None:
-            self._fail(command, "This fake supports only one active dialog worker")
+        if (
+            isinstance(behavior, (ExtensionDialogPrompt, NestedToolPrompt))
+            and self._run_thread is not None
+        ):
+            self._fail(
+                command, "This fake supports only one active dialog or replay worker"
+            )
             return
         self._abort_requested.clear()
         match behavior:
@@ -521,6 +546,13 @@ class FakePiHarness:
                     target=lambda: self._run_tool_prompt(
                         message, behavior, prompt_images=prompt_images
                     ),
+                )
+            case NestedToolPrompt() as behavior:
+                user_message = self._build_user_message(message, prompt_images)
+                self._respond(command, data={"disposition": "started"})
+                self._start_run(
+                    name=f"fake-pi-nested-tools-{self.scenario.name}",
+                    target=lambda: self._run_nested_tool_prompt(user_message, behavior),
                 )
             case _:
                 raise AssertionError("Unknown prompt behavior")
@@ -936,6 +968,34 @@ class FakePiHarness:
         self._finish_run(
             [user_message, tool_assistant_message, tool_result_message, final_message]
         )
+
+    def _run_nested_tool_prompt(
+        self, user_message: JsonDict, behavior: NestedToolPrompt
+    ) -> None:
+        """Replay literal wire records, persisting only authoritative messages."""
+        self._write_json({"type": "agent_start"})
+        self._persist_user_message(user_message)
+        self._write_json({"type": "message_start", "message": user_message})
+        self._write_json({"type": "message_end", "message": user_message})
+        for record in behavior.records:
+            if not self._sleep_ms(30, abortable=True):
+                if self.state.is_streaming:
+                    self._finish_aborted_run()
+                return
+            record_type = record["type"]
+            if record_type == "message_end":
+                message = record["message"]
+                if message["role"] == "assistant":
+                    self._persist_assistant_message(message)
+                elif message["role"] == "toolResult":
+                    self._persist_tool_result_message(message)
+            elif record_type == "agent_settled":
+                self.state.is_streaming = False
+            self._write_json(record)
+            # Settlement ends streaming, not this worker.  Leave a fixed pause
+            # to observe the saved snapshot or join playback before its late end.
+            if record_type == "agent_settled" and not self._sleep_ms(500, abortable=True):
+                return
 
     def _build_extension_request(
         self, request_id: str, behavior: ExtensionDialogPrompt

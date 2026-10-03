@@ -1,0 +1,833 @@
+{
+  "description": "One literal Pi 1.0 nested codemode wire flow with a saved snapshot and a late child end",
+  "commands": [],
+  "prompt": {
+    "type": "nested_tools",
+    "records": [
+      {
+        "type": "message_start",
+        "message": {
+          "role": "assistant",
+          "content": [],
+          "api": "fake-api",
+          "provider": "fake",
+          "model": "fake-model",
+          "thinkingLevel": "off",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "pending",
+          "timestamp": 1791036000000
+        }
+      },
+      {
+        "type": "message_update",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "assistantMessageEvent": {
+          "type": "toolcall_start",
+          "contentIndex": 0,
+          "id": "parent",
+          "toolName": "codemode"
+        }
+      },
+      {
+        "type": "message_update",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "assistantMessageEvent": {
+          "type": "toolcall_delta",
+          "contentIndex": 0,
+          "delta": "{\"code\":\"const read = tools.read({ path: \\\"/tmp/CHILD-READ\\\" });\\nconst error = tools.bash({ command: \\\"printf 'CHILD-ERROR'; exit 7; # \\\" + \\\"é\\\".repeat(4477) });\\nvoid tools.bash({ command: \\\"printf 'CHILD-LATE'; sleep 1\\\" });\\nconst classified = await models.classify(\\n  { provider: \\\"fake\\\", id: \\\"classifier\\\" },\\n  { state: { read: true }, questions: { useful: {\\n    type: \\\"bool\\\", instructions: \\\"Is the read useful?\\\",\\n    criteria: { true: \\\"Useful\\\", false: \\\"Not useful\\\" }\\n  } } }\\n);\\nvoid models.generateImages(\\n  { provider: \\\"fake\\\", id: \\\"image\\\" },\\n  { input: [{ type: \\\"text\\\", text: \\\"A small test image\\\" }] }\\n);\\nconst results = await Promise.allSettled([read, error]);\\ntext({ results, classified });\"}"
+        }
+      },
+      {
+        "type": "message_update",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "assistantMessageEvent": {
+          "type": "toolcall_end",
+          "contentIndex": 0,
+          "toolCall": {
+            "type": "toolCall",
+            "id": "parent",
+            "name": "codemode",
+            "arguments": {
+              "code": "const read = tools.read({ path: \"/tmp/CHILD-READ\" });\nconst error = tools.bash({ command: \"printf 'CHILD-ERROR'; exit 7; # \" + \"é\".repeat(4477) });\nvoid tools.bash({ command: \"printf 'CHILD-LATE'; sleep 1\" });\nconst classified = await models.classify(\n  { provider: \"fake\", id: \"classifier\" },\n  { state: { read: true }, questions: { useful: {\n    type: \"bool\", instructions: \"Is the read useful?\",\n    criteria: { true: \"Useful\", false: \"Not useful\" }\n  } } }\n);\nvoid models.generateImages(\n  { provider: \"fake\", id: \"image\" },\n  { input: [{ type: \"text\", text: \"A small test image\" }] }\n);\nconst results = await Promise.allSettled([read, error]);\ntext({ results, classified });"
+            }
+          }
+        }
+      },
+      {
+        "type": "message_end",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "toolCall",
+              "id": "parent",
+              "name": "codemode",
+              "arguments": {
+                "code": "const read = tools.read({ path: \"/tmp/CHILD-READ\" });\nconst error = tools.bash({ command: \"printf 'CHILD-ERROR'; exit 7; # \" + \"é\".repeat(4477) });\nvoid tools.bash({ command: \"printf 'CHILD-LATE'; sleep 1\" });\nconst classified = await models.classify(\n  { provider: \"fake\", id: \"classifier\" },\n  { state: { read: true }, questions: { useful: {\n    type: \"bool\", instructions: \"Is the read useful?\",\n    criteria: { true: \"Useful\", false: \"Not useful\" }\n  } } }\n);\nvoid models.generateImages(\n  { provider: \"fake\", id: \"image\" },\n  { input: [{ type: \"text\", text: \"A small test image\" }] }\n);\nconst results = await Promise.allSettled([read, error]);\ntext({ results, classified });"
+              }
+            }
+          ],
+          "api": "fake-api",
+          "provider": "fake",
+          "model": "fake-model",
+          "thinkingLevel": "off",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "toolUse",
+          "timestamp": 1791036000000
+        }
+      },
+      {
+        "type": "tool_execution_start",
+        "toolCallId": "parent",
+        "toolName": "codemode",
+        "args": {
+          "code": "const read = tools.read({ path: \"/tmp/CHILD-READ\" });\nconst error = tools.bash({ command: \"printf 'CHILD-ERROR'; exit 7; # \" + \"é\".repeat(4477) });\nvoid tools.bash({ command: \"printf 'CHILD-LATE'; sleep 1\" });\nconst classified = await models.classify(\n  { provider: \"fake\", id: \"classifier\" },\n  { state: { read: true }, questions: { useful: {\n    type: \"bool\", instructions: \"Is the read useful?\",\n    criteria: { true: \"Useful\", false: \"Not useful\" }\n  } } }\n);\nvoid models.generateImages(\n  { provider: \"fake\", id: \"image\" },\n  { input: [{ type: \"text\", text: \"A small test image\" }] }\n);\nconst results = await Promise.allSettled([read, error]);\ntext({ results, classified });"
+        }
+      },
+      {
+        "type": "tool_execution_start",
+        "toolCallId": "parent/1",
+        "toolName": "read",
+        "args": {
+          "path": "/tmp/CHILD-READ"
+        },
+        "parentToolCallId": "parent"
+      },
+      {
+        "type": "tool_execution_start",
+        "toolCallId": "parent/2",
+        "toolName": "bash",
+        "args": {
+          "command": "printf 'CHILD-ERROR'; exit 7; # ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+        },
+        "parentToolCallId": "parent"
+      },
+      {
+        "type": "tool_execution_start",
+        "toolCallId": "parent/3",
+        "toolName": "bash",
+        "args": {
+          "command": "printf 'CHILD-LATE'; sleep 1"
+        },
+        "parentToolCallId": "parent"
+      },
+      {
+        "type": "tool_execution_update",
+        "toolCallId": "parent/3",
+        "toolName": "bash",
+        "args": {
+          "command": "printf 'CHILD-LATE'; sleep 1"
+        },
+        "partialResult": {
+          "content": [
+            {
+              "type": "text",
+              "text": "CHILD-LATE"
+            }
+          ]
+        },
+        "parentToolCallId": "parent"
+      },
+      {
+        "type": "tool_execution_update",
+        "toolCallId": "parent",
+        "toolName": "codemode",
+        "args": {
+          "code": "const read = tools.read({ path: \"/tmp/CHILD-READ\" });\nconst error = tools.bash({ command: \"printf 'CHILD-ERROR'; exit 7; # \" + \"é\".repeat(4477) });\nvoid tools.bash({ command: \"printf 'CHILD-LATE'; sleep 1\" });\nconst classified = await models.classify(\n  { provider: \"fake\", id: \"classifier\" },\n  { state: { read: true }, questions: { useful: {\n    type: \"bool\", instructions: \"Is the read useful?\",\n    criteria: { true: \"Useful\", false: \"Not useful\" }\n  } } }\n);\nvoid models.generateImages(\n  { provider: \"fake\", id: \"image\" },\n  { input: [{ type: \"text\", text: \"A small test image\" }] }\n);\nconst results = await Promise.allSettled([read, error]);\ntext({ results, classified });"
+        },
+        "partialResult": {
+          "content": [],
+          "details": {
+            "calls": [
+              {
+                "id": "parent/?",
+                "name": "read",
+                "args": "{\"path\":\"/tmp/CHILD-READ\"}",
+                "status": "running"
+              },
+              {
+                "id": "parent/?",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-ERROR'; exit 7; # ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé...",
+                "status": "running"
+              },
+              {
+                "id": "parent/?",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-LATE'; sleep 1\"}",
+                "status": "running"
+              },
+              {
+                "id": "parent/models.classify/1",
+                "name": "models.classify",
+                "args": "fake/classifier",
+                "status": "ok",
+                "durationMs": 30,
+                "cost": 0.002
+              },
+              {
+                "id": "parent/models.generateImages/2",
+                "name": "models.generateImages",
+                "args": "fake/image",
+                "status": "cancelled",
+                "durationMs": 35
+              }
+            ]
+          }
+        }
+      },
+      {
+        "type": "tool_execution_end",
+        "toolCallId": "parent/1",
+        "toolName": "read",
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "CHILD-READ: contents\n"
+            }
+          ],
+          "details": {}
+        },
+        "isError": false,
+        "parentToolCallId": "parent"
+      },
+      {
+        "type": "tool_execution_end",
+        "toolCallId": "parent/2",
+        "toolName": "bash",
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "CHILD-ERROR\n\nCommand exited with code 7"
+            }
+          ],
+          "structuredContent": {
+            "output": "CHILD-ERROR",
+            "truncated": false,
+            "exit_code": 7,
+            "wall_time_seconds": 0.1
+          },
+          "isError": true
+        },
+        "isError": true,
+        "parentToolCallId": "parent"
+      },
+      {
+        "type": "tool_execution_end",
+        "toolCallId": "parent",
+        "toolName": "codemode",
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+            },
+            {
+              "type": "text",
+              "text": "Read finished; error retained; classifier useful."
+            }
+          ],
+          "details": {
+            "calls": [
+              {
+                "id": "parent/1",
+                "name": "read",
+                "args": "{\"path\":\"/tmp/CHILD-READ\"}",
+                "status": "ok",
+                "durationMs": 40
+              },
+              {
+                "id": "parent/2",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-ERROR'; exit 7; # ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé...",
+                "status": "error",
+                "durationMs": 80,
+                "error": "CHILD-ERROR\n\nCommand exited with code 7"
+              },
+              {
+                "id": "parent/?",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-LATE'; sleep 1\"}",
+                "status": "cancelled"
+              },
+              {
+                "id": "parent/models.classify/1",
+                "name": "models.classify",
+                "args": "fake/classifier",
+                "status": "ok",
+                "durationMs": 30,
+                "cost": 0.002
+              },
+              {
+                "id": "parent/models.generateImages/2",
+                "name": "models.generateImages",
+                "args": "fake/image",
+                "status": "cancelled",
+                "durationMs": 35
+              }
+            ]
+          },
+          "usage": {
+            "input": 100,
+            "output": 4,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 104,
+            "cost": {
+              "input": 0.001,
+              "output": 0.001,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.002
+            }
+          }
+        },
+        "isError": false
+      },
+      {
+        "type": "message_start",
+        "message": {
+          "role": "toolResult",
+          "toolCallId": "parent",
+          "toolName": "codemode",
+          "content": [
+            {
+              "type": "text",
+              "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+            },
+            {
+              "type": "text",
+              "text": "Read finished; error retained; classifier useful."
+            }
+          ],
+          "details": {
+            "calls": [
+              {
+                "id": "parent/1",
+                "name": "read",
+                "args": "{\"path\":\"/tmp/CHILD-READ\"}",
+                "status": "ok",
+                "durationMs": 40
+              },
+              {
+                "id": "parent/2",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-ERROR'; exit 7; # ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé...",
+                "status": "error",
+                "durationMs": 80,
+                "error": "CHILD-ERROR\n\nCommand exited with code 7"
+              },
+              {
+                "id": "parent/?",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-LATE'; sleep 1\"}",
+                "status": "cancelled"
+              },
+              {
+                "id": "parent/models.classify/1",
+                "name": "models.classify",
+                "args": "fake/classifier",
+                "status": "ok",
+                "durationMs": 30,
+                "cost": 0.002
+              },
+              {
+                "id": "parent/models.generateImages/2",
+                "name": "models.generateImages",
+                "args": "fake/image",
+                "status": "cancelled",
+                "durationMs": 35
+              }
+            ]
+          },
+          "usage": {
+            "input": 100,
+            "output": 4,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 104,
+            "cost": {
+              "input": 0.001,
+              "output": 0.001,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.002
+            }
+          },
+          "isError": false,
+          "timestamp": 1791036000800,
+          "nestedCalls": {
+            "calls": [
+              {
+                "id": "parent/1",
+                "name": "read",
+                "arguments": {
+                  "path": "/tmp/CHILD-READ"
+                },
+                "status": "ok",
+                "durationMs": 40
+              },
+              {
+                "id": "parent/2",
+                "name": "bash",
+                "argumentsBytes": 9000,
+                "status": "error",
+                "durationMs": 80,
+                "error": "CHILD-ERROR\n\nCommand exited with code 7"
+              },
+              {
+                "id": "parent/3",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'CHILD-LATE'; sleep 1"
+                },
+                "status": "unfinished"
+              }
+            ],
+            "complete": false
+          }
+        }
+      },
+      {
+        "type": "message_end",
+        "message": {
+          "role": "toolResult",
+          "toolCallId": "parent",
+          "toolName": "codemode",
+          "content": [
+            {
+              "type": "text",
+              "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+            },
+            {
+              "type": "text",
+              "text": "Read finished; error retained; classifier useful."
+            }
+          ],
+          "details": {
+            "calls": [
+              {
+                "id": "parent/1",
+                "name": "read",
+                "args": "{\"path\":\"/tmp/CHILD-READ\"}",
+                "status": "ok",
+                "durationMs": 40
+              },
+              {
+                "id": "parent/2",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-ERROR'; exit 7; # ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé...",
+                "status": "error",
+                "durationMs": 80,
+                "error": "CHILD-ERROR\n\nCommand exited with code 7"
+              },
+              {
+                "id": "parent/?",
+                "name": "bash",
+                "args": "{\"command\":\"printf 'CHILD-LATE'; sleep 1\"}",
+                "status": "cancelled"
+              },
+              {
+                "id": "parent/models.classify/1",
+                "name": "models.classify",
+                "args": "fake/classifier",
+                "status": "ok",
+                "durationMs": 30,
+                "cost": 0.002
+              },
+              {
+                "id": "parent/models.generateImages/2",
+                "name": "models.generateImages",
+                "args": "fake/image",
+                "status": "cancelled",
+                "durationMs": 35
+              }
+            ]
+          },
+          "usage": {
+            "input": 100,
+            "output": 4,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 104,
+            "cost": {
+              "input": 0.001,
+              "output": 0.001,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0.002
+            }
+          },
+          "isError": false,
+          "timestamp": 1791036000800,
+          "nestedCalls": {
+            "calls": [
+              {
+                "id": "parent/1",
+                "name": "read",
+                "arguments": {
+                  "path": "/tmp/CHILD-READ"
+                },
+                "status": "ok",
+                "durationMs": 40
+              },
+              {
+                "id": "parent/2",
+                "name": "bash",
+                "argumentsBytes": 9000,
+                "status": "error",
+                "durationMs": 80,
+                "error": "CHILD-ERROR\n\nCommand exited with code 7"
+              },
+              {
+                "id": "parent/3",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'CHILD-LATE'; sleep 1"
+                },
+                "status": "unfinished"
+              }
+            ],
+            "complete": false
+          }
+        }
+      },
+      {
+        "type": "message_start",
+        "message": {
+          "role": "assistant",
+          "content": [],
+          "api": "fake-api",
+          "provider": "fake",
+          "model": "fake-model",
+          "thinkingLevel": "off",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "pending",
+          "timestamp": 1791036001000
+        }
+      },
+      {
+        "type": "message_update",
+        "usage": {
+          "input": 0,
+          "output": 0,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 0,
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "total": 0
+          }
+        },
+        "assistantMessageEvent": {
+          "type": "text_delta",
+          "contentIndex": 0,
+          "delta": "FINAL-AFTER-PARENT"
+        }
+      },
+      {
+        "type": "message_end",
+        "message": {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "text",
+              "text": "FINAL-AFTER-PARENT"
+            }
+          ],
+          "api": "fake-api",
+          "provider": "fake",
+          "model": "fake-model",
+          "thinkingLevel": "off",
+          "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "total": 0
+            }
+          },
+          "stopReason": "stop",
+          "timestamp": 1791036001000
+        }
+      },
+      {
+        "type": "agent_end",
+        "messages": [
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "toolCall",
+                "id": "parent",
+                "name": "codemode",
+                "arguments": {
+                  "code": "const read = tools.read({ path: \"/tmp/CHILD-READ\" });\nconst error = tools.bash({ command: \"printf 'CHILD-ERROR'; exit 7; # \" + \"é\".repeat(4477) });\nvoid tools.bash({ command: \"printf 'CHILD-LATE'; sleep 1\" });\nconst classified = await models.classify(\n  { provider: \"fake\", id: \"classifier\" },\n  { state: { read: true }, questions: { useful: {\n    type: \"bool\", instructions: \"Is the read useful?\",\n    criteria: { true: \"Useful\", false: \"Not useful\" }\n  } } }\n);\nvoid models.generateImages(\n  { provider: \"fake\", id: \"image\" },\n  { input: [{ type: \"text\", text: \"A small test image\" }] }\n);\nconst results = await Promise.allSettled([read, error]);\ntext({ results, classified });"
+                }
+              }
+            ],
+            "api": "fake-api",
+            "provider": "fake",
+            "model": "fake-model",
+            "thinkingLevel": "off",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "toolUse",
+            "timestamp": 1791036000000
+          },
+          {
+            "role": "toolResult",
+            "toolCallId": "parent",
+            "toolName": "codemode",
+            "content": [
+              {
+                "type": "text",
+                "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"
+              },
+              {
+                "type": "text",
+                "text": "Read finished; error retained; classifier useful."
+              }
+            ],
+            "details": {
+              "calls": [
+                {
+                  "id": "parent/1",
+                  "name": "read",
+                  "args": "{\"path\":\"/tmp/CHILD-READ\"}",
+                  "status": "ok",
+                  "durationMs": 40
+                },
+                {
+                  "id": "parent/2",
+                  "name": "bash",
+                  "args": "{\"command\":\"printf 'CHILD-ERROR'; exit 7; # ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé...",
+                  "status": "error",
+                  "durationMs": 80,
+                  "error": "CHILD-ERROR\n\nCommand exited with code 7"
+                },
+                {
+                  "id": "parent/?",
+                  "name": "bash",
+                  "args": "{\"command\":\"printf 'CHILD-LATE'; sleep 1\"}",
+                  "status": "cancelled"
+                },
+                {
+                  "id": "parent/models.classify/1",
+                  "name": "models.classify",
+                  "args": "fake/classifier",
+                  "status": "ok",
+                  "durationMs": 30,
+                  "cost": 0.002
+                },
+                {
+                  "id": "parent/models.generateImages/2",
+                  "name": "models.generateImages",
+                  "args": "fake/image",
+                  "status": "cancelled",
+                  "durationMs": 35
+                }
+              ]
+            },
+            "usage": {
+              "input": 100,
+              "output": 4,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 104,
+              "cost": {
+                "input": 0.001,
+                "output": 0.001,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0.002
+              }
+            },
+            "isError": false,
+            "timestamp": 1791036000800,
+            "nestedCalls": {
+              "calls": [
+                {
+                  "id": "parent/1",
+                  "name": "read",
+                  "arguments": {
+                    "path": "/tmp/CHILD-READ"
+                  },
+                  "status": "ok",
+                  "durationMs": 40
+                },
+                {
+                  "id": "parent/2",
+                  "name": "bash",
+                  "argumentsBytes": 9000,
+                  "status": "error",
+                  "durationMs": 80,
+                  "error": "CHILD-ERROR\n\nCommand exited with code 7"
+                },
+                {
+                  "id": "parent/3",
+                  "name": "bash",
+                  "arguments": {
+                    "command": "printf 'CHILD-LATE'; sleep 1"
+                  },
+                  "status": "unfinished"
+                }
+              ],
+              "complete": false
+            }
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "FINAL-AFTER-PARENT"
+              }
+            ],
+            "api": "fake-api",
+            "provider": "fake",
+            "model": "fake-model",
+            "thinkingLevel": "off",
+            "usage": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0,
+              "totalTokens": 0,
+              "cost": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "total": 0
+              }
+            },
+            "stopReason": "stop",
+            "timestamp": 1791036001000
+          }
+        ],
+        "willRetry": false
+      },
+      {
+        "type": "agent_settled"
+      },
+      {
+        "type": "tool_execution_end",
+        "toolCallId": "parent/3",
+        "toolName": "bash",
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "CHILD-LATE\n\nCommand aborted"
+            }
+          ],
+          "details": {}
+        },
+        "isError": true,
+        "parentToolCallId": "parent"
+      }
+    ]
+  }
+}
