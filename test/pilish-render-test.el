@@ -3942,6 +3942,67 @@ See https://github.com/dnouri/pilish/issues/176."
         (should response-sent)
         (should (eq (plist-get response-sent :cancelled) t))))))
 
+;; W1 Task 1 fixture: a valid supported-dialog request. File-local to these tests.
+(defun pilish-test--extension-dialog-request (method &optional id)
+  "Return a supported METHOD request with ID, defaulting to METHOD."
+  (list :type "extension_ui_request" :id (or id method) :method method
+        :title "Question:" :message "Continue?"
+        :options ["Option A" "Option B"] :placeholder "Default"))
+
+(ert-deftest pilish-test-extension-ui-w1-completion-exits ()
+  "Every pre-response exit cancels; only error and quit are contained."
+  (dolist (proc '(t nil))
+    (dolist (exit '(error quit throw))
+      (let (sent)
+        (cl-letf (((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (process response)
+                     (push (list process response) sent))))
+          (let ((outcome
+                 (catch 'w1-dialog-unwind
+                   (condition-case nil
+                       (progn
+                         (pilish--complete-extension-ui-dialog
+                          (pilish-test--extension-dialog-request "input") proc
+                          (lambda ()
+                            (if (eq exit 'throw)
+                                (throw 'w1-dialog-unwind :thrown)
+                              (signal exit nil))))
+                         :returned)
+                     ((error quit) :escaped)))))
+            (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
+            (should (equal sent
+                           (when proc
+                             '((t (:type "extension_ui_response"
+                                   :id "input" :cancelled t))))))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-completion-send-failures ()
+  "Neither a failed success send nor a failed cancel send gets retried."
+  (dolist (kind '(success cancel))
+    (dolist (exit '(error quit throw))
+      (let* ((expected (if (eq kind 'success)
+                           '(:type "extension_ui_response" :id "input" :value "")
+                         '(:type "extension_ui_response" :id "input" :cancelled t)))
+             sent)
+        (cl-letf (((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (_process response)
+                     ;; Record the attempt BEFORE failing, like a partial write.
+                     (push response sent)
+                     (if (eq exit 'throw)
+                         (throw 'w1-send-unwind :thrown)
+                       (signal exit nil)))))
+          (let ((outcome
+                 (catch 'w1-send-unwind
+                   (condition-case nil
+                       (progn
+                         (pilish--complete-extension-ui-dialog
+                          (pilish-test--extension-dialog-request "input") t
+                          (lambda ()
+                            (if (eq kind 'cancel) (error "Reader failed") expected)))
+                         :returned)
+                     ((error quit) :escaped)))))
+            (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
+            (should (equal sent (list expected)))))))))
+
 ;;; Pretty-Print JSON Helper
 
 (ert-deftest pilish-test-pretty-print-json-simple-plist ()

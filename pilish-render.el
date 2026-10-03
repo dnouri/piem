@@ -1191,6 +1191,35 @@ Include optional STDERR in a text fence and optional DETAIL before it."
                (_ ""))
              msg)))
 
+(defun pilish--complete-extension-ui-dialog (event proc read-response)
+  "Answer supported-dialog EVENT with exactly one response on PROC.
+Call READ-RESPONSE with no arguments to obtain the complete
+success response plist; call it even when PROC is nil, so readers
+work without a process.  A response counts as attempted once
+sending begins: the flag is set before the send, so a response
+that fails midway counts as delivered and is neither retried nor
+replaced by a cancellation.  Any exit before the first attempt --
+reader error, user quit, or a throw -- cancels the dialog by
+sending a `:cancelled' response instead.  `error' and `quit',
+including from cancellation itself, return nil; any other
+nonlocal exit propagates after cancelling."
+  (let ((response-attempted nil))
+    (condition-case nil
+        (unwind-protect
+            (let ((response (funcall read-response)))
+              (when proc
+                (setq response-attempted t)
+                (pilish--send-extension-ui-response proc response)))
+          (when (and proc (not response-attempted))
+            (setq response-attempted t)
+            (pilish--send-extension-ui-response
+             proc
+             (list :type "extension_ui_response"
+                   :id (plist-get event :id)
+                   :cancelled t))))
+      ((error quit) nil))
+    nil))
+
 (defun pilish--extension-ui-confirm (event proc)
   "Handle confirm method from EVENT, responding via PROC."
   (let* ((id (plist-get event :id))
