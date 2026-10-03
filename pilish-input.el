@@ -671,17 +671,25 @@ Skips / at buffer start to allow slash command completion."
 
 (defun pilish--send-steer-message (text)
   "Send TEXT as a steering message via RPC.
-Returns t if message was sent, nil if process unavailable.
-Shows error message if RPC fails."
-  (let ((proc (pilish--get-process)))
+Return t if scheduled, nil if the process is unavailable.
+Report acceptance or failure after the current process acknowledges it."
+  (let ((proc (pilish--get-process))
+        (chat-buf (pilish--get-chat-buffer)))
     (if (and proc (process-live-p proc))
         (progn
-          (pilish--rpc-async proc
-                                      (list :type "steer" :message text)
-                                      (lambda (response)
-                                        (unless (eq (plist-get response :success) t)
-                                          (message "Pi: Steering failed: %s"
-                                                   (or (plist-get response :error) "unknown error")))))
+          (pilish--rpc-async
+           proc (list :type "steer" :message text)
+           (lambda (response)
+             (when (and (buffer-live-p chat-buf)
+                        (eq proc (with-current-buffer chat-buf (pilish--get-process))))
+               (if (eq (plist-get response :success) t)
+                   (message "%s"
+                            (pcase (plist-get (plist-get response :data) :disposition)
+                              ("queued" "Pi: Steering acknowledged as queued")
+                              ("handled" "Pi: Steering handled by extension")
+                              (_ "Pi: Steering message sent")))
+                 (message "Pi: Steering failed: %s"
+                          (or (plist-get response :error) "unknown error"))))))
           t)
       (message "Pi: Cannot send steering - process unavailable")
       nil)))
@@ -718,8 +726,7 @@ command reservation finish.  Steering refuses a draft image."
                 (message "Pi: Steering queued (will send when Pi is ready)"))
                ((memq status '(sending streaming))
                 (when (pilish--send-steer-message text)
-                  (pilish--accept-input-text text)
-                  (message "Pi: Steering message sent")))
+                  (pilish--accept-input-text text)))
                (t
                 (message "Pi: Cannot steer while session status is %s"
                          status))))))))))

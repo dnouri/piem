@@ -180,7 +180,7 @@ Each function is called with five arguments:
   CHAT-BUFFER INPUT-BUFFER OLD-PHASE NEW-PHASE REASON
 
 NEW-PHASE is one of \"thinking\", \"replying\", \"running\",
-\"compact\", or \"idle\".  INPUT-BUFFER may be nil or dead during
+\"queued\", \"compact\", or \"idle\".  INPUT-BUFFER may be nil or dead during
 session teardown.
 
 REASON is one of `phase-change', `reset', `teardown',
@@ -1370,7 +1370,7 @@ Starts as `line-start' because content begins after separator newline.")
 (defvar-local pilish--activity-phase "idle"
   "Fine-grained activity phase for header-line display.
 One of \"thinking\", \"replying\", \"running\",
-\"compact\", or \"idle\".
+\"queued\", \"compact\", or \"idle\".
 Always populated; normally rendered in a fixed-width slot.")
 
 (defvar-local pilish--inactivity-timer nil
@@ -1468,7 +1468,7 @@ transitions."
 (defun pilish--set-activity-phase (phase &optional reason force)
   "Set activity PHASE for header-line display in current chat buffer.
 PHASE should be one of \"thinking\", \"replying\",
-\"running\", \"compact\", or \"idle\".  REASON defaults to
+\"running\", \"queued\", \"compact\", or \"idle\".  REASON defaults to
 `phase-change'.  When FORCE is non-nil, rerun
 `pilish-activity-phase-functions' even if PHASE did not change.
 Returns non-nil when the phase changed."
@@ -1709,7 +1709,8 @@ settles.  Record identity and process identity invalidate stale callbacks.")
 (defun pilish--prompt-local-echo-p ()
   "Return non-nil when acceptance may still display a speculative user turn."
   (not (and pilish--prompt-wait
-            (or (equal (pilish--prompt-wait-disposition pilish--prompt-wait) "handled")
+            (or (member (pilish--prompt-wait-disposition pilish--prompt-wait)
+                        '("handled" "queued"))
                 (pilish--prompt-wait-started pilish--prompt-wait)
                 (pilish--prompt-wait-echoed pilish--prompt-wait)))))
 
@@ -3073,7 +3074,8 @@ Call ON-NO-AGENT-START after releasing local ownership."
 
 (defun pilish--probe-prompt-start-state (chat-buf wait on-no-agent-start)
   "Ask whether CHAT-BUF's accepted WAIT produced no agent turn.
-Call ON-NO-AGENT-START only after Pi reports idle with no newer local start."
+Call ON-NO-AGENT-START only after Pi reports idle with no newer local start
+or pending queued input."
   (let ((proc (pilish--prompt-wait-process wait)))
     (when (and proc (process-live-p proc))
       (condition-case nil
@@ -3087,7 +3089,9 @@ Call ON-NO-AGENT-START only after Pi reports idle with no newer local start."
                      (if (or (memq pilish--status '(streaming compacting))
                              (not (eq (plist-get response :success) t))
                              (pilish--normalize-boolean (plist-get data :isStreaming))
-                             (pilish--normalize-boolean (plist-get data :isCompacting)))
+                             (pilish--normalize-boolean (plist-get data :isCompacting))
+                             (and (equal (pilish--prompt-wait-disposition wait) "queued")
+                                  (> (or (plist-get data :pendingMessageCount) 0) 0)))
                          (pilish--schedule-prompt-start-fallback
                           chat-buf wait on-no-agent-start)
                        (pilish--finish-prompt-without-agent-start
@@ -3182,6 +3186,8 @@ ON-NO-AGENT-START runs only for accepted requests confirmed to have no turn."
                              (if pilish--aborted
                                  (pilish--clear-followup-queue)
                                (pilish--restore-followup-queue-to-input)))
+                           (when (equal (pilish--prompt-wait-disposition wait) "queued")
+                             (message "Pi: Prompt acknowledged as queued"))
                            (if (pilish--prompt-wait-started wait)
                                (progn
                                  (pilish--invalidate-prompt-start-wait)
@@ -3189,11 +3195,16 @@ ON-NO-AGENT-START runs only for accepted requests confirmed to have no turn."
                                    (when pilish--aborted (pilish--clear-followup-queue))
                                    (setq pilish--aborted nil))
                                  (pilish--process-followup-queue))
-                             ;; Handled describes this input, not independent
-                             ;; work.  A blocked finish keeps the guarded probe.
-                             (when (equal (pilish--prompt-wait-disposition wait) "handled")
-                               (pilish--finish-prompt-without-agent-start
-                                chat-buf wait on-no-agent-start))
+                             ;; Dispositions describe this input, not newer
+                             ;; work.  Queued is an acknowledgment, not a snapshot.
+                             (pcase (pilish--prompt-wait-disposition wait)
+                               ("handled"
+                                (pilish--finish-prompt-without-agent-start
+                                 chat-buf wait on-no-agent-start))
+                               ("queued"
+                                (when (and (eq pilish--status 'sending)
+                                           (not (pilish--prompt-wait-echoed wait)))
+                                  (pilish--set-activity-phase "queued"))))
                              (pilish--schedule-prompt-start-fallback
                               chat-buf wait on-no-agent-start)))))))
                (pilish--handle-prompt-send-failure

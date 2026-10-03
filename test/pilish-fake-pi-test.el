@@ -1349,6 +1349,91 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
       (with-current-buffer chat-buf
         (should (file-exists-p (plist-get pilish--state :session-file)))))))
 
+(ert-deftest pilish-fake-pi-test-dispositions-through-emacs-seam ()
+  "Real frontend input honors handled prompts and handled/queued steering."
+  (pilish-fake-pi-test-with-session
+      (session "input-dispositions" "--pre-start-delay-ms" "100")
+    (let ((chat (plist-get session :chat-buffer))
+          (input (plist-get session :input-buffer))
+          (proc (plist-get session :process)) notices)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) notices))))
+        (pilish-fake-pi-test--wait-or-fail
+         proc (lambda () (with-current-buffer chat (plist-get pilish--state :model)))
+         "initial model state")
+        (with-current-buffer input (insert "consume without a run") (pilish-send))
+        (pilish-fake-pi-test--wait-or-fail
+         proc (lambda () (with-current-buffer chat
+                           (and (eq pilish--status 'idle) (not pilish--prompt-wait))))
+         "handled prompt acceptance")
+        (with-current-buffer chat
+          (should (equal pilish--activity-phase "idle"))
+          (should-not pilish--local-user-message)
+          (should-not pilish--prompt-start-timer)
+          (should-not (string-match-p "consume without a run\\|^You · " (buffer-string))))
+        (with-current-buffer input (insert "initial turn") (pilish-send))
+        (pilish-fake-pi-test--wait-or-fail
+         proc (lambda () (with-current-buffer chat
+                           (and (eq pilish--status 'streaming)
+                                (string-match-p "^initial turn$" (buffer-string)))))
+         "ordinary prompt start and authoritative user echo")
+        (setq notices nil)
+        (with-current-buffer input
+          (insert "consume without a run")
+          (pilish-queue-steering)
+          (should (string-empty-p (buffer-string))))
+        (should-not notices)
+        (pilish-fake-pi-test--wait-or-fail
+         proc (lambda () (member "Pi: Steering handled by extension" notices))
+         "handled steering acknowledgment")
+        (with-current-buffer chat
+          (should (eq pilish--status 'streaming))
+          (should-not (string-match-p "consume without a run" (buffer-string)))
+          (should (= 1 (pilish-test--count-matches "^You · " (buffer-string)))))
+        (setq notices nil)
+        (with-current-buffer input
+          (insert "queued steering")
+          (pilish-queue-steering)
+          (should (string-empty-p (buffer-string)))
+          (should (= 4 (ring-length pilish--input-ring)))
+          (insert "newer draft"))
+        (should-not notices)
+        (pilish-fake-pi-test--wait-or-fail
+         proc (lambda () (member "Pi: Steering acknowledged as queued" notices))
+         "queued steering acknowledgment")
+        ;; The bounded fake does not publish steering queue snapshots.  Its
+        ;; acknowledgment must not manufacture an input-header queue count.
+        (should-not (pilish--process-queue-snapshot proc))
+        (with-current-buffer input
+          (should-not (string-match-p " queued [0-9]+" (pilish--header-line-string))))
+        (pilish-fake-pi-test--wait-or-fail
+         proc (lambda () (with-current-buffer chat
+                           (and (eq pilish--status 'idle)
+                                (not pilish--prompt-wait)
+                                (string-match-p "Steered fake reply for: queued steering"
+                                                (buffer-string)))))
+         "queued steering echo and settlement")
+        (with-current-buffer chat
+          (should (= 1 (pilish-test--count-matches "^initial turn$" (buffer-string))))
+          (should (= 1 (pilish-test--count-matches "^queued steering$" (buffer-string))))
+          (should (= 2 (pilish-test--count-matches "^You · " (buffer-string))))
+          (should-not pilish--followup-queue)
+          (should-not pilish--local-user-message))
+        (with-current-buffer input
+          (should (equal (buffer-string) "newer draft"))
+          (should (= 4 (ring-length pilish--input-ring))))
+        (should (= 1 (cl-count "Pi: Steering acknowledged as queued" notices :test #'equal)))
+        (let* ((response (pilish--rpc-sync proc '(:type "get_messages")
+                                           pilish-fake-pi-test--timeout))
+               (users (seq-filter (lambda (msg) (equal (plist-get msg :role) "user"))
+                                  (append (plist-get (plist-get response :data) :messages) nil))))
+          (should (eq (plist-get response :success) t))
+          (should (equal (mapcar (lambda (msg)
+                                  (plist-get (aref (plist-get msg :content) 0) :text))
+                                users)
+                         '("initial turn" "queued steering"))))))))
+
 (ert-deftest pilish-fake-pi-test-prompt-image-persists-canonical-content ()
   "A UI-attached PNG survives the fake prompt and canonical history contract."
   (let* ((dir (make-temp-file "pilish-fake-pi-image-" t))

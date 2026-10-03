@@ -1154,8 +1154,8 @@ For custom UI changes tied to activity, add functions to
 (CHAT-BUFFER INPUT-BUFFER OLD-PHASE NEW-PHASE REASON)
 #+end_src
 
-=NEW-PHASE= is one of =thinking=, =replying=, =running=, =compact=, or
-=idle=.  =REASON= explains why the phase was applied:
+=NEW-PHASE= is one of =thinking=, =replying=, =running=, =queued=,
+=compact=, or =idle=.  =REASON= explains why the phase was applied:
 
 | Reason         | Meaning                                       |
 |----------------+-----------------------------------------------|

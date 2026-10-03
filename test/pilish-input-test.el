@@ -1223,6 +1223,81 @@ When user aborts, they want to stop everything - including queued messages."
 
 ;;; Message Queuing
 
+(ert-deftest pilish-test-disposition-steer-feedback ()
+  "Steering feedback follows its correlated response, not local scheduling."
+  (dolist (case '((queued t (:disposition "queued") "Pi: Steering acknowledged as queued")
+                  (handled t (:disposition "handled") "Pi: Steering handled by extension")
+                  (missing-data t nil "Pi: Steering message sent")
+                  (failure :false nil "Pi: Steering failed: rejected")))
+    (ert-info ((format "steering response: %s" (car case)))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let (notices)
+          (cl-letf (((symbol-function 'message)
+                     (lambda (fmt &rest args)
+                       (push (apply #'format fmt args) notices))))
+            (pilish-test--stdout proc '(:type "agent_start"))
+            (with-current-buffer input
+              (insert "steer this run")
+              (pilish-queue-steering)
+              (should (string-empty-p (buffer-string)))
+              (should (= 1 (ring-length pilish--input-ring)))
+              (should (equal (ring-ref pilish--input-ring 0) "steer this run"))
+              (insert "newer draft"))
+            (should-not notices)
+            (should (= 1 (length commands)))
+            (let* ((request (car commands))
+                   (response (append
+                              (list :type "response" :command "steer"
+                                    :id (plist-get request :id) :success (nth 1 case))
+                              (when (nth 2 case) (list :data (nth 2 case)))
+                              (when (eq (car case) 'failure) '(:error "rejected")))))
+              (should (equal (plist-get request :type) "steer"))
+              (should (equal (plist-get request :message) "steer this run"))
+              (pilish-test--stdout proc response response))
+            (should (equal notices (list (nth 3 case))))
+            (with-current-buffer chat
+              (should (eq pilish--status 'streaming))
+              (should (equal pilish--activity-phase "thinking"))
+              (should-not pilish--followup-queue)
+              (should-not pilish--local-user-message)
+              (should-not (string-match-p "steer this run" (buffer-string))))
+            (with-current-buffer input
+              (should (equal (buffer-string) "newer draft"))
+              (should (= 1 (ring-length pilish--input-ring))))
+            (should-not (pilish--process-queue-snapshot proc))
+            (pilish-test--queued-header input 0)))))))
+
+(ert-deftest pilish-test-disposition-steer-replacement-suppresses-old-feedback ()
+  "An old process's correlated success or failure cannot report on its replacement."
+  (dolist (success '(t :false))
+    (pilish-test-with-rpc-session (chat input proc commands)
+      (let ((replacement (start-process "pilish-new-steer-owner" nil "cat")) notices)
+        (unwind-protect
+            (cl-letf (((symbol-function 'message)
+                       (lambda (fmt &rest args)
+                         (push (apply #'format fmt args) notices))))
+              (set-process-query-on-exit-flag replacement nil)
+              (pilish-test--stdout proc '(:type "agent_start"))
+              (with-current-buffer input (insert "old steering") (pilish-queue-steering))
+              (let ((request (car commands)))
+                (setq notices nil)
+                (with-current-buffer chat
+                  (pilish--set-process replacement)
+                  (pilish--push-followup "new successor"))
+                (with-current-buffer input (insert "newer draft"))
+                (pilish-test--stdout
+                 proc (list :type "response" :command "steer" :success success
+                            :id (plist-get request :id) :error "rejected"
+                            :data '(:disposition "queued")))
+                (should-not notices)
+                (with-current-buffer chat
+                  (should (eq (pilish--get-process) replacement))
+                  (should (eq pilish--status 'streaming))
+                  (should (equal pilish--followup-queue '("new successor"))))
+                (with-current-buffer input (should (equal (buffer-string) "newer draft")))
+                (pilish-test--queued-header input 1)))
+          (when (process-live-p replacement) (delete-process replacement)))))))
+
 (ert-deftest pilish-test-queue-steering-when-streaming-sends-steer ()
   "Queue steering sends steer RPC command when agent is streaming."
   (let ((chat-buf (get-buffer-create "*pilish-test-queue-steer*"))
@@ -1279,6 +1354,10 @@ When user aborts, they want to stop everything - including queued messages."
           (should (= 2 (length commands)))
           (should (equal (plist-get (car commands) :type) "steer"))
           (should (equal (plist-get (car commands) :message) "Steer the upcoming run"))
+          (should-not notice)
+          (pilish-test--stdout
+           proc (list :type "response" :command "steer" :success t
+                      :id (plist-get (car commands) :id)))
           (should (equal notice "Pi: Steering message sent")))))))
 
 (defun pilish-test--retry-steering-after-state-refresh (path)
@@ -1315,6 +1394,7 @@ When user aborts, they want to stop everything - including queued messages."
                                   :thinkingLevel "high"))))
             (should (equal (plist-get pilish--state :thinking-level) "high"))
             (should (eq pilish--status 'sending))
+            (setq notice nil)
             (with-current-buffer input
               (insert (if retrying "steer the retry" "after the run"))
               (pilish-queue-steering)
@@ -1323,6 +1403,10 @@ When user aborts, they want to stop everything - including queued messages."
                 (progn
                   (should (equal (plist-get (car commands) :type) "steer"))
                   (should (equal (plist-get (car commands) :message) "steer the retry"))
+                  (should-not notice)
+                  (pilish-test--stdout
+                   proc (list :type "response" :command "steer" :success t
+                              :id (plist-get (car commands) :id)))
                   (should (equal notice "Pi: Steering message sent"))
                   (should (= 2 (length commands)))
                   (should-not pilish--followup-queue))
@@ -1665,37 +1749,21 @@ When user aborts, they want to stop everything - including queued messages."
       (kill-buffer input-buf))))
 
 (ert-deftest pilish-test-steering-shows-minibuffer-message ()
-  "Steering shows feedback in minibuffer but is NOT displayed locally.
-Unlike normal sends, steering waits for pi's echo to display at the
-correct position in the conversation."
-  (let ((chat-buf (get-buffer-create "*pilish-test-queue-display*"))
-        (input-buf (get-buffer-create "*pilish-test-queue-display-input*"))
-        (message-shown nil))
-    (unwind-protect
-        (progn
-          (with-current-buffer chat-buf
-            (pilish-chat-mode)
-            (setq pilish--status 'streaming)
-            (setq pilish--input-buffer input-buf))
-          (with-current-buffer input-buf
-            (pilish-input-mode)
-            (setq pilish--chat-buffer chat-buf)
-            (insert "My steering message")
-            (cl-letf (((symbol-function 'pilish--get-process) (lambda () 'mock-proc))
-                      ((symbol-function 'process-live-p) (lambda (_) t))
-                      ((symbol-function 'pilish--rpc-async) #'ignore)
-                      ((symbol-function 'message)
-                       (lambda (fmt &rest _)
-                         (when (and fmt (string-match-p "steering\\|sent" (downcase fmt)))
-                           (setq message-shown t)))))
-              (pilish-queue-steering)))
-          ;; Should show minibuffer message
-          (should message-shown)
-          ;; Steering is NOT displayed locally - will be displayed when pi echoes it back
-          (with-current-buffer chat-buf
-            (should-not (string-match-p "My steering message" (buffer-string)))))
-      (kill-buffer chat-buf)
-      (kill-buffer input-buf))))
+  "A missing-data steering acknowledgment keeps feedback without local display."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (notice)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (setq notice (apply #'format fmt args)))))
+        (pilish-test--stdout proc '(:type "agent_start"))
+        (with-current-buffer input (insert "My steering message") (pilish-queue-steering))
+        (should-not notice)
+        (pilish-test--stdout
+         proc (list :type "response" :command "steer" :success t
+                    :id (plist-get (car commands) :id)))
+        (should (equal notice "Pi: Steering message sent"))
+        (with-current-buffer chat
+          (should-not (string-match-p "My steering message" (buffer-string))))))))
 
 (ert-deftest pilish-test-input-mode-has-queue-keybindings ()
   "Input mode has C-c C-s for steering (C-c C-c handles follow-up)."
@@ -3926,6 +3994,301 @@ Pi handles command expansion on the server side."
             (when (and replacement (process-live-p replacement))
               (delete-process replacement))))))))
 
+(ert-deftest pilish-test-disposition-queued-reentrant-success-keeps-newer-wait ()
+  "Queued acceptance cannot echo old text or change work started by its callback."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (newer-wait notices)
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) notices))))
+        (with-current-buffer chat
+          (pilish--send-prompt
+           "old request"
+           (lambda ()
+             (pilish--display-accepted-prompt "old request")
+             (pilish--send-prompt "new request")
+             (setq newer-wait pilish--prompt-wait
+                   pilish--aborted t pilish--followup-queue '("new successor"))
+             (with-current-buffer input (insert "newer draft"))))
+          (setf (pilish--prompt-wait-restore-followups pilish--prompt-wait) t))
+        (let* ((request (car commands))
+               (response (list :type "response" :command "prompt" :success t
+                               :id (plist-get request :id) :data '(:disposition "queued"))))
+          (pilish-test--stdout proc response response))
+        (with-current-buffer chat
+          (should (eq pilish--prompt-wait newer-wait))
+          (should (eq pilish--status 'sending))
+          (should (equal pilish--activity-phase "thinking"))
+          (should pilish--aborted)
+          (should (equal pilish--followup-queue '("new successor")))
+          (should-not pilish--prompt-start-timer)
+          (should-not pilish--local-user-message)
+          (should-not (string-match-p "old request" (buffer-string))))
+        (with-current-buffer input (should (equal (buffer-string) "newer draft")))
+        (should-not notices)
+        (should (equal (mapcar (lambda (c) (plist-get c :message)) (reverse commands))
+                       '("old request" "new request")))))))
+
+(ert-deftest pilish-test-disposition-queued-prompt-acknowledges-without-echo ()
+  "Queued acceptance drops the FIFO head, without guessing a turn or snapshot."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let ((schedule (symbol-function 'run-at-time)) fallbacks notices)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (seconds repeat function &rest args)
+                   (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                       (progn (push (cons function args) fallbacks)
+                              'fake-prompt-start-timer)
+                     (apply schedule seconds repeat function args))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args)
+                   (push (apply #'format fmt args) notices))))
+        (with-current-buffer chat
+          (pilish--push-followup "first")
+          (pilish--push-followup "second")
+          (pilish--process-followup-queue))
+        (let ((request (car commands))
+              (wait (buffer-local-value 'pilish--prompt-wait chat)))
+          (should (equal (plist-get request :message) "first"))
+          (with-current-buffer input (insert "newer draft"))
+          (pilish-test--stdout
+           proc (list :type "response" :command "prompt" :success t
+                      :id (plist-get request :id) :data '(:disposition "queued")))
+          (with-current-buffer chat
+            (should (equal pilish--followup-queue '("second")))
+            (should (equal (pilish--prompt-wait-disposition pilish--prompt-wait) "queued"))
+            (should (pilish--prompt-wait-accepted pilish--prompt-wait))
+            (should (equal pilish--activity-phase "queued"))
+            (should (eq pilish--status 'sending))
+            (should-not pilish--local-user-message)
+            (should-not pilish--local-user-message-region)
+            (should-not (string-match-p "first" (buffer-string))))
+          (should (equal notices '("Pi: Prompt acknowledged as queued")))
+          (should-not (pilish--process-queue-snapshot proc))
+          (pilish-test--queued-header input 1)
+          (should (= 1 (length fallbacks)))
+          (should (= 1 (length commands)))
+          (apply (caar fallbacks) (cdar fallbacks))
+          (let ((probe (car commands)))
+            (should (equal (plist-get probe :type) "get_state"))
+            (pilish-test--stdout
+             proc (list :type "response" :command "get_state" :success t
+                        :id (plist-get probe :id)
+                        :data '(:isStreaming :false :isCompacting :false
+                                :pendingMessageCount 1))))
+          (with-current-buffer chat
+            (should (eq pilish--prompt-wait wait))
+            (should (equal pilish--activity-phase "queued"))
+            (should (equal pilish--followup-queue '("second")))
+            (should-not (string-match-p "first" (buffer-string))))
+          (should (= 2 (length fallbacks)))
+          (pilish-test--stdout proc '(:type "agent_start"))
+          (pilish-test--stdout
+           proc '(:type "message_start" :message
+                   (:role "user" :timestamp 1704067200000
+                    :content [(:type "text" :text "first")])))
+          (with-current-buffer chat
+            (should-not pilish--prompt-wait)
+            (should-not pilish--prompt-start-timer)
+            (should (eq pilish--status 'streaming))
+            (should (equal pilish--activity-phase "thinking"))
+            (should (equal pilish--followup-queue '("second")))
+            (should (= 1 (pilish-test--count-matches "first" (buffer-string)))))
+          (with-current-buffer input (should (equal (buffer-string) "newer draft")))
+          (should (= 2 (length commands))))))))
+
+(ert-deftest pilish-test-disposition-queued-prompt-probe-preserves-pending-fifo ()
+  "Pending backend work blocks no-turn completion; gone work releases the FIFO."
+  (dolist (gone-state '((:isStreaming :false :isCompacting :false :pendingMessageCount 0)
+                        (:isStreaming :false :isCompacting :false)))
+    (ert-info ((format "queue removed, state=%S" gone-state))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let ((schedule (symbol-function 'run-at-time)) fallbacks notices)
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (seconds repeat function &rest args)
+                       (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                           (progn (push (cons function args) fallbacks)
+                                  'fake-prompt-start-timer)
+                         (apply schedule seconds repeat function args))))
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args)
+                       (push (apply #'format fmt args) notices))))
+            (with-current-buffer chat
+              (pilish--push-followup "first")
+              (pilish--push-followup "second")
+              (pilish--process-followup-queue))
+            (let ((request (car commands))
+                  (wait (buffer-local-value 'pilish--prompt-wait chat)))
+              (pilish-test--stdout
+               proc (list :type "response" :command "prompt" :success t
+                          :id (plist-get request :id) :data '(:disposition "queued")))
+              (with-current-buffer input (insert "newer draft"))
+              (apply (caar fallbacks) (cdar fallbacks))
+              (let ((probe (car commands)))
+                (should (equal (plist-get probe :type) "get_state"))
+                (pilish-test--stdout
+                 proc (list :type "response" :command "get_state" :success t
+                            :id (plist-get probe :id)
+                            :data '(:isStreaming :false :isCompacting :false
+                                    :pendingMessageCount 1))))
+              (with-current-buffer chat
+                (should (eq pilish--prompt-wait wait))
+                (should (eq pilish--status 'sending))
+                (should (equal pilish--activity-phase "queued"))
+                (should (equal pilish--followup-queue '("second")))
+                (should-not pilish--local-user-message)
+                (should-not (string-match-p "first" (buffer-string))))
+              (should (= 2 (length fallbacks)))
+              (should (= 2 (length commands)))
+              (pilish-test--queued-header input 1)
+              (should-not (pilish--process-queue-snapshot proc))
+              (apply (caar fallbacks) (cdar fallbacks))
+              (let ((probe (car commands)))
+                (should (equal (plist-get probe :type) "get_state"))
+                (pilish-test--stdout
+                 proc (list :type "response" :command "get_state" :success t
+                            :id (plist-get probe :id) :data gone-state)))
+              (with-current-buffer chat
+                (should-not (eq pilish--prompt-wait wait))
+                (should (eq pilish--status 'sending))
+                (should (equal pilish--followup-queue '("second")))
+                (should-not pilish--local-user-message)
+                (should-not (string-match-p "first\\|second" (buffer-string))))
+              (should (equal (mapcar (lambda (c) (plist-get c :message))
+                                     (seq-filter (lambda (c) (equal (plist-get c :type) "prompt"))
+                                                 (reverse commands)))
+                             '("first" "second")))
+              (should (equal notices '("Pi: Prompt acknowledged as queued")))
+              (with-current-buffer input
+                (should (equal (buffer-string) "newer draft"))))))))))
+
+(ert-deftest pilish-test-disposition-queued-prompt-preserves-observed-work ()
+  "A historical queued acknowledgment cannot regress observed run/echo activity."
+  (dolist (case '((streaming ((:type "agent_start")) streaming "thinking")
+                  (ended ((:type "agent_start") (:type "agent_end" :messages []))
+                         sending "thinking")
+                  (manual ((:type "agent_start") (:type "agent_end" :messages [])
+                           (:type "compaction_start" :reason "manual"))
+                          compacting "compact")
+                  (unstarted-manual ((:type "compaction_start" :reason "manual"))
+                                    compacting "compact")
+                  (retry ((:type "agent_start") (:type "agent_end" :messages [])
+                          (:type "auto_retry_start" :attempt 1 :maxAttempts 3
+                           :delayMs 1000 :errorMessage "overloaded"))
+                         sending "thinking")
+                  (settled ((:type "agent_start") (:type "agent_end" :messages [])
+                            (:type "agent_settled")) idle "idle")
+                  (echo-only nil sending "thinking")))
+    (ert-info ((format "before queued acknowledgment: %s" (car case)))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let ((schedule (symbol-function 'run-at-time)) fallbacks notices)
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (seconds repeat function &rest args)
+                       (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                           (progn (push (cons function args) fallbacks)
+                                  'fake-prompt-start-timer)
+                         (apply schedule seconds repeat function args))))
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args)
+                       (push (apply #'format fmt args) notices))))
+            (with-current-buffer input (insert "first") (pilish-send))
+            (let ((request (car commands)))
+              (dolist (event (nth 1 case)) (pilish-test--stdout proc event))
+              (when (memq (car case) '(settled echo-only))
+                (pilish-test--stdout
+                 proc '(:type "message_start" :message
+                         (:role "user" :timestamp 1704067200000
+                          :content [(:type "text" :text "first")]))))
+              (with-current-buffer input (insert "newer draft"))
+              (with-current-buffer chat
+                (unless (eq (car case) 'settled)
+                  (pilish--push-followup "second")
+                  (setq pilish--aborted t))
+                (setq notices nil)
+                (let ((before (buffer-string)))
+                  (pilish-test--stdout
+                   proc (list :type "response" :command "prompt" :success t
+                              :id (plist-get request :id) :data '(:disposition "queued")))
+                  (should (equal (buffer-string) before)))
+                (should (eq pilish--status (nth 2 case)))
+                (should (equal pilish--activity-phase (nth 3 case)))
+                (should (eq pilish--aborted (not (eq (car case) 'settled))))
+                (should (equal pilish--followup-queue
+                               (unless (eq (car case) 'settled) '("second"))))
+                (should-not pilish--local-user-message)
+                (if (memq (car case) '(echo-only unstarted-manual))
+                    (progn (should pilish--prompt-wait)
+                           (should (= 1 (length fallbacks))))
+                  (should-not pilish--prompt-wait)
+                  (should-not fallbacks)))
+              (should (equal notices '("Pi: Prompt acknowledged as queued")))
+              (should (= 1 (length commands)))
+              (should-not (pilish--process-queue-snapshot proc))
+              (with-current-buffer input (should (equal (buffer-string) "newer draft"))))))))))
+
+(ert-deftest pilish-test-disposition-queued-stop-keeps-empty-snapshot-and-local-queue ()
+  "Stop followed by queued prompt/steer acceptance cannot resurrect discarded work."
+  (dolist (command '(prompt steer))
+    (pilish-test-with-rpc-session (chat input proc commands)
+      (let ((schedule (symbol-function 'run-at-time)) fallbacks notices)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (seconds repeat function &rest args)
+                     (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                         (progn (push (cons function args) fallbacks)
+                                'fake-prompt-start-timer)
+                       (apply schedule seconds repeat function args))))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (push (apply #'format fmt args) notices))))
+          (if (eq command 'prompt)
+              (with-current-buffer chat
+                (pilish--push-followup "first")
+                (pilish--push-followup "second")
+                (pilish--process-followup-queue))
+            (pilish-test--stdout proc '(:type "agent_start"))
+            (with-current-buffer input (insert "first") (pilish-queue-steering))
+            (with-current-buffer chat (pilish--push-followup "second")))
+          (let ((request (car commands)))
+            (pilish-test--stdout
+             proc '(:type "queue_update" :steering ["first"] :followUp []))
+            (pilish-test--queued-header input (if (eq command 'prompt) 3 2))
+            (with-current-buffer input (insert "newer draft") (pilish-abort))
+            (pilish-test--stdout proc '(:type "queue_update" :steering [] :followUp []))
+            (pilish-test--queued-header input 0)
+            (setq notices nil)
+            (pilish-test--stdout
+             proc (list :type "response" :command (symbol-name command) :success t
+                        :id (plist-get request :id) :data '(:disposition "queued")))
+            (should (equal notices
+                           (list (if (eq command 'prompt)
+                                     "Pi: Prompt acknowledged as queued"
+                                   "Pi: Steering acknowledged as queued"))))
+            (pilish-test--queued-header input 0)
+            (should (equal (pilish--process-queue-snapshot proc)
+                           '(:type "queue_update" :steering [] :followUp [])))
+            (with-current-buffer chat
+              (should-not pilish--followup-queue)
+              (should-not pilish--local-user-message)
+              (should-not (string-match-p "first" (buffer-string)))
+              (should pilish--aborted))
+            (with-current-buffer input (should (equal (buffer-string) "newer draft")))
+            (should (equal (mapcar (lambda (c) (plist-get c :type)) (reverse commands))
+                           (list (symbol-name command) "clear_queue" "abort")))
+            (when (eq command 'prompt)
+              (apply (caar fallbacks) (cdar fallbacks))
+              (let ((probe (car commands)))
+                (should (equal (plist-get probe :type) "get_state"))
+                (pilish-test--stdout
+                 proc (list :type "response" :command "get_state" :success t
+                            :id (plist-get probe :id)
+                            :data '(:isStreaming :false :isCompacting :false
+                                    :pendingMessageCount 0))))
+              (with-current-buffer chat
+                (should (eq pilish--status 'idle))
+                (should-not pilish--aborted)
+                (should-not pilish--prompt-wait)
+                (should-not pilish--followup-queue))
+              (should (= 4 (length commands))))))))))
+
 (ert-deftest pilish-test-prompt-image-no-turn-success-retracts-local-echo ()
   "An extension-handled image prompt leaves no phantom user turn."
   (pilish-test-with-prompt-image-session (dir chat-buf input-buf)
@@ -5606,7 +5969,7 @@ no spurious faces are applied to plain colon-ending lines."
          (position (string-match " queued [0-9]+" header)))
     (if (zerop count)
         (progn
-          (should-not (string-match-p "queue" header))
+          (should-not position)
           nil)
       (should position)
       (should (equal (match-string 0 header) (format " queued %d" count)))
@@ -5654,7 +6017,7 @@ no spurious faces are applied to plain colon-ending lines."
                  (lambda (fmt &rest args)
                    (setq notice (apply #'format fmt args)))))
         (with-current-buffer input (insert "duplicate") (pilish-queue-steering)))
-      (should (string-match-p "[Ss]teering" notice)))
+      (should-not notice))
     (should (equal (plist-get (car commands) :type) "steer"))
     (let ((request (car commands)))
       (pilish-test--queued-header input 0)
@@ -5668,9 +6031,14 @@ no spurious faces are applied to plain colon-ending lines."
         (should (string-match-p "Steering.*2" help))
         (should (string-match-p "[-•] duplicate\n[-•] duplicate" help))
         (should-not (string-match-p "Follow-ups" help)))
-      (pilish-test--queued-header-wire
-       proc (list :type "response" :id (plist-get request :id)
-                  :command "steer" :success t))
+      (let (notice)
+        (cl-letf (((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (setq notice (apply #'format fmt args)))))
+          (pilish-test--queued-header-wire
+           proc (list :type "response" :id (plist-get request :id)
+                      :command "steer" :success t)))
+        (should (equal notice "Pi: Steering message sent")))
       (pilish-test--queued-header input 2))
     (pilish-test--queued-header-wire
      proc '(:type "queue_update" :steering ["replacement"] :followUp []))
