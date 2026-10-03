@@ -1672,6 +1672,40 @@ Pi v0.51.3+ renamed SlashCommandSource from \"template\" to \"prompt\"."
     (should (pilish-test--suffix-key-bound-p "A"))
     (should (pilish-test--suffix-key-bound-p "B"))))
 
+(ert-deftest pilish-test-builtin-command-run-key-without-edit-key ()
+  "Built-in extension commands get a run key but consume no edit suffix.
+The pathless built-in keeps its key slot, so a later file-backed command
+keeps its run/edit correspondence."
+  (let* ((pilish--commands
+          (list (pilish--normalize-command
+                 (list :name "mcp" :description "Model context"
+                       :source "extension"
+                       :sourceInfo '(:scope "temporary" :path "builtin:mcp"))
+                 "/tmp/project/")
+                (pilish--normalize-command
+                 (list :name "z-local" :description "Local extension"
+                       :source "extension"
+                       :sourceInfo '(:scope "project" :path "extension.ts"))
+                 "/tmp/project/")))
+         (opened nil))
+    (should (equal (mapcar #'car (seq-filter #'listp
+                                (pilish--make-submenu-children "extension")))
+                   '("a" "b")))
+    (should (equal (mapcar #'car
+                           (pilish--make-submenu-edit-children "extension"))
+                   '("B")))
+    (cl-letf (((symbol-function 'find-file-other-window)
+               (lambda (path) (push path opened))))
+      (unwind-protect
+          (progn
+            (transient-setup 'pilish-extensions-menu)
+            (should (pilish-test--suffix-key-bound-p "a"))
+            (should-not (pilish-test--suffix-key-bound-p "A"))
+            (should (pilish-test--suffix-key-bound-p "B"))
+            (should-not opened))
+        ;; Leave no transient keymaps or hooks behind for later tests.
+        (transient--emergency-exit)))))
+
 ;;; Manual Compaction
 
 (ert-deftest pilish-test-manual-compact-event-and-response-render-once ()
@@ -3665,6 +3699,53 @@ The tree is built iteratively to avoid recursion in test setup."
     (should (equal (plist-get norm :location) "project"))
     (should-not (plist-get norm :path))
     (should-not (plist-get norm :sourceInfo))))
+
+(ert-deftest pilish-test-normalize-command-builtin-paths ()
+  "Normalizer drops `builtin:' command identifiers instead of storing paths.
+The check precedes path expansion for both wire and lifted inputs, under
+local and remote anchors.  A real file whose name merely contains
+`builtin:' stays a usable path."
+  (let ((real (symbol-function 'pilish--passive-emacs-path)))
+    (dolist (anchor '("/tmp/project/" "/ssh:pi-host:/home/pi/project/"))
+      (cl-letf (((symbol-function 'pilish--passive-emacs-path)
+                 (lambda (path &optional path-anchor)
+                   (when (and (stringp path)
+                              (string-prefix-p "builtin:" path))
+                     (error "builtin: identifier reached path conversion: %S"
+                            path))
+                   (funcall real path path-anchor))))
+        (dolist (value '("builtin:mcp" "builtin:"))
+          ;; Wire input: raw sourceInfo with a temporary scope.
+          (let ((norm (pilish--normalize-command
+                       (list :name "mcp" :source "extension"
+                             :sourceInfo (list :scope "temporary"
+                                               :path value))
+                       anchor)))
+            (should (equal (plist-get norm :location) "path"))
+            (should (equal (plist-get norm :source) "extension"))
+            (should-not (plist-member norm :path))
+            (should-not (plist-member norm :sourceInfo)))
+          ;; Lifted input: path already at top level.
+          (let ((norm (pilish--normalize-command
+                       (list :name "mcp" :source "extension" :path value)
+                       anchor)))
+            (should-not (plist-member norm :location))
+            (should-not (plist-member norm :path))))))
+    ;; Non-string top-level paths are still not stored.
+    (let ((norm (pilish--normalize-command
+                 (list :name "odd" :source "prompt" :path 42)
+                 "/tmp/project/")))
+      (should-not (plist-member norm :path)))
+    ;; A real file whose name merely contains `builtin:' stays a usable
+    ;; path; only the prefix is reserved.
+    (let ((norm (pilish--normalize-command
+                 (list :name "notes" :source "prompt"
+                       :sourceInfo '(:scope "project"
+                                            :path "prompts/builtin:notes.md"))
+                 "/tmp/project/")))
+      (should (equal (plist-get norm :location) "project"))
+      (should (equal (plist-get norm :path)
+                     "/tmp/project/prompts/builtin:notes.md")))))
 
 (ert-deftest pilish-test-edit-command-source-opens-remote-emacs-path ()
   "Editing command sources opens the Emacs/TRAMP path for remote sessions."

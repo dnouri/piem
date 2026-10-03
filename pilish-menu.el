@@ -87,10 +87,12 @@ but %s is loaded.
   "Normalize a command plist from the RPC wire format.
 Lift `sourceInfo.scope' to `:location' and `sourceInfo.path' to
 `:path' when present, mapping Pi's temporary scope to the menu's path bucket,
-then drop the raw `:sourceInfo' key.  Path values from
-Pi are normalized to Emacs paths using ANCHOR or `default-directory'.  Unsafe
-passive backend path metadata is ignored rather than stored as navigable state.
-Returns CMD (modified in place)."
+then drop the raw `:sourceInfo' key.  Values starting with the reserved
+`builtin:' prefix name built-in commands rather than files, so such paths are
+dropped here, before any path expansion, leaving the command pathless.  Other
+path values from Pi are normalized to Emacs paths using ANCHOR or
+`default-directory'.  Unsafe passive backend path metadata is ignored rather
+than stored as navigable state.  Returns CMD (modified in place)."
   (when-let* ((info (plist-get cmd :sourceInfo)))
     (when-let* ((scope (plist-get info :scope)))
       (plist-put cmd :location
@@ -99,9 +101,11 @@ Returns CMD (modified in place)."
       (plist-put cmd :path path))
     (cl-remf cmd :sourceInfo))
   (when-let* ((path (plist-get cmd :path)))
-    (if-let* ((emacs-path (pilish--passive-emacs-path path anchor)))
-        (plist-put cmd :path emacs-path)
-      (cl-remf cmd :path)))
+    (if (and (stringp path) (string-prefix-p "builtin:" path))
+        (cl-remf cmd :path)
+      (if-let* ((emacs-path (pilish--passive-emacs-path path anchor)))
+          (plist-put cmd :path emacs-path)
+        (cl-remf cmd :path))))
   cmd)
 
 (defun pilish--fetch-commands (proc callback &optional anchor)
