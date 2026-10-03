@@ -145,11 +145,13 @@ under a =You= heading, and Pi's reply streams in under =Assistant=.
 The header line above the input tracks the model, activity phase,
 cost, and context usage while it works.
 
-One default worth knowing up front: Pi never shows its project trust
-prompt in RPC mode, so Pilish starts Pi with =--approve= and
-project-local =.pi= resources (skills, prompts, extensions) are active
-right away.  If you would rather rely on Pi's saved trust decisions,
-see =pilish-project-trust-policy= under Troubleshooting.
+Pilish approves projects by default.  Pi does not show its project
+trust prompt in RPC mode, so Pilish starts Pi with =--approve= and
+project-local =.pi= resources are active right away.  A trusted
+project's =.pi/mcp.json= can start configured server programs in the
+background with Pi's permissions.  If you would rather rely on Pi's
+saved trust decisions, see =pilish-project-trust-policy= under
+Troubleshooting.
 
 If no models are available or Emacs cannot find the =pi= executable,
 the Troubleshooting section below has the fixes.
@@ -657,10 +659,8 @@ If you configure Node from init.el, update both:
 #+html: <details>
 #+html: <summary><strong>Project-local <code>.pi</code> resources are not active</strong></summary>
 
-Pi does not show its project trust prompt in RPC mode.  To make Emacs
-sessions behave like the usual trusted project workflow,
-Pilish passes =--approve= by default so project-local
-=.pi= prompts, skills, settings, themes, and extensions are active.
+Use =pilish-project-trust-policy= to change how Pilish handles
+project-local =.pi= files.
 
 Set =pilish-project-trust-policy= to =default= to pass no
 trust flag and let Pi use its saved trust decisions and
@@ -899,6 +899,9 @@ Less common tuning knobs:
 ;; (setopt pilish-tree-browser-default-filter 'default)
 #+end_src
 
+In =pilish-extra-args=, =--provider= requires =--model=; Pi exits with
+an error if the model option is missing.
+
 You can also inspect the whole customization group with:
 
 #+begin_src
@@ -1112,6 +1115,28 @@ component-based views are unavailable or fall back.  Hover extension
 status text in the header line to see the exact =statusKey=, which you
 can use to change the font for that extension's status text using
 =pilish-extension-status-faces=.
+
+** MCP servers
+
+In Emacs, bare =/mcp= shows server status in the echo area.
+=/mcp login [server]=, =/mcp logout [server]=, and
+=/mcp reconnect [server]= work through Pi's dialogs and notifications;
+=C-g= cancels a dialog.  Configure servers with =pi mcp add=,
+=pi mcp remove=, and =pi mcp list=; shell =pi mcp login= and
+=pi mcp logout= also work without a session.
+
+The rich server manager, tool browsing, exposure changes, and
+enable/disable controls require Pi's terminal UI.  An Emacs server
+manager is deferred; see [[https://github.com/dnouri/pilish/issues/346][issue #346]].  =pi config= controls which
+built-in extensions load.  Provider =/login=, including Radius setup,
+still requires the terminal.
+
+Pi connects enabled MCP servers in the background.  The first prompt
+may wait up to ten seconds by default for servers with direct tools.
+Other prompt hooks can take longer; Pilish's waiting label is not an
+observed MCP connection state.  Check notifications in =*Messages*=
+and =~/.pi/agent/mcp.log= for connection problems.  See
+[[https://pi.dev/docs/latest/mcp][Pi's MCP documentation]] for configuration details.
 
 ** Tree-sitter grammar management
 
