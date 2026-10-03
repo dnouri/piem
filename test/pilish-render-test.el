@@ -3962,7 +3962,7 @@ See https://github.com/dnouri/pilish/issues/176."
                    (condition-case nil
                        (progn
                          (pilish--complete-extension-ui-dialog
-                          (pilish-test--extension-dialog-request "input") proc
+                          (pilish-test--extension-dialog-request "input" "input-cancel") proc
                           (lambda ()
                             (if (eq exit 'throw)
                                 (throw 'w1-dialog-unwind :thrown)
@@ -3973,7 +3973,7 @@ See https://github.com/dnouri/pilish/issues/176."
             (should (equal sent
                            (when proc
                              '((t (:type "extension_ui_response"
-                                   :id "input" :cancelled t))))))))))))
+                                   :id "input-cancel" :cancelled t))))))))))))
 
 (ert-deftest pilish-test-extension-ui-w1-completion-send-failures ()
   "Neither a failed success send nor a failed cancel send gets retried."
@@ -4002,6 +4002,160 @@ See https://github.com/dnouri/pilish/issues/176."
                      ((error quit) :escaped)))))
             (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
             (should (equal sent (list expected)))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-exits ()
+  "All three supported methods cancel on any nonlocal reader exit."
+  (dolist (method '("confirm" "select" "input"))
+    (dolist (proc '(t nil))
+      (dolist (exit '(error quit throw))
+        (with-temp-buffer
+          (pilish-chat-mode)
+          (let* ((pilish--process proc) (reads 0) sent
+                 (reader (lambda (&rest _)
+                           (cl-incf reads)
+                           (if (eq exit 'throw)
+                               (throw 'w1-dialog-unwind :thrown)
+                             (signal exit nil)))))
+            (cl-letf (((symbol-function 'yes-or-no-p) reader)
+                      ((symbol-function 'completing-read) reader)
+                      ((symbol-function 'read-string) reader)
+                      ((symbol-function 'pilish--send-extension-ui-response)
+                       (lambda (process response) (push (list process response) sent))))
+              (let ((outcome
+                     (catch 'w1-dialog-unwind
+                       (condition-case nil
+                           (progn
+                             (pilish--handle-extension-ui-request
+                              (pilish-test--extension-dialog-request method))
+                             :returned)
+                         ((error quit) :escaped)))))
+                (should (eq outcome (if (eq exit 'throw) :thrown :returned)))
+                (should (= reads 1))
+                (should (equal sent
+                               (when proc
+                                 (list (list proc (list :type "extension_ui_response"
+                                                       :id method :cancelled t))))))))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-success ()
+  "Declining confirmation and empty values are successes, not cancellations."
+  (dolist (case '(("confirm" t :confirmed t)
+                  ("confirm" nil :confirmed :json-false)
+                  ("select" "Option A" :value "Option A")
+                  ("select" "" :value "")
+                  ("input" "text" :value "text")
+                  ("input" "" :value "")))
+    (pcase-let ((`(,method ,answer ,key ,expected) case))
+      (dolist (proc '(t nil))
+        (with-temp-buffer
+          (pilish-chat-mode)
+          (let* ((pilish--process proc) (reads 0) sent
+                 (reader (lambda (&rest _) (cl-incf reads) answer)))
+            (cl-letf (((symbol-function 'yes-or-no-p) reader)
+                      ((symbol-function 'completing-read) reader)
+                      ((symbol-function 'read-string) reader)
+                      ((symbol-function 'pilish--send-extension-ui-response)
+                       (lambda (_process response) (push response sent))))
+              (pilish--handle-extension-ui-request
+               (pilish-test--extension-dialog-request method)))
+            (should (= reads 1))
+            (should (equal sent
+                           (when proc
+                             (list (list :type "extension_ui_response"
+                                         :id method key expected)))))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-preparation ()
+  "Prompt preparation and minibuffer setup are inside the completion guard."
+  (dolist (method '("confirm" "select"))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((pilish--process t) (minibuffer-setup-hook nil)
+            (event (pilish-test--extension-dialog-request method)) read-called sent)
+        ;; A valid id with a malformed title fails before the confirm reader.
+        (when (equal method "confirm") (setq event (plist-put event :title 42)))
+        (cl-letf (((symbol-function 'yes-or-no-p)
+                   (lambda (&rest _) (setq read-called t) t))
+                  ((symbol-function 'pilish--extension-ui-select-minibuffer-setup)
+                   (lambda () (signal 'quit nil)))
+                  ((symbol-function 'completing-read)
+                   (lambda (&rest _)
+                     (setq read-called t)
+                     (run-hooks 'minibuffer-setup-hook)
+                     "Option A"))
+                  ((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (_process response) (push response sent))))
+          (should (eq :returned
+                      (condition-case nil
+                          (progn (pilish--handle-extension-ui-request event) :returned)
+                        ((error quit) :escaped)))))
+        (should (eq read-called (equal method "select")))
+        (should (equal sent (list (list :type "extension_ui_response"
+                                       :id method :cancelled t))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-handlers-reentrant ()
+  "An inner dialog's success cannot suppress the outer dialog's cancellation."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish--process 'outer-proc) sent)
+      (cl-letf (((symbol-function 'yes-or-no-p)
+                 (lambda (&rest _)
+                   (let ((pilish--process 'inner-proc))
+                     (pilish--handle-extension-ui-request
+                      (pilish-test--extension-dialog-request "input" "inner")))
+                   (signal 'quit nil)))
+                ((symbol-function 'read-string) (lambda (&rest _) ""))
+                ((symbol-function 'pilish--send-extension-ui-response)
+                 (lambda (process response) (push (list process response) sent))))
+        (should (eq :returned
+                    (condition-case nil
+                        (progn
+                          (pilish--handle-extension-ui-request
+                           (pilish-test--extension-dialog-request "confirm" "outer"))
+                          :returned)
+                      ((error quit) :escaped)))))
+      (should (equal (reverse sent)
+                     '((inner-proc (:type "extension_ui_response" :id "inner" :value ""))
+                       (outer-proc (:type "extension_ui_response" :id "outer" :cancelled t))))))))
+
+(ert-deftest pilish-test-extension-ui-w1-filter-batch ()
+  "One filter call survives reader and cancellation-send error/quit."
+  (dolist (case '((quit nil) (error nil) (quit error) (quit quit)))
+    (pcase-let ((`(,reader-exit ,send-exit) case))
+      (pilish-test-with-rpc-session (chat _input proc commands)
+        (let* ((sender (symbol-function 'pilish--send-string)) tail-response
+               (reader (lambda (&rest _) (signal reader-exit nil))))
+          (puthash "tail" (lambda (response) (setq tail-response response))
+                   (pilish--get-pending-requests proc))
+          (cl-letf (((symbol-function 'yes-or-no-p) reader)
+                    ((symbol-function 'completing-read) reader)
+                    ((symbol-function 'read-string) reader)
+                    ((symbol-function 'message) #'ignore)
+                    ((symbol-function 'pilish--send-string)
+                     (lambda (process line)
+                       (funcall sender process line)
+                       (when send-exit (signal send-exit nil)))))
+            (should (eq :returned
+                        (condition-case nil
+                            (progn
+                              (apply #'pilish-test--stdout proc
+                                     (append
+                                      (mapcar #'pilish-test--extension-dialog-request
+                                              '("confirm" "select" "input"))
+                                      '((:type "extension_ui_request" :method "setStatus"
+                                         :statusKey "w1" :statusText "ready")
+                                        (:type "response" :id "tail"
+                                         :command "get_state" :success t))))
+                              :returned)
+                          ((error quit) :escaped)))))
+          ;; Compare all parsed outbound messages, not just the last send.
+          (should (equal (reverse commands)
+                         (mapcar (lambda (id)
+                                   (list :type "extension_ui_response" :id id :cancelled t))
+                                 '("confirm" "select" "input"))))
+          (should (eq (plist-get tail-response :success) t))
+          (should (= 0 (hash-table-count (pilish--get-pending-requests proc))))
+          (should (equal (buffer-local-value 'pilish--extension-status chat)
+                         '(("w1" . "ready"))))
+          (should (process-live-p proc)))))))
 
 ;;; Pretty-Print JSON Helper
 

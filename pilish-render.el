@@ -1192,17 +1192,16 @@ Include optional STDERR in a text fence and optional DETAIL before it."
              msg)))
 
 (defun pilish--complete-extension-ui-dialog (event proc read-response)
-  "Answer supported-dialog EVENT with exactly one response on PROC.
+  "Attempt one response to supported-dialog EVENT on PROC.
 Call READ-RESPONSE with no arguments to obtain the complete
 success response plist; call it even when PROC is nil, so readers
-work without a process.  A response counts as attempted once
-sending begins: the flag is set before the send, so a response
-that fails midway counts as delivered and is neither retried nor
-replaced by a cancellation.  Any exit before the first attempt --
-reader error, user quit, or a throw -- cancels the dialog by
-sending a `:cancelled' response instead.  `error' and `quit',
-including from cancellation itself, return nil; any other
-nonlocal exit propagates after cancelling."
+work without a process.  Mark the attempt before sending: a failed
+send is neither retried nor replaced by cancellation, and delivery
+is not guaranteed.  Any exit before the first attempt -- reader
+error, user quit, or a throw -- tries a `:cancelled' response when
+PROC is non-nil.  `error' and `quit', including from cancellation
+itself, return nil.  Other nonlocal exits propagate when cleanup
+completes normally."
   (let ((response-attempted nil))
     (condition-case nil
         (unwind-protect
@@ -1222,18 +1221,19 @@ nonlocal exit propagates after cancelling."
 
 (defun pilish--extension-ui-confirm (event proc)
   "Handle confirm method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (msg (plist-get event :message))
-         ;; Don't add colon if title already ends with one
-         (separator (if (string-suffix-p ":" title) " " ": "))
-         (prompt (format "%s%s%s " title separator msg))
-         (confirmed (yes-or-no-p prompt)))
-    (when proc
-      (pilish--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :confirmed (if confirmed t :json-false))))))
+  (pilish--complete-extension-ui-dialog
+   event proc
+   (lambda ()
+     (let* ((id (plist-get event :id))
+            (title (plist-get event :title))
+            (msg (plist-get event :message))
+            ;; Don't add colon if title already ends with one
+            (separator (if (string-suffix-p ":" title) " " ": "))
+            (prompt (format "%s%s%s " title separator msg))
+            (confirmed (yes-or-no-p prompt)))
+       (list :type "extension_ui_response"
+             :id id
+             :confirmed (if confirmed t :json-false))))))
 
 (defun pilish--extension-ui-select-minibuffer-setup ()
   "Set up the minibuffer for an extension UI selection."
@@ -1260,32 +1260,34 @@ nonlocal exit propagates after cancelling."
 
 (defun pilish--extension-ui-select (event proc)
   "Handle select method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (options (append (plist-get event :options) nil))
-         (completion-extra-properties
-          (cons :eager-display (cons t completion-extra-properties)))
-         (selected
-          (minibuffer-with-setup-hook
-              (:append #'pilish--extension-ui-select-minibuffer-setup)
-            (completing-read (concat title " ") options nil t))))
-    (when proc
-      (pilish--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :value selected)))))
+  (pilish--complete-extension-ui-dialog
+   event proc
+   (lambda ()
+     (let* ((id (plist-get event :id))
+            (title (plist-get event :title))
+            (options (append (plist-get event :options) nil))
+            (completion-extra-properties
+             (cons :eager-display (cons t completion-extra-properties)))
+            (selected
+             (minibuffer-with-setup-hook
+                 (:append #'pilish--extension-ui-select-minibuffer-setup)
+               (completing-read (concat title " ") options nil t))))
+       (list :type "extension_ui_response"
+             :id id
+             :value selected)))))
 
 (defun pilish--extension-ui-input (event proc)
   "Handle input method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (placeholder (plist-get event :placeholder))
-         (value (read-string (concat title " ") placeholder)))
-    (when proc
-      (pilish--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :value value)))))
+  (pilish--complete-extension-ui-dialog
+   event proc
+   (lambda ()
+     (let* ((id (plist-get event :id))
+            (title (plist-get event :title))
+            (placeholder (plist-get event :placeholder))
+            (value (read-string (concat title " ") placeholder)))
+       (list :type "extension_ui_response"
+             :id id
+             :value value)))))
 
 (defun pilish--extension-ui-set-editor-text (event)
   "Handle set_editor_text method from EVENT."
