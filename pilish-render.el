@@ -3963,10 +3963,8 @@ Each element is a plist `(:content-index N :tool-call TOOL-CALL)'."
     (nreverse tool-calls)))
 
 (defun pilish--clear-toolcall-preview-body (block)
-  "Clear stale streamed body state from ordinary tool preview BLOCK."
-  ;; Compound redraw owns its body replacement, including view capture.
-  (unless (or (pilish--tool-block-compound-p block)
-              (pilish--tool-block-execution-backed-p block))
+  "Clear stale streamed body state from unexecuted tool preview BLOCK."
+  (unless (pilish--tool-block-execution-backed-p block)
     (pilish--tool-block-set-last-tail block nil)
     (pilish--tool-block-replace-body block "" nil nil)))
 
@@ -3979,6 +3977,7 @@ nil, reuse a keyed block or create one."
          (tool-name (plist-get tool-call :name))
          (args (plist-get tool-call :arguments))
          (streaming-p (member event-type '("toolcall_start" "toolcall_delta")))
+         (compound-redraw-p (and (equal tool-name "codemode") (not streaming-p)))
          (preview-state (and streaming-p 'streaming))
          (existing-block (or block
                              (pilish--tool-block-get tool-call-id)
@@ -3988,6 +3987,14 @@ nil, reuse a keyed block or create one."
                      tool-name args tool-call-id content-index preview-state
                      'defer))))
     (unless (pilish--tool-block-execution-backed-p block)
+      (when (and (pilish--tool-block-compound-p block) (not compound-redraw-p))
+        ;; Ordinary authority supersedes generation-only compound state,
+        ;; not observed execution facts or retained descendant obligations.
+        (setf (pilish--tool-block-compound-p block) nil
+              (pilish--tool-block-args block) nil
+              (pilish--tool-block-folds block) nil)
+        (pilish--tool-block-set-last-tail block nil)
+        (remhash (pilish--tool-block-tool-call-id block) pilish--nested-tool-owners))
       (setq pilish--pending-tool-overlay
             (pilish--tool-block-overlay block))
       (overlay-put (pilish--tool-block-overlay block)
@@ -4006,7 +4013,9 @@ nil, reuse a keyed block or create one."
                 (pilish--tool-path-string
                  (pilish--tool-arg-path args)))
                block)
-            (pilish--clear-toolcall-preview-body block)))
+            ;; Capture established compound sections before replacing them.
+            (unless compound-redraw-p
+              (pilish--clear-toolcall-preview-body block))))
          ((and (equal tool-name "write")
                (pilish--tool-arg-member args :content))
           (if (stringp content)
@@ -4018,7 +4027,7 @@ nil, reuse a keyed block or create one."
                  (pilish--tool-arg-path args)))
                block)
             (pilish--clear-toolcall-preview-body block))))))
-    (when (and (equal tool-name "codemode") (not streaming-p))
+    (when compound-redraw-p
       (pilish--enable-compound-tool block args)
       (pilish--display-tool-update-header tool-name args block)
       (pilish--redraw-compound-tool block))

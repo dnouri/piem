@@ -1187,6 +1187,38 @@ execution cannot retain a temporary record on this setup's evaluator stack."
         (should-not (pilish-test--all-tool-overlays))
         (should-not (pilish--nested-tool-owner "p"))))))
 
+(ert-deftest pilish-test-codemode-final-preview-replaced-by-ordinary-tool ()
+  "Final ordinary-tool authority removes the superseded codemode preview."
+  ;; Deferring a clear based on the old presentation, rather than the next
+  ;; body's renderer, leaves obsolete JavaScript beneath the new header.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_start" :contentIndex 0 :id "p" :toolName "codemode"))
+    (pilish--handle-toolcall-message-event
+     '(:type "toolcall_end" :contentIndex 0
+       :toolCall (:type "toolCall" :id "p" :name "codemode"
+                  :arguments (:code "STALE-SCRIPT"))))
+    (let ((block (pilish--tool-block-get "p")))
+      (should (string-match-p "STALE-SCRIPT" (buffer-string)))
+      (should-not (pilish--tool-block-execution-backed-p block))
+      (pilish--reconcile-toolcall-previews
+       '(:role "assistant"
+         :content [(:type "toolCall" :id "p" :name "bash"
+                    :arguments (:command "echo final"))]))
+      (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                     "$ echo final\n"))
+      (should-not (string-match-p "STALE-SCRIPT" (buffer-string)))
+      (should (eq block (pilish--tool-block-get "p")))
+      (should (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
+                     "bash"))
+      (should-not (pilish--tool-block-compound-p block))
+      (should-not (pilish--tool-block-args block))
+      (should-not (pilish--nested-tool-owner "p"))
+      (should-not (pilish--tool-block-execution-backed-p block))
+      (pilish--reconcile-toolcall-previews '(:role "assistant" :content []))
+      (should-not (pilish-test--all-tool-overlays)))))
+
 (ert-deftest pilish-test-codemode-details-only-preserves-script-and-output ()
   "Metadata snapshots enrich one list without replacing script or parent text."
   ;; Empty publication content must not erase previously received output;
