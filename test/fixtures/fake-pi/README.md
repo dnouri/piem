@@ -122,6 +122,31 @@ Example:
 }
 ```
 
+## Assistant and command metadata
+
+Generated assistant messages include the current session `thinkingLevel`
+(default `"off"`), including tool-call and aborted messages. Their authoritative
+live payloads, `get_messages`, and disk entries retain the field unchanged.
+It is optional in upstream assistant messages: switching to an older disk
+session without it remains supported and does not add the field.
+
 Commands exposed by `get_commands` live in the top-level `commands` array and
-use the real RPC response shape (`name`, `source`, optional `description`,
-`path`, `location`).
+use `name`, `source`, optional `description`, and optional `sourceInfo`. The
+fake returns the supplied `sourceInfo` object literally, without expanding
+paths or dropping extra fields. The `input-dispositions.json` fixture includes:
+
+```json
+{
+  "name": "mcp",
+  "source": "extension",
+  "sourceInfo": {
+    "path": "builtin:mcp",
+    "source": "builtin",
+    "scope": "temporary",
+    "origin": "top-level"
+  }
+}
+```
+
+`builtin:mcp` names no file. This entry is discovery metadata only, not an
+implemented fake MCP command or runtime.

@@ -63,24 +63,15 @@ class SlashCommand:
     name: str
     source: Literal["extension", "prompt", "skill"]
     description: str | None = None
-    path: str | None = None
-    location: str | None = None
+    source_info: JsonDict | None = None
 
     def to_rpc(self) -> JsonDict:
-        """Return this command in RPC response shape.
-
-        Emits ``sourceInfo`` with ``scope`` and ``path`` sub-fields.
-        """
+        """Return this command with its literal discovery metadata."""
         data: JsonDict = {"name": self.name, "source": self.source}
         if self.description is not None:
             data["description"] = self.description
-        if self.path is not None or self.location is not None:
-            source_info: JsonDict = {}
-            if self.location is not None:
-                source_info["scope"] = self.location
-            if self.path is not None:
-                source_info["path"] = self.path
-            data["sourceInfo"] = source_info
+        if self.source_info is not None:
+            data["sourceInfo"] = self.source_info
         return data
 
 
@@ -239,14 +230,12 @@ def load_scenario(path: Path, name: str) -> Scenario:
     data = json.loads(path.read_text(encoding="utf-8"))
     commands = []
     for item in data.get("commands", []):
-        si = item.get("sourceInfo", {})
         commands.append(
             SlashCommand(
                 name=item["name"],
                 source=item["source"],
                 description=item.get("description"),
-                path=si.get("path"),
-                location=si.get("scope"),
+                source_info=item.get("sourceInfo"),
             )
         )
     prompt_data = data["prompt"]
@@ -831,6 +820,7 @@ class FakePiHarness:
             "api": self.state.model["api"],
             "provider": self.state.model["provider"],
             "model": self.state.model["id"],
+            "thinkingLevel": self.state.thinking_level,
             "usage": self._zero_usage(),
             "timestamp": now_ms(),
             "stopReason": "toolUse",
@@ -1157,6 +1147,7 @@ class FakePiHarness:
             "api": self.state.model["api"],
             "provider": self.state.model["provider"],
             "model": self.state.model["id"],
+            "thinkingLevel": self.state.thinking_level,
             "usage": self._zero_usage(),
             "timestamp": now_ms(),
             "stopReason": "stop",
@@ -1170,6 +1161,7 @@ class FakePiHarness:
             "api": self.state.model["api"],
             "provider": self.state.model["provider"],
             "model": self.state.model["id"],
+            "thinkingLevel": self.state.thinking_level,
             "usage": self._zero_usage(),
             "timestamp": now_ms(),
             "stopReason": "aborted",

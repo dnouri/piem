@@ -170,9 +170,14 @@ Required shape:
   - `name`
   - `source`
 
-`description` may be omitted unless a test needs it.  Command
-metadata uses `sourceInfo` with `scope` and `path` sub-fields.
-The Emacs normalizer lifts these to top-level `:location` and `:path`.
+`description` and `sourceInfo` may be omitted in scenario data. Supplied
+`sourceInfo` is returned unchanged, including `path`, `source`, `scope`,
+`origin`, and any extra fields. Synthetic paths such as `builtin:mcp` name no
+file and are not expanded. Command `source` describes the command kind, not
+its resource source: the `input-dispositions` fixture advertises `mcp` with
+command source `extension` and resource source `builtin`, scope `temporary`,
+and origin `top-level`. This is discovery metadata only; the fake does not
+implement an MCP command or runtime.
 
 ### `prompt` happy path
 
@@ -204,6 +209,15 @@ text-only and image-bearing `steer` commands fail.  `tool_stream` preserves
 prompt images on its ordinary user message.  The extension-owned
 `extension_dialog` and `custom_message` prompt behaviors reject nonempty image
 arrays before reporting prompt success.  No new scenario type is implied.
+
+### Assistant thinking metadata
+
+Generated text, tool-call, final, and aborted assistant messages include the
+current session `thinkingLevel` (default `"off"`). The authoritative
+`message_end` and `agent_end` payloads, `get_messages`, and persisted message
+entries retain the same field. Upstream makes this field optional for legacy
+or unmanaged responses: switched disk messages without it remain valid and
+keep its absence, rather than inheriting the current session level.
 
 ### Input dispositions and bounded steering
 

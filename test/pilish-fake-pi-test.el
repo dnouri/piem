@@ -232,6 +232,24 @@ SPEC is (PROC SCENARIO &rest EXTRA-ARGS)."
   (equal (pilish-fake-pi-test--canonical-json a)
          (pilish-fake-pi-test--canonical-json b)))
 
+(defun pilish-fake-pi-test--assert-assistant-roundtrip (proc assistants)
+  "Assert live ASSISTANTS match PROC's inspected and persisted payloads."
+  (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_messages")))
+         (state (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+         (records (pilish-fake-pi-test--read-jsonl-file
+                   (plist-get (plist-get state :data) :sessionFile))))
+    (should (eq (plist-get response :success) t))
+    (should (eq (plist-get state :success) t))
+    (dolist (messages (list (plist-get (plist-get response :data) :messages)
+                           (seq-map (lambda (record) (plist-get record :message))
+                                    records)))
+      (should
+       (pilish-fake-pi-test--json-equal-p
+        (vconcat (seq-filter (lambda (message)
+                              (equal (plist-get message :role) "assistant"))
+                            messages))
+        (vconcat assistants))))))
+
 (defun pilish-fake-pi-test--iso-timestamp-p (value)
   "Return non-nil when VALUE is a strict UTC ISO timestamp."
   (and (stringp value)
@@ -646,6 +664,42 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
       (should (equal (plist-get first :name) "test-confirm"))
       (should (equal (plist-get first :source) "extension")))))
 
+(ert-deftest pilish-fake-pi-test-1-0-command-and-thinking-metadata ()
+  "Discovery preserves builtin sourceInfo; assistant thinking survives all views."
+  (pilish-fake-pi-test-with-process (proc "input-dispositions")
+    (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_commands")))
+           (mcp (seq-find
+                 (lambda (command) (equal (plist-get command :name) "mcp"))
+                 (plist-get (plist-get response :data) :commands)))
+           (source-info (plist-get mcp :sourceInfo)))
+      (should (eq (plist-get response :success) t))
+      (should (equal (plist-get mcp :source) "extension"))
+      (should (equal (plist-get source-info :path) "builtin:mcp"))
+      (should (equal (plist-get source-info :origin) "top-level"))
+      (should (equal (plist-get source-info :source) "builtin"))
+      (should (equal (plist-get source-info :scope) "temporary")))
+    (should (eq (plist-get (pilish-fake-pi-test--rpc
+                           proc '(:type "set_thinking_level" :level "high"))
+                          :success)
+                t))
+    (should (eq (plist-get (pilish-fake-pi-test--rpc
+                           proc '(:type "prompt" :message "thinking metadata"))
+                          :success)
+                t))
+    (let* ((events (pilish-fake-pi-test--collect-until
+                    proc (lambda (object)
+                           (equal (plist-get object :type) "agent_settled"))))
+           (ends (pilish-fake-pi-test--message-events
+                  events "message_end" "assistant"))
+           (assistant (plist-get (car ends) :message))
+           (agent-end (car (pilish-fake-pi-test--events-of-type
+                            events "agent_end"))))
+      (should (= (length ends) 1))
+      (should (equal (plist-get assistant :stopReason) "stop"))
+      (should (equal (plist-get assistant :thinkingLevel) "high"))
+      (should (equal (plist-get agent-end :messages) (vector assistant)))
+      (pilish-fake-pi-test--assert-assistant-roundtrip proc (list assistant)))))
+
 (ert-deftest pilish-fake-pi-test-set-model-and-thinking-level-update-state ()
   "set_model and set_thinking_level change subsequent get_state responses."
   (pilish-fake-pi-test-with-process (proc "prompt-lifecycle")
@@ -741,6 +795,10 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                (active-id (plist-get fixture :active-user-id))
                (leaf-id (plist-get fixture :post-assistant-id)))
           (pilish-fake-pi-test-with-process (proc "prompt-lifecycle")
+            (should (eq (plist-get (pilish-fake-pi-test--rpc
+                                   proc '(:type "set_thinking_level" :level "high"))
+                                  :success)
+                        t))
             (let ((switch-response
                    (pilish-fake-pi-test--rpc
                     proc (list :id "branched-switch"
@@ -877,6 +935,8 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
               (should
                (pilish-fake-pi-test--json-equal-p
                 messages (plist-get fixture :expected-messages)))
+              ;; Older disk assistants do not inherit the current level.
+              (should-not (plist-member (aref messages 4) :thinkingLevel))
               (let ((printed (prin1-to-string messages)))
                 (should-not (string-match-p "ABANDONED USER CONTENT" printed))
                 (should-not
@@ -1539,6 +1599,10 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
 (ert-deftest pilish-fake-pi-test-tool-stream-emits-tool-events ()
   "tool_stream emits an ordered, correlated, delta-only RPC lifecycle."
   (pilish-fake-pi-test-with-process (proc "tool-read")
+    (should (eq (plist-get (pilish-fake-pi-test--rpc
+                           proc '(:type "set_thinking_level" :level "low"))
+                          :success)
+                t))
     (pilish-fake-pi-test--send proc '(:type "prompt" :message "use the tool"))
     (should (equal (plist-get (pilish-fake-pi-test--pop-object proc) :command)
                    "prompt"))
@@ -1650,6 +1714,8 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                        '(:path "/tmp/fake-tool.txt")))
         (should (equal tool-call tool-call-from-message))
         (should (equal (plist-get tool-assistant-message :stopReason) "toolUse"))
+        (should (equal (plist-get tool-assistant-message :thinkingLevel) "low"))
+        (should (equal (plist-get final-message :thinkingLevel) "low"))
         (should (equal (plist-get tool-call :id) call-id))
         (should (equal (plist-get tool-call :name) "read"))
         (should (equal (plist-get (plist-get tool-call :arguments) :path)
@@ -1691,10 +1757,12 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
         (should (equal (mapcar (lambda (message) (plist-get message :role))
                                agent-messages)
                        '("user" "assistant" "toolResult" "assistant")))
-        (should (equal (plist-get (aref agent-messages 1) :content)
-                       (plist-get tool-assistant-message :content)))
+        (should (equal (aref agent-messages 1) tool-assistant-message))
         (should (equal (plist-get (aref agent-messages 2) :toolCallId) call-id))
-        (should (equal (plist-get agent-end :willRetry) :false))))))
+        (should (equal (aref agent-messages 3) final-message))
+        (should (equal (plist-get agent-end :willRetry) :false))
+        (pilish-fake-pi-test--assert-assistant-roundtrip
+         proc (list tool-assistant-message final-message))))))
 
 (ert-deftest pilish-fake-pi-test-clear-queue-before-abort-stops-continuation ()
   "Only clear_queue discards steering; abort acknowledges after final settlement."
@@ -1730,6 +1798,10 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
 (ert-deftest pilish-fake-pi-test-abort-stops-streaming ()
   "abort stops an in-flight prompt and leaves the fake idle."
   (pilish-fake-pi-test-with-process (proc "prompt-lifecycle")
+    (should (eq (plist-get (pilish-fake-pi-test--rpc
+                           proc '(:type "set_thinking_level" :level "high"))
+                          :success)
+                t))
     (pilish-fake-pi-test--send proc '(:type "prompt" :message "abort me"))
     (should (equal (plist-get (pilish-fake-pi-test--pop-object proc) :command)
                    "prompt"))
@@ -1762,10 +1834,12 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
       (should aborted-message)
       (should (equal (plist-get aborted-message :errorMessage)
                      "Request was aborted"))
+      (should (equal (plist-get aborted-message :thinkingLevel) "high"))
       (should-not saw-stop-message-end)
       (let ((messages (plist-get agent-end :messages)))
         (should (equal (aref messages (1- (length messages)))
                        aborted-message)))
+      (pilish-fake-pi-test--assert-assistant-roundtrip proc (list aborted-message))
       (pilish-fake-pi-test--send proc '(:type "get_state"))
       (let* ((state (pilish-fake-pi-test--pop-object proc))
              (data (plist-get state :data)))
@@ -1816,6 +1890,7 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
         (should aborted-message)
         (should (equal (plist-get aborted-message :errorMessage)
                        "Request was aborted"))
+        (should (equal (plist-get aborted-message :thinkingLevel) "off"))
         (should (equal (plist-get (aref (plist-get aborted-message :content) 0)
                                   :name)
                        "read"))
@@ -1831,7 +1906,8 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                             "toolcall_end"))))
           events))
         (should (equal (aref messages (1- (length messages)))
-                       aborted-message))))))
+                       aborted-message))
+        (pilish-fake-pi-test--assert-assistant-roundtrip proc (list aborted-message))))))
 
 (ert-deftest pilish-fake-pi-test-steer-queues-another-turn ()
   "steer queues another user turn and delivers it before agent_end."

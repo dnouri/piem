@@ -1,6 +1,17 @@
 {
   "description": "Pi 1.0 input dispositions with one intercepted text and one steering slot.",
-  "commands": [],
+  "commands": [
+    {
+      "name": "mcp",
+      "source": "extension",
+      "sourceInfo": {
+        "path": "builtin:mcp",
+        "source": "builtin",
+        "scope": "temporary",
+        "origin": "top-level"
+      }
+    }
+  ],
   "prompt": {
     "type": "text_stream",
     "assistant_text": "Fake reply for: {message}",
