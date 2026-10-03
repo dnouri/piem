@@ -2418,6 +2418,215 @@ execution cannot retain a temporary record on this setup's evaluator stack."
       (should (equal (pilish-test--nested-summary-lines "literal-root" t)
                      '(("literal-child" . "  ✗ bash {\"command\":\"echo **danger** [target](somewhere) `quoted`\"} — denied **retry** [help](elsewhere) `later`")))))))
 
+(defun pilish-test--nested-expansion-source-view
+    (section source first-line second-line &optional preview-at-tab)
+  "Expand SECTION containing SOURCE and preserve two readers' source positions.
+FIRST-LINE and SECOND-LINE are literal source rows retained by the preview.
+PREVIEW-AT-TAB changes the budget after painting, before the public fold."
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let ((pilish-tool-preview-lines 2))
+        (pilish-test--nested-event
+         "tool_execution_start" "expand-root" nil :toolName "codemode"
+         :args (list :code (if (eq section 'script) source "text(1);")))
+        (when (eq section 'output)
+          (pilish-test--nested-event
+           "tool_execution_end" "expand-root" nil :toolName "codemode" :isError :false
+           :result (list :content (vector (list :type "text" :text source)))))
+        (let ((selected (selected-window))
+              (other (split-window-right)))
+          (set-window-buffer other (current-buffer))
+          (goto-char (+ (pilish-test--hover-pos "SECOND") 2))
+          (set-window-start selected (pilish-test--hover-pos first-line) t)
+          (set-window-point other (1+ (pilish-test--hover-pos "SECOND")))
+          (set-window-start other (pilish-test--hover-pos second-line) t)
+          ;; Public TAB from surviving preview text, not a private redraw.
+          (when preview-at-tab (setq pilish-tool-preview-lines preview-at-tab))
+          (pilish-toggle-tool-section)
+          (should (= (point) (+ (pilish-test--hover-pos "SECOND") 2)))
+          (should (= (window-point selected) (point)))
+          (should (looking-at-p "COND"))
+          (should (= (window-start selected) (pilish-test--hover-pos first-line)))
+          (should (equal first-line (pilish-test--window-start-line selected)))
+          (should (= (window-point other) (1+ (pilish-test--hover-pos "SECOND"))))
+          (should (pilish-test--window-point-text-p other "ECOND"))
+          (should (= (window-start other) (pilish-test--hover-pos second-line)))
+          (should (equal second-line (pilish-test--window-start-line other)))
+          ;; Full expansion restores the source blanks and hidden rows too.
+          (should (string-match-p (regexp-quote source) (buffer-string)))
+          (when (string-match-p "```" source)
+            (should (string-match-p "^~~~" (buffer-string)))))))))
+
+(ert-deftest pilish-test-codemode-script-expansion-preserves-source-view ()
+  "Public expansion restores blanks without moving either script reader."
+  ;; Raw section offsets land before SECOND after the two blanks return.
+  (pilish-test--nested-expansion-source-view
+   'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);"
+   "const FIRST = 1;" "const SECOND = 2;"))
+
+(ert-deftest pilish-test-nested-output-expansion-preserves-source-view ()
+  "Public expansion restores blanks without moving either output reader."
+  (pilish-test--nested-expansion-source-view
+   'output "\nFIRST\n\nSECOND\nTHIRD" "FIRST" "SECOND"))
+
+(ert-deftest pilish-test-codemode-script-expansion-fence-change-preserves-source-view ()
+  "A different full script fence cannot change surviving content coordinates."
+  ;; Rendered-prefix comparison fails when hidden backticks require tildes.
+  (pilish-test--nested-expansion-source-view
+   'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);\n```"
+   "const FIRST = 1;" "const SECOND = 2;"))
+
+(ert-deftest pilish-test-nested-output-expansion-fence-change-preserves-source-view ()
+  "A different full output fence cannot change surviving content coordinates."
+  (pilish-test--nested-expansion-source-view
+   'output "\nFIRST\n\nSECOND\nTHIRD\n```" "FIRST" "SECOND"))
+
+(ert-deftest pilish-test-codemode-script-expansion-new-budget-preserves-source-view ()
+  "Expansion maps the painted rows, not a preview recomputed with a new budget."
+  ;; Recomputing only the new one-row preview cannot identify painted SECOND.
+  (pilish-test--nested-expansion-source-view
+   'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);"
+   "const FIRST = 1;" "const SECOND = 2;" 1))
+
+(ert-deftest pilish-test-nested-output-expansion-before-pending-update-keeps-displayed-snapshot ()
+  "Expansion uses painted source rows while a newer parent result awaits paint."
+  ;; Folding retained facts instead of the displayed snapshot either maps
+  ;; SECOND onto unrelated newer text or indexes rows which were never painted.
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let ((pilish-tool-preview-lines 2))
+        (pilish-test--nested-event
+         "tool_execution_start" "pending-root" nil :toolName "runner" :args '(:job "pending"))
+        (pilish-test--nested-event
+         "tool_execution_start" "stable-child" "pending-root" :toolName "read" :args '(:path "stable.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "stable-child" "pending-root" :toolName "read" :isError :false
+         :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
+        (pilish-test--nested-event
+         "tool_execution_update" "pending-root" nil
+         :partialResult '(:content [(:type "text" :text "\nFIRST\n\nSECOND\nTHIRD")]))
+        (cancel-timer pilish--tool-update-flush-timer)
+        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+          (pilish--flush-tool-updates (current-buffer)))
+        (pilish-test--nested-tab "pending-root" '(child . "stable-child"))
+        (let ((selected (selected-window))
+              (other (split-window-right)))
+          (set-window-buffer other (current-buffer))
+          (goto-char (+ (pilish-test--hover-pos "SECOND") 2))
+          (set-window-start selected (pilish-test--hover-pos "SECOND") t)
+          (set-window-point other (+ (pilish-test--hover-pos "UNCHANGED-OFFSET") 3))
+          (set-window-start other (pilish-test--hover-pos "UNCHANGED-OFFSET") t)
+          (let ((displayed (buffer-substring-no-properties (point-min) (point-max))))
+            (pilish-test--nested-event
+             "tool_execution_update" "pending-root" nil
+             :partialResult '(:content [(:type "text" :text "\n\nLATEST\nNEW-SECOND\nNEW-HIDDEN")]))
+            (should (equal displayed (buffer-substring-no-properties (point-min) (point-max)))))
+          (pilish-toggle-tool-section)
+          (should (string-match-p "\nFIRST\n\nSECOND\nTHIRD" (buffer-string)))
+          (should-not (string-match-p "LATEST\\|NEW-" (buffer-string)))
+          (should (= (point) (+ (pilish-test--hover-pos "SECOND") 2)))
+          (should (= (window-point selected) (point)))
+          (should (= (window-start selected) (pilish-test--hover-pos "SECOND")))
+          (should (pilish-test--window-point-text-p other "HANGED-OFFSET"))
+          (should (= (window-start other) (pilish-test--hover-pos "UNCHANGED-OFFSET")))
+          ;; The ordinary queued paint still applies latest facts with the
+          ;; user's open fold.  Its last row must not become a hidden preview.
+          (cancel-timer pilish--tool-update-flush-timer)
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish--flush-tool-updates (current-buffer)))
+          (should (string-match-p "\n\nLATEST\nNEW-SECOND\nNEW-HIDDEN" (buffer-string)))
+          (should-not (string-match-p "FIRST\\|THIRD" (buffer-string)))
+          (should (pilish-test--window-point-text-p other "HANGED-OFFSET"))
+          (should (= (window-start other) (pilish-test--hover-pos "UNCHANGED-OFFSET")))
+          (pilish-test--nested-tab "pending-root" 'output)
+          (should (string-match-p "LATEST\nNEW-SECOND" (buffer-string)))
+          (should-not (string-match-p "NEW-HIDDEN" (buffer-string))))))))
+
+(defun pilish-test--nested-summary-enrichment-output-view (saved-duration)
+  "Enrich a received child's duration to SAVED-DURATION without moving its reader."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (let ((chat (current-buffer))
+            (reader (selected-window))
+            (now 10.0))
+        (switch-to-buffer chat)
+        (pilish-chat-mode)
+        (pilish--append-to-chat "OLDER TURN\nunchanged prelude\n")
+        (cl-letf (((symbol-function 'current-time) (lambda () (seconds-to-time now))))
+          (pilish-test--nested-event
+           "tool_execution_start" "batch" nil :toolName "batch_read" :args '(:files ["fast.txt" "slow.txt"]))
+          (pilish-test--nested-event
+           "tool_execution_start" "fast" "batch" :toolName "read" :args '(:path "fast.txt"))
+          (setq now 10.009)
+          (pilish-test--nested-event
+           "tool_execution_end" "fast" "batch" :toolName "read" :isError :false
+           :result '(:content [(:type "text" :text "FIRST\nREADER-TEXT\nTHIRD")]))
+          (pilish-test--nested-event
+           "tool_execution_start" "slow" "batch" :toolName "read" :args '(:path "slow.txt")))
+        (pilish-test--nested-tab "batch" '(child . "fast"))
+        (should (string-match-p "9ms" (cdr (assoc "fast" (pilish-test--nested-summary-lines "batch")))))
+        (goto-char (+ (pilish-test--hover-pos "READER-TEXT") 4))
+        (set-window-start reader (pilish-test--hover-pos "READER-TEXT") t)
+        (let ((input-window (split-window-below)))
+          (with-temp-buffer
+            (let ((input (current-buffer)))
+              (pilish-input-mode)
+              (insert "NEWER DRAFT")
+              (set-window-buffer input-window input)
+              (select-window input-window)
+              (with-current-buffer chat
+                (pilish-test--nested-event
+                 "tool_execution_end" "slow" "batch" :toolName "read" :isError :false
+                 :result '(:content [(:type "text" :text "SLOW-DONE")]))
+                (pilish-test--nested-event
+                 "tool_execution_end" "batch" nil :toolName "batch_read" :isError :false
+                 :result '(:content [(:type "text" :text "ALL-DONE")]))
+                (pilish--append-to-chat "NEWER TURN\nunchanged epilogue\n")
+                (should (pilish-test--window-point-text-p reader "ER-TEXT"))
+                (should (= (window-start reader) (pilish-test--hover-pos "READER-TEXT")))
+                (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "batch")))
+                       (prefix (buffer-substring-no-properties (point-min) (overlay-start overlay)))
+                       (suffix (buffer-substring-no-properties (overlay-end overlay) (point-max))))
+                  ;; Pi persists the saved snapshot after the live parent end.
+                  (pilish--handle-display-event
+                   `(:type "message_end" :message
+                     (:role "toolResult" :toolCallId "batch" :toolName "batch_read"
+                      :content [(:type "text" :text "ALL-DONE")] :isError :false :timestamp 1784817120000
+                      :nestedCalls (:complete t :calls
+                                    [(:id "fast" :name "read" :status "ok" :arguments (:path "fast.txt")
+                                      :durationMs ,saved-duration)
+                                     (:id "slow" :name "read" :status "ok" :arguments (:path "slow.txt")
+                                      :durationMs 5000)]))))
+                  ;; The truthful duration must grow; suppressing metadata is
+                  ;; not an acceptable way to preserve output coordinates.
+                  (should (string-match-p (format " %dms" saved-duration)
+                                          (cdr (assoc "fast" (pilish-test--nested-summary-lines "batch")))))
+                  (should (= (window-point reader) (+ (pilish-test--hover-pos "READER-TEXT") 4)))
+                  (should (pilish-test--window-point-text-p reader "ER-TEXT"))
+                  (should (= (window-start reader) (pilish-test--hover-pos "READER-TEXT")))
+                  (should (equal "READER-TEXT" (pilish-test--window-start-line reader)))
+                  (should (equal prefix (buffer-substring-no-properties (point-min) (overlay-start overlay))))
+                  (should (equal suffix (buffer-substring-no-properties (overlay-end overlay) (point-max))))))
+              (should (eq (selected-window) input-window))
+              (should (eq (window-buffer input-window) input))
+              (should (equal (buffer-string) "NEWER DRAFT")))))))))
+
+(ert-deftest pilish-test-nested-summary-enrichment-preserves-output-view ()
+  "A 9ms to 10ms saved duration leaves the input-selected output reader in place."
+  ;; Offsets from the summary start shift readers when that summary grows.
+  (pilish-test--nested-summary-enrichment-output-view 10))
+
+(ert-deftest pilish-test-nested-summary-enrichment-wider-duration-preserves-output-view ()
+  "A 9ms to 953ms saved duration also keeps the exact output character and row."
+  (pilish-test--nested-summary-enrichment-output-view 953))
+
 (defun pilish-test--nested-short-output-collapse-view (output target retained-p)
   "Collapse OUTPUT with point on TARGET and check both readers' views.
 With RETAINED-P, point must stay on FIRST; otherwise it must clamp to the

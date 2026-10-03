@@ -2335,85 +2335,112 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
            (collapsing (member section folds)))
       (setf (pilish--tool-block-folds block)
             (if collapsing (remove section folds) (cons section folds)))
-      (pilish--redraw-compound-tool block (and collapsing section)))))
+      (pilish--redraw-compound-tool block section))))
 
-(defun pilish--tool-section-bounds (start end)
-  "Return transient (KEY START END) section bounds in START..END."
+(defun pilish--tool-section-bounds (start end &optional line-maps)
+  "Return transient (KEY START END ROWS) section geometry in START..END.
+Each content row is (SOURCE-LINE START END).  LINE-MAPS associates section
+keys with preview vectors naming the original source lines; other rows
+use their displayed order.  Geometry belongs to this paint, not retained facts."
   (let ((position start) sections)
     (while (< position end)
       (let ((next (next-single-property-change position 'pilish-tool-section nil end))
             (key (get-text-property position 'pilish-tool-section)))
-        (when key (push (list key position next) sections))
+        (when key
+          (let ((line-map (cdr (assoc key line-maps))))
+            (push (list key position next
+                        (seq-map-indexed
+                         (lambda (line index)
+                           (cons (if line-map (aref line-map index) (1+ index)) line))
+                         (pilish--tool-section-content-lines (list key position next))))
+                  sections)))
         (setq position next)))
     (nreverse sections)))
 
 (defun pilish--tool-section-content-lines (section)
-  "Return transient content-line spans for SECTION, excluding decoration.
-Output spans omit the wrapper fences and its final newline.  A child keeps
-its summary; the list keeps its heading.  Each span is (START END)."
+  "Return transient content-line spans for SECTION as (START END).
+Script and parent output exclude wrapper fences and their final newline.
+A child separates its summary from its displayed body rows, so summary
+width cannot change output coordinates.  The list keeps its heading."
   (let* ((start (nth 1 section))
          (end (nth 2 section))
          (bounds
           (pcase (car section)
-            ((or 'script 'output) (pilish--tool-fenced-content-bounds start end))
+            ((or 'script 'output) (list (pilish--tool-fenced-content-bounds start end)))
             ('children
-             (cons start (save-excursion
-                           (goto-char start)
-                           (min end (line-beginning-position 2)))))
+             (list (cons start (save-excursion
+                                 (goto-char start)
+                                 (min end (line-beginning-position 2))))))
             (`(child . ,_)
-             (cons start (next-single-property-change
-                          start 'pilish-nested-summary nil end)))))
+             (list (cons start (next-single-property-change
+                               start 'pilish-nested-summary nil end))
+                   (cons (save-excursion (goto-char start) (line-beginning-position 2))
+                         end)))))
          lines)
-    (when bounds
-      (save-excursion
-        (goto-char (car bounds))
-        (while (< (point) (cdr bounds))
-          (push (list (point) (min (cdr bounds) (line-beginning-position 2))) lines)
-          (forward-line 1))))
+    (save-excursion
+      (dolist (region bounds)
+        (when region
+          (goto-char (car region))
+          (while (< (point) (cdr region))
+            (push (list (point) (min (cdr region) (line-beginning-position 2))) lines)
+            (forward-line 1)))))
     (vconcat (nreverse lines))))
 
 (defun pilish--map-tool-section-position
-    (position old-sections new-sections start old-end new-end &optional collapse)
+    (position old-sections new-sections start old-end new-end &optional toggled-section)
   "Map POSITION through transient OLD-SECTIONS and NEW-SECTIONS.
 START, OLD-END and NEW-END delimit the body rewrite.  Outside positions
-use the existing cooling mapper.  A vanished or shortened section clamps
-to its summary, or the list header when the list hides that child.
-COLLAPSE is (KEY . RANGES) for an explicitly collapsed section.  Each
-retained content range is (OLD-START OLD-END NEW-START); all other positions
-in that section clamp to its anchor, regardless of fence or fold text."
+use the existing cooling mapper.  Content follows its source row and
+character offset in either fold direction.  Vanished characters clamp to
+their section anchor, or the list header when the list hides that child.
+Decoration in TOGGLED-SECTION also clamps, never impersonating source text."
   (if-let* ((old (seq-find (lambda (section)
                             (and (>= position (nth 1 section)) (< position (nth 2 section))))
                           old-sections)))
       (if-let* ((new (assoc (car old) new-sections)))
-          (if (equal (car old) (car collapse))
-              (if-let* ((range (seq-find
-                               (lambda (range)
-                                 (and (>= position (nth 0 range)) (< position (nth 1 range))))
-                               (cdr collapse))))
-                  (+ (nth 2 range) (- position (nth 0 range)))
-                (nth 1 new))
-            (let ((offset (- position (nth 1 old))))
-              (+ (nth 1 new) (if (< offset (- (nth 2 new) (nth 1 new))) offset 0))))
+          (if-let* ((row (seq-find (lambda (row)
+                                    (and (>= position (nth 1 row)) (< position (nth 2 row))))
+                                  (nth 3 old))))
+              (let ((offset (- position (nth 1 row)))
+                    (target (assoc (car row) (nth 3 new))))
+                (if (and target (< offset (- (nth 2 target) (nth 1 target))))
+                    (+ (nth 1 target) offset)
+                  (nth 1 new)))
+            (if (equal (car old) toggled-section)
+                (nth 1 new)
+              (let ((offset (- position (nth 1 old))))
+                (+ (nth 1 new) (if (< offset (- (nth 2 new) (nth 1 new))) offset 0)))))
         (or (nth 1 (assq 'children new-sections)) start))
     (pilish--map-tool-cooling-position position start old-end new-end)))
 
-(defun pilish--redraw-compound-tool (block &optional collapsing-section)
+(defun pilish--redraw-compound-tool (block &optional toggled-section)
   "Rewrite compound BLOCK within retained bounds and preserve each reader's view.
-COLLAPSING-SECTION identifies the fold whose removed text must clamp.
-Output collapse uses the last painted presentation so captured row spans
-and the preview line map share one source.  Pending updates still paint
-newer retained facts through the existing queue."
+TOGGLED-SECTION identifies an explicit fold in either direction.  Parent
+output folds use the last painted presentation so captured row spans and
+preview line maps share one source.  Pending updates still paint newer
+retained facts through the existing queue."
   (when-let* ((overlay (pilish--tool-block-overlay block))
               ((eq (overlay-buffer overlay) (current-buffer)))
               (header (pilish--tool-block-header-end block))
               (end (pilish--tool-block-end-marker block)))
     (let* ((start (marker-position header))
            (old-end (marker-position end))
-           (old-sections (pilish--tool-section-bounds start old-end))
-           (old-content-lines
-            (when-let* ((section (and collapsing-section (assoc collapsing-section old-sections))))
-              (pilish--tool-section-content-lines section)))
-           (displayed-output (and (eq collapsing-section 'output)
+           ;; The fold has already changed; an open script was a preview
+           ;; before this toggle, and a closed script was full content.
+           (script-expanded (member 'script (pilish--tool-block-folds block)))
+           (script-line-map
+            (when (eq toggled-section 'script)
+              ;; A preview keeps the first nonblank source rows.  Enumerate
+              ;; their identities independently of its old budget or width.
+              (vconcat (cl-loop for line in (split-string (pilish--compound-tool-code block) "\n")
+                                for source-line from 1
+                                unless (string-empty-p line) collect source-line))))
+           (old-sections
+            (pilish--tool-section-bounds
+             start old-end
+             (list (cons 'script (and script-expanded script-line-map))
+                   (cons 'output (pilish--tool-block-line-map block)))))
+           (displayed-output (and (eq toggled-section 'output)
                                   (pilish--tool-block-displayed-output block)))
            (view (pilish--capture-tool-cooling-view))
            (inhibit-read-only t))
@@ -2427,34 +2454,16 @@ newer retained facts through the existing queue."
         (pilish--tool-block-refresh-overlay block)
         (pilish--font-lock-ensure-excluding-property start (point) 'pilish-no-fontify))
       (let* ((new-end (marker-position end))
-             (new-sections (pilish--tool-section-bounds start new-end))
-             (collapse
-              (when-let* ((section (and collapsing-section (assoc collapsing-section new-sections))))
-                (let ((line-map
-                       (pcase collapsing-section
-                         ('output (pilish--tool-block-line-map block))
-                         ('script
-                          (plist-get (pilish--truncate-to-visual-lines
-                                      (pilish--compound-tool-code block)
-                                      pilish-tool-preview-lines (pilish--chat-display-width))
-                                     :line-map)))))
-                  (cons
-                   collapsing-section
-                   ;; Preview rows name their original lines.  Only their
-                   ;; surviving characters map, never fence or fold text.
-                   (seq-map-indexed
-                    (lambda (line index)
-                      (let* ((source (aref old-content-lines
-                                           (if line-map (1- (aref line-map index)) index)))
-                             (span-length (min (- (cadr source) (car source))
-                                               (- (cadr line) (car line)))))
-                        (list (car source) (+ (car source) span-length) (car line))))
-                    (pilish--tool-section-content-lines section)))))))
+             (new-sections
+              (pilish--tool-section-bounds
+               start new-end
+               (list (cons 'script (and (not script-expanded) script-line-map))
+                     (cons 'output (pilish--tool-block-line-map block))))))
         (pilish--restore-tool-cooling-view
          view start old-end new-end
          (lambda (position)
            (pilish--map-tool-section-position
-            position old-sections new-sections start old-end new-end collapse)))))))
+            position old-sections new-sections start old-end new-end toggled-section)))))))
 
 (defun pilish--release-nested-tool-block (block)
   "Release BLOCK's retained routing, payloads, fold choices and markers."
