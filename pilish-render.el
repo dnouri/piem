@@ -1680,7 +1680,17 @@ Updates buffer-local state and renders display updates."
          (pilish--reset-toolcall-streams)
          (pilish--refresh-header))
        (when (equal role "toolResult")
-         (pilish--hover-update-tool-from-result message))
+         (pilish--hover-update-tool-from-result message)
+         (when-let* ((id (plist-get message :toolCallId))
+                     (block (or (pilish--nested-tool-owner id)
+                                (pilish--tool-block-get id)))
+                     ((equal id (pilish--tool-block-tool-call-id block))))
+           (pilish--merge-saved-nested-calls block (plist-get message :nestedCalls))
+           (pilish--merge-codemode-calls
+            block (pilish--tool-arg-get (plist-get message :details) :calls) t)
+           (when (pilish--tool-block-compound-p block)
+             (pilish--discard-pending-tool-update id)
+             (pilish--redraw-compound-tool block))))
        (when assistant-p
          (pilish--render-complete-message)
          ;; message_end.message is authoritative; state has already cleared
@@ -1918,15 +1928,18 @@ overlays are left alone."
   result
   displayed-output                   ; Parent presentation used by the last paint.
   nested-calls
-  folds)
+  folds
+  history-p
+  summary-incomplete-p)
 
 (cl-defstruct (pilish--nested-call
                (:constructor pilish--make-nested-call))
-  "One real nested execution, stored in its root's observed order."
+  "One nested call's live or saved facts, stored in display order."
   id
   parent-id
   name
   arguments
+  arguments-bytes
   args-preview
   status
   duration-ms
@@ -1963,7 +1976,8 @@ index outlives ordinary execution registration, never a transcript teardown.")
 With HISTORY-P, do not register execution ownership; otherwise index the
 live root's exact real ID."
   (setf (pilish--tool-block-compound-p block) t
-        (pilish--tool-block-args block) args)
+        (pilish--tool-block-args block) args
+        (pilish--tool-block-history-p block) history-p)
   (unless history-p
     (unless pilish--nested-tool-owners
       (setq pilish--nested-tool-owners (make-hash-table :test 'equal)))
@@ -1987,11 +2001,13 @@ starts/updates owe an end, and repeated events cannot reopen ended calls."
       (setf (pilish--tool-block-nested-calls block)
             (seq-filter #'pilish--nested-call-id (pilish--tool-block-nested-calls block)))
       (let ((call (pilish--nested-call-get block id)))
-        (when (or (null call) (eq (pilish--nested-call-source call) 'details))
+        (when (or (null call) (memq (pilish--nested-call-source call) '(details saved)))
           (unless call (setq call (pilish--make-nested-call :id id)))
           (setf (pilish--nested-call-parent-id call) parent-id
                 (pilish--nested-call-name call) (plist-get event :toolName)
-                (pilish--nested-call-arguments call) (plist-get event :args)
+                (pilish--nested-call-arguments call)
+                (if (plist-member event :args) (plist-get event :args)
+                  (pilish--nested-call-arguments call))
                 (pilish--nested-call-source call) 'event
                 (pilish--nested-call-status call)
                 (if (eq (pilish--nested-call-status call) 'cancelled) 'cancelled 'running)
@@ -2037,6 +2053,50 @@ starts/updates owe an end, and repeated events cannot reopen ended calls."
 (defun pilish--nested-metadata-number-p (value)
   "Return non-nil for a finite, nonnegative metadata number VALUE."
   (and (numberp value) (>= value 0) (< value 1.0e+INF)))
+
+(defun pilish--merge-saved-nested-calls (block nested-calls)
+  "Merge saved NESTED-CALLS facts into BLOCK without execution obligations.
+Exact event-backed status, arguments and received results remain authoritative.
+Saved rows supply no ancestry or child output.  A valid container, even empty,
+enables the shared compound presentation."
+  (let ((calls (pilish--tool-arg-get nested-calls :calls)))
+    (when (vectorp calls)
+      (pilish--enable-compound-tool block (pilish--tool-block-args block)
+                                    (pilish--tool-block-history-p block))
+      (setf (pilish--tool-block-summary-incomplete-p block)
+            (eq :false (pilish--tool-arg-get nested-calls :complete)))
+      (dolist (row (append calls nil))
+        (let* ((id (pilish--tool-arg-get row :id))
+               (name (pilish--tool-arg-get row :name))
+               (status (pcase (pilish--tool-arg-get row :status)
+                         ("ok" 'ok) ("error" 'error) ("unfinished" 'unfinished)))
+               (arguments (pilish--tool-arg-get row :arguments)))
+          (when (and (pilish--tool-call-id-p id) (stringp name) status)
+            (let ((call (pilish--nested-call-get block id)))
+              (unless call
+                (setq call (pilish--make-nested-call :id id :source 'saved)))
+              (unless (eq (pilish--nested-call-source call) 'event)
+                (setf (pilish--nested-call-source call) 'saved
+                      (pilish--nested-call-name call) name
+                      (pilish--nested-call-status call) status)
+                (let* ((others (delq call (pilish--tool-block-nested-calls block)))
+                       (details-p (lambda (row) (eq (pilish--nested-call-source row) 'details))))
+                  (setf (pilish--tool-block-nested-calls block)
+                        (append (seq-remove details-p others) (list call)
+                                (seq-filter details-p others)))))
+              (when (and (null (pilish--nested-call-arguments call)) (listp arguments))
+                (setf (pilish--nested-call-arguments call) arguments))
+              (when-let* (((eq (pilish--nested-call-source call) 'saved))
+                          ((not (pilish--tool-arg-member row :arguments)))
+                          (bytes (pilish--tool-arg-get row :argumentsBytes))
+                          ((integerp bytes)) ((>= bytes 0)))
+                (setf (pilish--nested-call-arguments-bytes call) bytes))
+              (when-let* ((duration (pilish--tool-arg-get row :durationMs))
+                          ((pilish--nested-metadata-number-p duration)))
+                (setf (pilish--nested-call-duration-ms call) duration))
+              (when-let* ((error-text (pilish--tool-arg-get row :error)) ((stringp error-text)))
+                (setf (pilish--nested-call-error call) error-text))))))))
+  nil)
 
 (defun pilish--merge-codemode-calls (block calls &optional saved-p)
   "Merge codemode metadata into compound BLOCK.
@@ -2231,8 +2291,15 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
                      (not (null (memq (pilish--nested-call-status call) '(error cancelled)))))))
                  (text (plist-get presentation :text))
                  (images (plist-get presentation :images)))
-            (insert (propertize (pilish--nested-call-summary call nil)
-                                'pilish-nested-root-id (pilish--tool-block-tool-call-id block)))
+            (insert (propertize
+                     (pilish--nested-call-summary
+                      call (or (pilish--tool-block-history-p block)
+                               (eq (pilish--nested-call-source call) 'saved)))
+                     'pilish-nested-root-id (pilish--tool-block-tool-call-id block)))
+            (when-let* (((eq (pilish--nested-call-source call) 'saved))
+                        (bytes (pilish--nested-call-arguments-bytes call)))
+              (insert (propertize (format " saved arguments omitted (%d bytes)" bytes)
+                                  'pilish-no-fontify t)))
             (when (or images (and text (not (string-empty-p text))))
               (insert " ")
               (pilish--insert-compound-tool-button
@@ -2244,7 +2311,13 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
                  (string-trim-right text "\n+") (plist-get presentation :lang)
                  (plist-get presentation :is-edit-diff)))
               (pilish--insert-image-previews images))
-            (add-text-properties child-start (point) (list 'pilish-tool-section section))))))
+            (add-text-properties child-start (point) (list 'pilish-tool-section section))))
+        (when (pilish--tool-block-history-p block)
+          (insert (propertize "Child outputs are not saved in sessions.\n"
+                              'pilish-no-fontify t 'pilish-tool-section 'children)))))
+    (when (pilish--tool-block-summary-incomplete-p block)
+      (insert (propertize "Incomplete saved call summary\n"
+                          'pilish-no-fontify t 'pilish-tool-section 'children)))
     (setf (pilish--tool-block-displayed-output block) presentation)))
 
 (defun pilish--toggle-compound-tool-section (button)
@@ -2389,6 +2462,7 @@ newer retained facts through the existing queue."
     (when pilish--nested-tool-owners
       (remhash (pilish--nested-call-id call) pilish--nested-tool-owners))
     (setf (pilish--nested-call-arguments call) nil
+          (pilish--nested-call-arguments-bytes call) nil
           (pilish--nested-call-args-preview call) nil
           (pilish--nested-call-error call) nil
           (pilish--nested-call-result call) nil
@@ -2399,6 +2473,8 @@ newer retained facts through the existing queue."
         (pilish--tool-block-displayed-output block) nil
         (pilish--tool-block-nested-calls block) nil
         (pilish--tool-block-folds block) nil
+        (pilish--tool-block-history-p block) nil
+        (pilish--tool-block-summary-incomplete-p block) nil
         (pilish--tool-block-last-tail block) nil
         (pilish--tool-block-image-previews block) nil
         (pilish--tool-block-compound-p block) nil)
@@ -2415,8 +2491,15 @@ With KEEP-TEXT, mark pending calls unfinished and freeze the displayed body
 before releasing payloads.  Idempotent; never a turn-settlement cleanup."
   (pilish--cancel-tool-cooling)
   (pilish--cancel-tool-update-flush)
-  (when pilish--nested-tool-owners
-    (dolist (block (delete-dups (hash-table-values pilish--nested-tool-owners)))
+  (let ((blocks (when pilish--nested-tool-owners
+                  (delete-dups (hash-table-values pilish--nested-tool-owners)))))
+    ;; History has display identity but no runtime owners.  Release its hot
+    ;; snapshots at the same teardown boundary, before their overlays vanish.
+    (dolist (overlay (pilish--tool-block-overlays-in-region (point-min) (point-max)))
+      (when-let* ((block (pilish--tool-block-from-overlay overlay))
+                  ((pilish--tool-block-compound-p block)))
+        (cl-pushnew block blocks)))
+    (dolist (block blocks)
       (let ((overlay (pilish--tool-block-overlay block)))
         (if (and keep-text (eq (overlay-buffer overlay) (current-buffer)))
             (progn
@@ -2428,7 +2511,8 @@ before releasing payloads.  Idempotent; never a turn-settlement cleanup."
               (pilish--tool-block-finalize block (overlay-get overlay 'face))
               (pilish--cool-tool-overlay-preserving-view overlay))
           (pilish--release-nested-tool-block block))))
-    (clrhash pilish--nested-tool-owners))
+    (when pilish--nested-tool-owners
+      (clrhash pilish--nested-tool-owners)))
   nil)
 
 (defun pilish--tool-block-execution-backed-p (block)
@@ -4489,7 +4573,8 @@ if none exists, render the result at point without a live overlay."
         (progn
           (setf (pilish--tool-block-result block)
                 (list :content content :details details :isError is-error))
-          (pilish--merge-codemode-calls block (pilish--tool-arg-get details :calls))
+          (pilish--merge-codemode-calls block (pilish--tool-arg-get details :calls)
+                                       (pilish--tool-block-history-p block))
           (pilish--redraw-compound-tool block)
           (pilish--tool-overlay-finalize
            (if is-error 'pilish-tool-block-error 'pilish-tool-block) block))
@@ -8056,6 +8141,18 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
   (let* ((tool-name (plist-get tool-call :name))
          (args (plist-get tool-call :arguments))
          (block (pilish--display-tool-start tool-name args)))
+    ;; Display identity is not execution registration.  History rows have no
+    ;; runtime owner, owed end, or child result to replay.
+    (setf (pilish--tool-block-tool-call-id block) (plist-get tool-call :id)
+          (pilish--tool-block-args block) args
+          (pilish--tool-block-history-p block) t)
+    (pilish--merge-saved-nested-calls block (pilish--tool-arg-get result :nestedCalls))
+    (pilish--merge-codemode-calls
+     block (pilish--tool-arg-get (pilish--tool-arg-get result :details) :calls) t)
+    (when (pilish--tool-block-nested-calls block)
+      (pilish--enable-compound-tool block args t))
+    (when (pilish--tool-block-compound-p block)
+      (pilish--display-tool-update-header tool-name args block))
     (if result
         (pilish--display-tool-end
          tool-name args

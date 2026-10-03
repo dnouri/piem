@@ -378,6 +378,45 @@ not the usage/context_edit records that precede it."
 
 ;;;; read-file
 
+(ert-deftest pilish-test-jsonl-nested-summary-fields-preserved ()
+  "Reading v3 summaries preserves bounded raw facts, not invented child output."
+  ;; Dropping optional message fields or decoding previews as arguments loses
+  ;; the persistence boundary on which live/history presentation depends.
+  (let* ((path (expand-file-name "nested-tools-session.jsonl" pilish-test--fixture-dir))
+         (session (pilish-jsonl-read-file path))
+         (entries (plist-get session :entries))
+         (messages (seq-map (lambda (entry) (plist-get entry :message)) entries))
+         (results (seq-filter (lambda (message) (equal (plist-get message :role) "toolResult"))
+                              messages))
+         (parent (car results))
+         (nested (plist-get parent :nestedCalls))
+         (calls (plist-get nested :calls))
+         (details (plist-get (plist-get parent :details) :calls)))
+    (should (= 3 (plist-get (plist-get session :header) :version)))
+    (should (equal (mapcar (lambda (message) (plist-get message :toolCallId)) results)
+                   '("p" "g" "d" "old")))
+    (should (equal nested
+                   '(:calls [(:id "p/1" :name "read" :arguments (:path "/tmp/CHILD-READ")
+                              :status "ok" :durationMs 12)
+                             (:id "p/2" :name "bash" :argumentsBytes 9000
+                              :status "error" :durationMs 25 :error "Command exited with code 3")
+                             (:id "p/3" :name "read" :arguments (:path "CHILD-LATE")
+                              :status "unfinished")]
+                     :complete :false)))
+    (should-not (plist-member (aref calls 1) :arguments))
+    (should-not (seq-some (lambda (call) (plist-member call :parentToolCallId)) calls))
+    (should (equal (plist-get (aref details 0) :args) "{\"path\":\"/tmp/CHILD-READ\"}"))
+    ;; Pi's 200-character preview keeps 197 JSON characters plus "...".
+    (should (equal (plist-get (aref details 1) :args)
+                   (concat "{\"command\":\"printf 'CHILD-ERROR'; " (make-string 163 ?x) "...")))
+    (should (equal (plist-get (aref details 2) :id) "p/models.classify/1"))
+    (should (= 0.002 (plist-get (aref details 2) :cost)))
+    ;; Every line is an ordinary linear v3 entry.  No nested execution entries
+    ;; are persisted or needed to redisplay the parent-only results.
+    (dotimes (index (length entries))
+      (should (equal (plist-get (aref entries index) :parentId)
+                     (if (= index 0) :null (plist-get (aref entries (1- index)) :id)))))))
+
 (ert-deftest pilish-test-jsonl-read-file-missing ()
   "A nonexistent path reads as nil."
   (should-not (pilish-jsonl-read-file
