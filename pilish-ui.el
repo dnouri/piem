@@ -63,6 +63,7 @@
 (declare-function pilish--restore-tool-properties "pilish-render")
 (declare-function pilish--fontify-with-hover-help "pilish-render")
 (declare-function pilish--hover-clear-live-state "pilish-render")
+(declare-function pilish--release-nested-tool-state "pilish-render")
 (declare-function pilish--maybe-refresh-hot-tail-tables "pilish-table")
 
 ;; pilish-input.el (input buffer commands)
@@ -1188,6 +1189,8 @@ new live processes in interactive sessions."
     ;; subsequent history refresh.  End live measurements at this boundary.
     (when (fboundp 'pilish--hover-clear-live-state)
       (pilish--hover-clear-live-state))
+    (when (fboundp 'pilish--release-nested-tool-state)
+      (pilish--release-nested-tool-state t))
     (force-mode-line-update t))
   (setq pilish--process process
         pilish--process-version nil)
