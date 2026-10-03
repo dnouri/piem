@@ -39,7 +39,7 @@
 ;; Requirements:
 ;;   - Emacs 29.1 or later (tree-sitter support required)
 ;;   - pi coding agent @earendil-works/pi-coding-agent 1.0.0 or later,
-;;     installed and in PATH on the host where Pi runs
+;;     installed and in PATH on the host where Pi runs (tested with 1.0.0)
 ;;   - tree-sitter grammars for markdown and markdown-inline
 ;;
 ;; Pilish uses `md-ts-mode` for its own chat and input buffers;

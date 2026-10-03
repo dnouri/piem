@@ -344,6 +344,30 @@ completion does not mutate the message's snapshot. The source's limits are
 characters; this fixture exercises per-call omission and unfinished work,
 not every limit boundary.
 
+### Nested frontend acceptance
+
+`pilish-fake-pi-test-nested-tools-live-history-contract` starts this literal
+fixture through a real Pilish session and its production process filter/display
+handler, then renders `get_messages` in a fresh chat buffer through the ordinary
+history seam. The shared visible-summary selector compares the completed read
+and error rows, excluding only duration spans. It does not deduplicate rows or
+remove status/error text. Full visible summaries occur once per child; the
+three tool rows precede the two model rows, and the late row stays before
+`FINAL-AFTER-PARENT`. Native JSON argument bytes are decoded as UTF-8 before
+character-oriented display escaping, so non-ASCII live arguments agree with
+saved details previews.
+
+Both views retain real script newlines and the honest
+`Incomplete saved call summary` footer, without an invented omitted-call count.
+The fixture's late **error** is visible live, while the disk snapshot and
+reloaded row stay **unfinished when saved**. W2's separate renderer regression
+covers late success; this literal fixture must not be changed to manufacture it.
+Received child output opens through public TAB live. History instead shows
+`Child outputs are not saved in sessions.` and the separate
+`saved arguments omitted (9000 bytes)` suffix. Neither is part of the summary
+comparison. This boundary test is deterministic frontend acceptance, not proof
+that a real codemode script or model ran.
+
 ### Fork messages
 
 Required shape and semantics:

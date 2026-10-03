@@ -2045,6 +2045,132 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                        (vconcat disk-messages)))
         (should-not (process-get proc 'fake-pi-invalid-lines))))))
 
+(ert-deftest pilish-fake-pi-test-nested-tools-live-history-contract ()
+  "Literal nested wire events and saved history share one visible summary grammar."
+  ;; Losing nested routing, appending a late end at the tail, or replaying live
+  ;; status on reload breaks this subprocess-to-production-display boundary.
+  ;; W2/W3's recorded REDs establish the missing summaries/readable script;
+  ;; this is a boundary regression over that already implemented renderer.
+  (pilish-fake-pi-test-with-session (session "nested-tools")
+    (let* ((chat-buf (plist-get session :chat-buffer))
+           (input-buf (plist-get session :input-buffer))
+           (proc (plist-get session :process))
+           (expected-ids '("parent/1" "parent/2" "parent/3"
+                           "parent/models.classify/1" "parent/models.generateImages/2"))
+           (script-opening
+            "const read = tools.read({ path: \"/tmp/CHILD-READ\" });\nconst error = tools.bash(")
+           completed-live-lines live-visible history-visible)
+      (pilish-fake-pi-test--wait-or-fail
+       proc (lambda ()
+              (with-current-buffer chat-buf
+                (and (plist-get pilish--state :session-id)
+                     (not (pilish--session-transition-active-p)))))
+       "initial nested session state")
+      (with-current-buffer input-buf
+        (erase-buffer)
+        (insert "nested frontend contract")
+        (pilish-send))
+      ;; The fixture's actual late end is an error, not cancellation metadata
+      ;; or a success.  Its post-settlement result must repaint the parent.
+      (pilish-fake-pi-test--wait-or-fail
+       proc (lambda ()
+              (with-current-buffer chat-buf
+                (let ((late (cdr (assoc "parent/3"
+                                        (pilish-test--nested-summary-lines "parent" t)))))
+                  (and late (string-prefix-p "  ✗ bash " late)
+                       (string-match-p "Command aborted" late)))))
+       "late child result under its original parent")
+      (with-current-buffer chat-buf
+        (font-lock-ensure)
+        (let* ((rows (pilish-test--nested-summary-lines "parent" t))
+               (visible-rows (pilish-test--nested-summary-lines "parent"))
+               (read-summary (cdr (assoc "parent/1" visible-rows)))
+               (error-summary (cdr (assoc "parent/2" visible-rows)))
+               (read-row (seq-find (lambda (row)
+                                     (string-match-p "/tmp/CHILD-READ" (cdr row))) rows))
+               (error-row (seq-find (lambda (row)
+                                      (string-match-p "CHILD-ERROR" (cdr row))) rows))
+               (late-summary (cdr (assoc "parent/3" visible-rows))))
+          (should (equal (mapcar #'car rows) expected-ids))
+          (should (equal (car read-row) "parent/1"))
+          (should (equal (car error-row) "parent/2"))
+          (setq completed-live-lines (list read-row error-row)
+                live-visible (pilish--visible-text (point-min) (point-max)))
+          (should (= 1 (pilish-test--count-matches (regexp-quote read-summary) live-visible)))
+          (should (= 1 (pilish-test--count-matches (regexp-quote error-summary) live-visible)))
+          (should (equal (cdr read-row) "  ✓ read {\"path\":\"/tmp/CHILD-READ\"}"))
+          (should (string-prefix-p
+                   "  ✗ bash {\"command\":\"printf 'CHILD-ERROR'; exit 7; # " error-summary))
+          (should (string-suffix-p
+                   " — CHILD-ERROR\\n\\nCommand exited with code 7" error-summary))
+          (should (equal (cdr (assoc "parent/models.classify/1" rows))
+                         "  ✓ models.classify fake/classifier $0.002"))
+          (should (equal (cdr (assoc "parent/models.generateImages/2" rows))
+                         "  ⊘ models.generateImages fake/image"))
+          (let ((late-child-position (string-match (regexp-quote late-summary) live-visible))
+                (final-assistant-position (string-match "FINAL-AFTER-PARENT" live-visible)))
+            (should late-child-position)
+            (should final-assistant-position)
+            (should (< late-child-position final-assistant-position)))
+          (should (= 1 (pilish-test--count-matches (regexp-quote late-summary) live-visible)))
+          ;; Received child output can be opened live through the public TAB.
+          (goto-char (point-min))
+          (search-forward read-summary)
+          (goto-char (match-beginning 0))
+          (pilish-toggle-tool-section)
+          (should (string-match-p "CHILD-READ: contents\n"
+                                  (pilish--visible-text (point-min) (point-max))))))
+      (let* ((response (pilish--rpc-sync proc '(:type "get_messages")
+                                        pilish-fake-pi-test--timeout))
+             (messages (plist-get (plist-get response :data) :messages))
+             (parent (seq-find (lambda (message)
+                                 (equal (plist-get message :toolCallId) "parent")) messages))
+             (records (pilish-fake-pi-test--read-jsonl-file
+                       (plist-get (buffer-local-value 'pilish--state chat-buf) :session-file)))
+             (disk-parent (plist-get
+                           (seq-find (lambda (record)
+                                       (equal (plist-get (plist-get record :message) :toolCallId)
+                                              "parent")) records)
+                           :message))
+             (persisted-late-status
+              (plist-get (seq-find (lambda (call)
+                                    (equal (plist-get call :id) "parent/3"))
+                                  (plist-get (plist-get disk-parent :nestedCalls) :calls))
+                         :status)))
+        (should (eq (plist-get response :success) t))
+        (should (equal persisted-late-status "unfinished"))
+        (should (equal (plist-get parent :nestedCalls) (plist-get disk-parent :nestedCalls)))
+        (with-temp-buffer
+          (pilish-chat-mode)
+          (pilish--display-history-messages messages)
+          (font-lock-ensure)
+          (let* ((rows (pilish-test--nested-summary-lines "parent" t))
+                 (visible-rows (pilish-test--nested-summary-lines "parent"))
+                 (read-summary (cdr (assoc "parent/1" visible-rows)))
+                 (error-summary (cdr (assoc "parent/2" visible-rows)))
+                 (completed-history-lines (seq-take rows 2))
+                 (late-summary (cdr (assoc "parent/3" rows))))
+            (should (equal (mapcar #'car rows) expected-ids))
+            (should (equal completed-live-lines completed-history-lines))
+            (should (equal late-summary
+                           "  ? bash {\"command\":\"printf 'CHILD-LATE'; sleep 1\"} unfinished when saved"))
+            (setq history-visible (pilish--visible-text (point-min) (point-max)))
+            (should (= 1 (pilish-test--count-matches (regexp-quote read-summary) history-visible)))
+            (should (= 1 (pilish-test--count-matches (regexp-quote error-summary) history-visible)))
+            (should (= 1 (pilish-test--count-matches (regexp-quote late-summary) history-visible)))
+            (should (< (string-match (regexp-quote late-summary) history-visible)
+                       (string-match "FINAL-AFTER-PARENT" history-visible))))
+          (should-not (string-match-p "CHILD-READ: contents\\|Command aborted" history-visible))
+          (should (string-match-p (regexp-quote "Child outputs are not saved in sessions.")
+                                  history-visible))
+          (should (string-match-p (regexp-quote "saved arguments omitted (9000 bytes)")
+                                  history-visible))))
+      (dolist (visible (list live-visible history-visible))
+        (should (string-match-p (regexp-quote script-opening) visible))
+        (should-not (string-match-p (regexp-quote "\\nconst error") visible))
+        (should (= 1 (pilish-test--count-matches "Incomplete saved call summary" visible)))
+        (should-not (string-match-p "[0-9]+ more calls not recorded" visible))))))
+
 (ert-deftest pilish-fake-pi-test-nested-tools-reset-stops-playback ()
   "Abort and session resets join playback even after wire settlement."
   (let ((target-dir (make-temp-file "pilish-fake-pi-nested-reset-" t)))
