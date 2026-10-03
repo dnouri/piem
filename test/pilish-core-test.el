@@ -563,6 +563,40 @@
 
 ;;;; Response Dispatch Tests
 
+(ert-deftest pilish-test-core-passes-disposition-to-correlated-callback ()
+  "Out-of-order prompt/steer acknowledgments keep their exact response data."
+  (pilish-test-with-rpc-session (_chat _input proc commands)
+    (let (prompt-response steer-response)
+      (pilish--rpc-async
+       proc '(:type "prompt" :message "prompt input")
+       (lambda (response) (setq prompt-response response)))
+      (let ((prompt-id (plist-get (car commands) :id)))
+        (pilish--rpc-async
+         proc '(:type "steer" :message "steer input")
+         (lambda (response) (setq steer-response response)))
+        (let* ((steer-id (plist-get (car commands) :id))
+               (pending (pilish--get-pending-requests proc))
+               (types (pilish--get-pending-command-types proc)))
+          (should (= 2 (hash-table-count pending)))
+          (pilish-test--stdout
+           proc (list :type "response" :id steer-id :command "steer" :success t
+                      :data '(:disposition "queued")))
+          (should-not prompt-response)
+          (should (equal steer-response
+                         (list :type "response" :id steer-id :command "steer"
+                               :success t :data '(:disposition "queued"))))
+          (should (gethash prompt-id pending))
+          (should-not (gethash steer-id pending))
+          (should-not (gethash steer-id types))
+          (pilish-test--stdout
+           proc (list :type "response" :id prompt-id :command "prompt" :success t
+                      :data '(:disposition "handled")))
+          (should (equal prompt-response
+                         (list :type "response" :id prompt-id :command "prompt"
+                               :success t :data '(:disposition "handled"))))
+          (should (= 0 (hash-table-count pending)))
+          (should (= 0 (hash-table-count types))))))))
+
 (ert-deftest pilish-test-dispatch-response-calls-callback ()
   "Response with matching ID calls stored callback."
   (let ((received nil)

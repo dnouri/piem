@@ -680,8 +680,8 @@ not claim to distinguish those otherwise identical sending-state traces."
                             :command "prompt" :success t)))
               (should-not pilish--followup-queue))))))))
 
-(defun pilish-test--retry-failure-with-late-ack (success)
-  "Check retry exhaustion before a FIFO owner's late SUCCESS response."
+(defun pilish-test--retry-failure-with-late-ack (success &optional disposition)
+  "Check retry exhaustion before a FIFO owner's late SUCCESS and DISPOSITION."
   (pilish-test-with-rpc-session (chat input proc commands)
     (let (notice)
       (cl-letf (((symbol-function 'message)
@@ -699,17 +699,20 @@ not claim to distinguish those otherwise identical sending-state traces."
                              (:type "agent_end" :messages [])
                              (:type "auto_retry_end" :success :false :attempt 1
                               :finalError "overloaded")))
-              (pilish--handle-display-event event))
+              (pilish-test--stdout proc event))
             (should (string-match-p "Retry failed" (buffer-string)))
             (with-current-buffer input
               (should (equal (buffer-string) "new draft")))
             (should (equal pilish--followup-queue '("next" "/extension-run")))
-            (pilish--handle-display-event '(:type "agent_settled"))
+            (pilish-test--stdout proc '(:type "agent_settled"))
             (should (pilish--session-busy-p))
             (should (= 1 (length commands)))
-            (pilish--dispatch-response
-             proc (list :type "response" :id (plist-get request :id)
-                        :command "prompt" :success success :error "command rejected"))
+            (let ((response
+                   (append (list :type "response" :id (plist-get request :id)
+                                 :command "prompt" :success success)
+                           (unless (eq success t) (list :error "command rejected"))
+                           (when disposition (list :data (list :disposition disposition))))))
+              (pilish-test--stdout proc response response))
             (should-not (pilish--session-busy-p))
             (should-not pilish--followup-queue)
             ;; Exhaustion recovers only unsent work; accepting the owner must
@@ -725,7 +728,8 @@ not claim to distinguish those otherwise identical sending-state traces."
 
 (ert-deftest pilish-test-adversarial-retry-failure-before-late-success ()
   "Late acceptance removes a submitted FIFO owner before restoring its successor."
-  (pilish-test--retry-failure-with-late-ack t))
+  (dolist (disposition '(nil "handled"))
+    (pilish-test--retry-failure-with-late-ack t disposition)))
 
 (ert-deftest pilish-test-adversarial-retry-failure-before-late-rejection ()
   "Late rejection restores the unresolved FIFO owner and successor exactly once."
@@ -733,43 +737,57 @@ not claim to distinguish those otherwise identical sending-state traces."
 
 (ert-deftest pilish-test-review-fixes-queued-extension-ack-after-run ()
   "An extension awaiting waitForIdle accepts late, without resending its FIFO item."
-  (pilish-test-with-rpc-session (chat _input proc commands)
-    (with-current-buffer chat
-      (setq pilish--followup-queue '("next" "/extension-run"))
-      (pilish--process-followup-queue)
-      (let ((request (car commands)))
-        (dolist (event '((:type "agent_start")
-                         (:type "agent_end" :messages [])
-                         (:type "agent_settled")))
-          (pilish--handle-display-event event))
-        (should (= 1 (length commands)))
-        (should (pilish--session-busy-p)) ; request still unacknowledged
-        (should (equal pilish--followup-queue '("next" "/extension-run")))
-        (pilish--dispatch-response
-         proc (list :type "response" :id (plist-get request :id)
-                    :command "prompt" :success t))
-        (should (equal (mapcar (lambda (cmd) (plist-get cmd :message))
-                              (reverse commands))
-                       '("/extension-run" "next")))
-        (should (equal pilish--followup-queue '("next")))))))
+  (dolist (disposition '(nil "handled"))
+    (pilish-test-with-rpc-session (chat _input proc commands)
+      (with-current-buffer chat
+        (setq pilish--followup-queue '("next" "/extension-run"))
+        (pilish--process-followup-queue)
+        (let ((request (car commands)))
+          (dolist (event '((:type "agent_start")
+                           (:type "agent_end" :messages [])
+                           (:type "agent_settled")))
+            (pilish-test--stdout proc event))
+          (should (= 1 (length commands)))
+          (should (pilish--session-busy-p)) ; request still unacknowledged
+          (should (equal pilish--followup-queue '("next" "/extension-run")))
+          (let ((response
+                 (append (list :type "response" :id (plist-get request :id)
+                               :command "prompt" :success t)
+                         (when disposition (list :data (list :disposition disposition))))))
+            (pilish-test--stdout proc response response))
+          (should (equal (mapcar (lambda (cmd) (plist-get cmd :message))
+                                (reverse commands))
+                         '("/extension-run" "next")))
+          (should (equal pilish--followup-queue '("next"))))))))
 
 (ert-deftest pilish-test-review-fixes-stop-while-awaiting-late-acceptance ()
-  "Stopping a settled but unacknowledged command does not poison the next prompt."
-  (pilish-test-with-rpc-session (chat _input proc commands)
-    (with-current-buffer chat
-      (cl-letf (((symbol-function 'message) #'ignore))
-        (pilish--prepare-and-send "/extension-run")
-        (let ((request (car commands)))
-          (dolist (event '((:type "agent_start") (:type "agent_end" :messages [])
-                           (:type "agent_settled")))
-            (pilish--handle-display-event event))
-          (pilish-abort)
-          (should pilish--aborted)
-          (pilish--dispatch-response
-           proc (list :type "response" :id (plist-get request :id)
-                      :command "prompt" :success t))
-          (should-not pilish--aborted)
-          (should-not (pilish--session-busy-p)))))))
+  "Stop drops the FIFO once; late acceptance cannot resend it or poison input."
+  (dolist (disposition '(nil "handled"))
+    (pilish-test-with-rpc-session (chat input proc commands)
+      (with-current-buffer chat
+        (cl-letf (((symbol-function 'message) #'ignore))
+          (setq pilish--followup-queue '("next" "/extension-run"))
+          (pilish--process-followup-queue)
+          (let ((request (car commands)))
+            (dolist (event '((:type "agent_start") (:type "agent_end" :messages [])
+                             (:type "agent_settled")))
+              (pilish-test--stdout proc event))
+            (with-current-buffer input (insert "newer draft"))
+            (pilish-abort)
+            (should pilish--aborted)
+            (let ((response
+                   (append (list :type "response" :id (plist-get request :id)
+                                 :command "prompt" :success t)
+                           (when disposition (list :data (list :disposition disposition))))))
+              (pilish-test--stdout proc response response))
+            (should-not pilish--aborted)
+            (should-not pilish--followup-queue)
+            (should-not (pilish--session-busy-p))
+            (should (equal (mapcar (lambda (cmd) (plist-get cmd :type))
+                                  (reverse commands))
+                           '("prompt" "clear_queue" "abort")))
+            (with-current-buffer input
+              (should (equal (buffer-string) "newer draft")))))))))
 
 (ert-deftest pilish-test-review-fixes-manual-reentry-retains-unacknowledged-fifo ()
   "Extension manual failure cannot restore a FIFO request still awaiting acceptance."
@@ -3604,6 +3622,309 @@ Pi handles command expansion on the server side."
                                (list :type "image" :data jpeg-data
                                      :mimeType "image/jpeg")))))
           (should (string-match-p "Image: image/jpeg" (buffer-string))))))))
+
+(ert-deftest pilish-test-disposition-handled-releases-unstarted-prompt ()
+  "Handled input releases its wait immediately, without echo or state probe."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let ((schedule (symbol-function 'run-at-time)) fallbacks)
+      (cl-letf (((symbol-function 'run-at-time)
+                 (lambda (seconds repeat function &rest args)
+                   (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                       (progn (push (cons function args) fallbacks)
+                              'fake-prompt-start-timer)
+                     (apply schedule seconds repeat function args)))))
+        (with-current-buffer input (insert "consumed input") (pilish-send))
+        (let ((request (car commands)))
+          (with-current-buffer input (insert "newer draft"))
+          (pilish-test--stdout
+           proc (list :type "response" :command "prompt" :success t
+                      :id (plist-get request :id) :data '(:disposition "handled")))
+          (with-current-buffer chat
+            (should (eq pilish--status 'idle))
+            (should (equal pilish--activity-phase "idle"))
+            (should-not pilish--prompt-wait)
+            (should-not pilish--prompt-start-timer)
+            (should-not pilish--local-user-message)
+            (should-not pilish--local-user-message-region)
+            (should-not (string-match-p "consumed input" (buffer-string))))
+          (with-current-buffer input
+            (should (equal (buffer-string) "newer draft")))
+          (should-not fallbacks)
+          (should-not (seq-find (lambda (c) (equal (plist-get c :type) "get_state"))
+                                commands)))))))
+
+(ert-deftest pilish-test-disposition-handled-consumes-image-without-local-echo ()
+  "An accepted handled image stays consumed, without a phantom image/text turn."
+  (pilish-test-with-prompt-image-session (dir chat input)
+    (let ((proc (start-process "pilish-handled-image" nil "cat"))
+          (path (pilish-test--write-prompt-image
+                 (expand-file-name "handled.png" dir) 'png))
+          (schedule (symbol-function 'run-at-time)) commands fallbacks)
+      (unwind-protect
+          (progn
+            (set-process-query-on-exit-flag proc nil)
+            (with-current-buffer chat (setq pilish--process proc))
+            (process-put proc 'pilish-chat-buffer chat)
+            (pilish--register-display-handler proc)
+            (cl-letf (((symbol-function 'pilish--send-string)
+                       (lambda (_process line)
+                         (push (pilish--parse-json-line line) commands)))
+                      ((symbol-function 'pilish--refresh-header) #'ignore)
+                      ((symbol-function 'run-at-time)
+                       (lambda (seconds repeat function &rest args)
+                         (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                             (progn (push (cons function args) fallbacks)
+                                    'fake-prompt-start-timer)
+                           (apply schedule seconds repeat function args))))
+                      ((symbol-function 'message) #'ignore))
+              (with-current-buffer input
+                (pilish-test--attach-image path)
+                (insert "consumed image input")
+                (pilish-send)
+                (should (string-empty-p (buffer-string)))
+                (should-not (pilish--get-prompt-image))
+                (insert "newer draft"))
+              (let ((request (car commands)))
+                (let ((images (plist-get request :images)))
+                  (should (= 1 (length images)))
+                  (should (equal (plist-get (aref images 0) :type) "image"))
+                  (should (equal (plist-get (aref images 0) :mimeType) "image/png"))
+                  (should (equal (plist-get (aref images 0) :data)
+                                 (pilish-test--prompt-image-base64 'png))))
+                (pilish-test--stdout
+                 proc (list :type "response" :command "prompt" :success t
+                            :id (plist-get request :id) :data '(:disposition "handled"))))
+              (with-current-buffer chat
+                (should (eq pilish--status 'idle))
+                (should-not pilish--prompt-wait)
+                (should-not pilish--prompt-start-timer)
+                (should-not pilish--local-user-message)
+                (should-not pilish--local-user-message-region)
+                (should-not (string-match-p "consumed image input\\|Image:" (buffer-string))))
+              (with-current-buffer input
+                (should (equal (buffer-string) "newer draft"))
+                (should-not (pilish--get-prompt-image)))
+              (should-not fallbacks)
+              (should (= 1 (length commands)))))
+        (when (process-live-p proc) (delete-process proc))))))
+
+(ert-deftest pilish-test-disposition-handled-preserves-observed-work ()
+  "Start/echo observations outrank handled, retaining active phase, Stop and FIFO."
+  (dolist (case '((streaming ((:type "agent_start")) streaming "thinking")
+                  (ended ((:type "agent_start") (:type "agent_end" :messages []))
+                         sending "thinking")
+                  (manual ((:type "agent_start") (:type "agent_end" :messages [])
+                           (:type "compaction_start" :reason "manual"))
+                          compacting "compact")
+                  (retry ((:type "agent_start") (:type "agent_end" :messages [])
+                          (:type "auto_retry_start" :attempt 1 :maxAttempts 3
+                           :delayMs 1000 :errorMessage "overloaded"))
+                         sending "thinking")
+                  (settled ((:type "agent_start") (:type "agent_end" :messages [])
+                            (:type "agent_settled")) idle "idle")
+                  (echo-only nil sending "thinking")))
+    (ert-info ((format "before handled acknowledgment: %s" (car case)))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let ((schedule (symbol-function 'run-at-time)) fallbacks)
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (seconds repeat function &rest args)
+                       (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                           (progn (push (cons function args) fallbacks)
+                                  'fake-prompt-start-timer)
+                         (apply schedule seconds repeat function args))))
+                    ((symbol-function 'message) #'ignore))
+            (with-current-buffer input (insert "consumed input") (pilish-send))
+            (let* ((request (car commands))
+                   (echoed (memq (car case) '(settled echo-only))))
+              (dolist (event (nth 1 case)) (pilish-test--stdout proc event))
+              (when echoed
+                (pilish-test--stdout
+                 proc '(:type "message_start" :message
+                         (:role "user" :timestamp 1704067200000
+                          :content [(:type "text" :text "consumed input")]))))
+              (with-current-buffer input (insert "newer draft"))
+              (with-current-buffer chat
+                (should (eq pilish--status (nth 2 case)))
+                (should (equal pilish--activity-phase (nth 3 case)))
+                (unless echoed (setq pilish--followup-queue '("waiting successor")))
+                (let ((status-before pilish--status)
+                      (phase-before pilish--activity-phase)
+                      (queue-before (copy-sequence pilish--followup-queue))
+                      (transcript-before (buffer-string)))
+                  (setq pilish--aborted t)
+                  (pilish-test--stdout
+                   proc (list :type "response" :command "prompt" :success t
+                              :id (plist-get request :id) :data '(:disposition "handled")))
+                  (if echoed
+                      (progn
+                        (should (eq pilish--status 'idle))
+                        (should-not pilish--aborted)
+                        (should (= 1 (pilish-test--count-matches
+                                      "consumed input" (buffer-string)))))
+                    (should (eq pilish--status status-before))
+                    (should (equal pilish--activity-phase phase-before))
+                    (should pilish--aborted)
+                    (should (equal pilish--followup-queue queue-before))
+                    (should-not (string-match-p "consumed input" (buffer-string))))
+                  (should (equal (buffer-string) transcript-before))
+                  (should-not pilish--prompt-wait)
+                  (should-not pilish--prompt-start-timer)
+                  (should-not pilish--local-user-message)
+                  (should-not pilish--local-user-message-region)))
+              (with-current-buffer input (should (equal (buffer-string) "newer draft")))
+              (should-not fallbacks)
+              (should (= 1 (length commands))))))))))
+
+(ert-deftest pilish-test-disposition-handled-during-unstarted-compaction ()
+  "Handled cannot finish over compaction; its guarded probe or newer start wins."
+  (dolist (stop '(nil t))
+    (dolist (next '(idle agent-start))
+      (ert-info ((format "stop=%S after compaction=%s" stop next))
+        (pilish-test-with-rpc-session (chat input proc commands)
+          (let ((schedule (symbol-function 'run-at-time)) fallbacks)
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (seconds repeat function &rest args)
+                         (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                             (progn (push (cons function args) fallbacks)
+                                    'fake-prompt-start-timer)
+                           (apply schedule seconds repeat function args))))
+                      ((symbol-function 'message) #'ignore))
+              (with-current-buffer input (insert "consumed input") (pilish-send))
+              (let ((request (car commands))
+                    (wait (buffer-local-value 'pilish--prompt-wait chat)))
+                (pilish-test--stdout proc '(:type "compaction_start" :reason "manual"))
+                (with-current-buffer input (insert "newer draft"))
+                (with-current-buffer chat
+                  (setq pilish--aborted stop pilish--followup-queue '("next")))
+                (pilish-test--stdout
+                 proc (list :type "response" :command "prompt" :success t
+                            :id (plist-get request :id) :data '(:disposition "handled")))
+                (with-current-buffer chat
+                  (should (eq pilish--status 'compacting))
+                  (should (equal pilish--activity-phase "compact"))
+                  (should (eq pilish--aborted stop))
+                  (should (equal pilish--followup-queue '("next")))
+                  (should (eq pilish--prompt-wait wait))
+                  (should (pilish--prompt-wait-accepted wait))
+                  (should-not (pilish--prompt-wait-started wait))
+                  (should-not pilish--local-user-message)
+                  (should-not pilish--local-user-message-region)
+                  (should-not (string-match-p "consumed input" (buffer-string))))
+                (should (= 1 (length fallbacks)))
+                (should (= 1 (length commands)))
+                (let ((fallback (car fallbacks)))
+                  ;; Compaction ends, but this same accepted wait still reserves
+                  ;; submission until its existing fallback confirms no turn.
+                  (pilish-test--stdout
+                   proc '(:type "compaction_end" :reason "manual" :aborted :false
+                           :result (:tokensBefore 1000 :summary "Summary")))
+                  (with-current-buffer chat
+                    (should (eq pilish--prompt-wait wait))
+                    (should (eq pilish--status 'idle)))
+                  (if (eq next 'agent-start)
+                      (progn
+                        (pilish-test--stdout proc '(:type "agent_start"))
+                        (let ((before (length commands)))
+                          ;; Even a cancelled callback already in flight must
+                          ;; not probe, idle, or erase the newer activity.
+                          (apply (car fallback) (cdr fallback))
+                          (should (= before (length commands))))
+                        (with-current-buffer chat
+                          (should (eq pilish--status 'streaming))
+                          (should (equal pilish--activity-phase "thinking"))
+                          (should (eq pilish--aborted stop))
+                          (should (equal pilish--followup-queue '("next")))
+                          (should-not pilish--prompt-wait)
+                          (should-not pilish--prompt-start-timer)))
+                    (apply (car fallback) (cdr fallback))
+                    (let ((probe (car commands)))
+                      (should (equal (plist-get probe :type) "get_state"))
+                      (pilish-test--stdout
+                       proc (list :type "response" :command "get_state" :success t
+                                  :id (plist-get probe :id)
+                                  :data '(:isStreaming :false :isCompacting :false))))
+                    (with-current-buffer chat
+                      (should-not (eq pilish--prompt-wait wait))
+                      (should-not pilish--aborted)
+                      (should (eq pilish--status (if stop 'idle 'sending)))
+                      (should (equal pilish--followup-queue (unless stop '("next")))))
+                    (should (equal (mapcar (lambda (c) (plist-get c :message))
+                                           (seq-filter (lambda (c) (equal (plist-get c :type) "prompt"))
+                                                       (reverse commands)))
+                                   (if stop '("consumed input") '("consumed input" "next"))))))
+                (with-current-buffer input
+                  (should (equal (buffer-string) "newer draft")))))))))))
+
+(ert-deftest pilish-test-disposition-handled-stale-and-reentrant ()
+  "Stale or reentrant handled acceptance leaves the newer wait, Stop and draft."
+  (dolist (case '(process-replacement invalidated reentrant))
+    (ert-info ((format "handled acknowledgment: %s" case))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let ((schedule (symbol-function 'run-at-time))
+              replacement newer-wait fallbacks (accepted 0) (finished 0))
+          (unwind-protect
+              (cl-letf (((symbol-function 'run-at-time)
+                         (lambda (seconds repeat function &rest args)
+                           (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                               (progn (push (cons function args) fallbacks)
+                                      'fake-prompt-start-timer)
+                             (apply schedule seconds repeat function args)))))
+                (with-current-buffer chat
+                  (pilish--send-prompt
+                   "old request"
+                   (lambda ()
+                     (cl-incf accepted)
+                     ;; Disposition must already suppress speculative display
+                     ;; when this acceptance callback runs.
+                     (pilish--display-accepted-prompt "old request")
+                     (when (eq case 'reentrant)
+                       (pilish--send-prompt "new request")
+                       (setq newer-wait pilish--prompt-wait
+                             pilish--aborted t pilish--followup-queue '("new successor"))
+                       (with-current-buffer input
+                         (erase-buffer) (insert "reentrant draft"))))
+                   nil (lambda () (cl-incf finished)))
+                  ;; Restoration belonging to the old request must not clear
+                  ;; the newer queue after a reentrant acceptance callback.
+                  (setf (pilish--prompt-wait-restore-followups pilish--prompt-wait) t))
+                (let ((request (car commands)))
+                  (unless (eq case 'reentrant)
+                    (with-current-buffer chat
+                      (if (eq case 'process-replacement)
+                          (progn
+                            (setq replacement (start-process "pilish-new-owner" nil "cat"))
+                            (set-process-query-on-exit-flag replacement nil)
+                            (pilish--set-process replacement)
+                            (process-put replacement 'pilish-chat-buffer chat)
+                            (pilish--register-display-handler replacement))
+                        (pilish--invalidate-prompt-start-wait))
+                      (pilish--send-prompt "new request")
+                      (setq newer-wait pilish--prompt-wait))
+                    (pilish-test--stdout (or replacement proc) '(:type "agent_start"))
+                    (with-current-buffer chat
+                      (setq pilish--aborted t pilish--followup-queue '("new successor"))))
+                  (with-current-buffer input (insert "newer draft"))
+                  (let ((response (list :type "response" :command "prompt" :success t
+                                        :id (plist-get request :id) :data '(:disposition "handled"))))
+                    (pilish-test--stdout proc response response))
+                  (with-current-buffer chat
+                    (should (eq pilish--prompt-wait newer-wait))
+                    (should (eq pilish--status (if (eq case 'reentrant) 'sending 'streaming)))
+                    (should (equal pilish--activity-phase "thinking"))
+                    (should pilish--aborted)
+                    (should (equal pilish--followup-queue '("new successor")))
+                    (should-not pilish--prompt-start-timer)
+                    (should-not pilish--local-user-message)
+                    (should-not pilish--local-user-message-region)
+                    (should-not (string-match-p "old request" (buffer-string))))
+                  (with-current-buffer input
+                    (should (equal (buffer-string)
+                                   (if (eq case 'reentrant) "reentrant draft" "newer draft"))))
+                  (should (= accepted (if (eq case 'reentrant) 1 0)))
+                  (should (= finished 0))
+                  (should-not fallbacks)))
+            (when (and replacement (process-live-p replacement))
+              (delete-process replacement))))))))
 
 (ert-deftest pilish-test-prompt-image-no-turn-success-retracts-local-echo ()
   "An extension-handled image prompt leaves no phantom user turn."

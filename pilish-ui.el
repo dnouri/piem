@@ -1693,10 +1693,10 @@ example, after prompt or image transformation).")
 
 (cl-defstruct (pilish--prompt-wait (:constructor pilish--make-prompt-wait))
   "Ownership of one prompt request, separate from observed run activity."
-  process accepted started echoed restore-followups)
+  process accepted started echoed restore-followups disposition)
 
 (defvar-local pilish--prompt-wait nil
-  "Current prompt request record, or nil after acceptance and observed start.
+  "Current prompt request record, or nil after its ownership is released.
 An unacknowledged extension command retains this record even after its run
 settles.  Record identity and process identity invalidate stale callbacks.")
 
@@ -1709,7 +1709,8 @@ settles.  Record identity and process identity invalidate stale callbacks.")
 (defun pilish--prompt-local-echo-p ()
   "Return non-nil when acceptance may still display a speculative user turn."
   (not (and pilish--prompt-wait
-            (or (pilish--prompt-wait-started pilish--prompt-wait)
+            (or (equal (pilish--prompt-wait-disposition pilish--prompt-wait) "handled")
+                (pilish--prompt-wait-started pilish--prompt-wait)
                 (pilish--prompt-wait-echoed pilish--prompt-wait)))))
 
 (defun pilish--session-busy-p (&optional chat-buf)
@@ -3169,7 +3170,9 @@ ON-NO-AGENT-START runs only for accepted requests confirmed to have no turn."
                  (when (buffer-live-p chat-buf)
                    (with-current-buffer chat-buf
                      (when (pilish--prompt-start-current-p wait)
-                       (setf (pilish--prompt-wait-accepted wait) t)
+                       (setf (pilish--prompt-wait-accepted wait) t
+                             (pilish--prompt-wait-disposition wait)
+                             (plist-get (plist-get response :data) :disposition))
                        (unwind-protect
                            (when on-success (funcall on-success))
                          (when (pilish--prompt-start-current-p wait)
@@ -3186,6 +3189,11 @@ ON-NO-AGENT-START runs only for accepted requests confirmed to have no turn."
                                    (when pilish--aborted (pilish--clear-followup-queue))
                                    (setq pilish--aborted nil))
                                  (pilish--process-followup-queue))
+                             ;; Handled describes this input, not independent
+                             ;; work.  A blocked finish keeps the guarded probe.
+                             (when (equal (pilish--prompt-wait-disposition wait) "handled")
+                               (pilish--finish-prompt-without-agent-start
+                                chat-buf wait on-no-agent-start))
                              (pilish--schedule-prompt-start-fallback
                               chat-buf wait on-no-agent-start)))))))
                (pilish--handle-prompt-send-failure
