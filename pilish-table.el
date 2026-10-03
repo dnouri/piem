@@ -104,7 +104,10 @@ buffers are not affected by the visibility guard."
   "Return usable character columns for the chat window, or nil if hidden.
 Excludes columns reserved by fringes such as line-number display."
   (when-let* ((window (pilish--chat-display-window)))
-    (window-max-chars-per-line window)))
+    ;; The native query selects WINDOW internally.  When input is selected,
+    ;; that can move this buffer's insertion point to the chat reader's point.
+    (save-excursion
+      (window-max-chars-per-line window))))
 
 (defun pilish--chat-display-width ()
   "Return the usable character width of the chat window, or 80 if hidden."

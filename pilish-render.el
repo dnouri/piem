@@ -2490,8 +2490,8 @@ newer retained facts through the existing queue."
 
 (defun pilish--release-nested-tool-state (&optional keep-text)
   "Release retained execution routing and payloads at a teardown boundary.
-With KEEP-TEXT, mark pending calls unfinished and freeze the displayed body
-before releasing payloads.  Idempotent; never a turn-settlement cleanup."
+With KEEP-TEXT, mark pending or still-running calls unfinished and freeze the
+body before releasing payloads.  Idempotent; never a turn-settlement cleanup."
   (pilish--cancel-tool-cooling)
   (pilish--cancel-tool-update-flush)
   (let ((blocks (when pilish--nested-tool-owners
@@ -2507,7 +2507,8 @@ before releasing payloads.  Idempotent; never a turn-settlement cleanup."
         (if (and keep-text (eq (overlay-buffer overlay) (current-buffer)))
             (progn
               (dolist (call (pilish--tool-block-nested-calls block))
-                (when (pilish--nested-call-pending-end-p call)
+                (when (or (pilish--nested-call-pending-end-p call)
+                          (eq (pilish--nested-call-status call) 'running))
                   (setf (pilish--nested-call-status call) 'unfinished
                         (pilish--nested-call-pending-end-p call) nil)))
               (pilish--redraw-compound-tool block)
@@ -5191,8 +5192,9 @@ buttons, full content, markers, and absolute buffer positions."
                          (overlay-get overlay 'pilish-line-map))
           :header-length (- header-end (overlay-start overlay)))))
 
-(defun pilish--compound-tool-cold-body (overlay)
-  "Project OVERLAY's displayed compound body to inert, language-free text.
+(defun pilish--compound-tool-cold-projection (overlay)
+  "Project OVERLAY's displayed body to inert, language-free text.
+Return :cold-body and transient absolute :deleted-spans for view mapping.
 Copy only lightweight section/summary properties and visible image previews;
 never select or truncate results again."
   (let* ((start (marker-position (overlay-get overlay 'pilish-header-end)))
@@ -5234,7 +5236,10 @@ never select or truncate results again."
     ;; Spans are already in reverse order, so earlier offsets stay valid.
     (dolist (span language-spans)
       (setq cold (concat (substring cold 0 (car span)) (substring cold (cdr span)))))
-    cold))
+    (list :cold-body cold
+          :deleted-spans (mapcar (lambda (span)
+                                   (cons (+ start (car span)) (+ start (cdr span))))
+                                 language-spans))))
 
 (defun pilish--tool-overlay-cold-metadata (overlay)
   "Return cold-history metadata for completed tool OVERLAY.
@@ -5244,11 +5249,11 @@ count because cold history must stay preview-only.  Compound blocks instead
 freeze their entire currently displayed body in :cold-body."
   (if-let* ((block (pilish--tool-block-from-overlay overlay))
             ((pilish--tool-block-compound-p block)))
-      (list :cold-body (pilish--compound-tool-cold-body overlay)
-            :target-metadata
-            (pilish--cold-tool-target-metadata
-             overlay (marker-position (pilish--tool-block-header-end block))
-             (not (member 'output (pilish--tool-block-folds block)))))
+      (append (pilish--compound-tool-cold-projection overlay)
+              (list :target-metadata
+                    (pilish--cold-tool-target-metadata
+                     overlay (marker-position (pilish--tool-block-header-end block))
+                     (not (member 'output (pilish--tool-block-folds block))))))
     (when-let* ((visible-body (pilish--tool-overlay-visible-body overlay))
                 (header-end (marker-position
                              (overlay-get overlay 'pilish-header-end))))
@@ -5266,7 +5271,7 @@ freeze their entire currently displayed body in :cold-body."
 (defun pilish--cool-tool-overlay (overlay)
   "Rewrite completed tool OVERLAY into its cold plain-history form.
 Preserves the header and visible preview, drops overlays, buttons, and
-diff annotations."
+diff annotations.  Return the applied projection metadata, or nil if ineligible."
   (when (pilish--completed-tool-overlay-p overlay)
     (when-let* ((metadata (pilish--tool-overlay-cold-metadata overlay))
                 (header-end (marker-position
@@ -5301,7 +5306,7 @@ diff annotations."
             (pilish--set-hover-help ov-start (point) help)))
         (when (and record (pilish--tool-block-compound-p record))
           (pilish--release-nested-tool-block record))
-        t))))
+        metadata))))
 
 (defun pilish--cool-completed-tool-blocks (overlays)
   "Cool the given completed tool OVERLAYS.
@@ -5438,7 +5443,7 @@ section-aware old-position to new-position mapping."
 (defun pilish--cool-tool-overlay-preserving-view (overlay)
   "Cool completed tool OVERLAY while mapping visible view positions.
 The header stays in place, so only the replaced body bounds participate in the
-mapping.  Return the result of `pilish--cool-tool-overlay'."
+mapping.  Return non-nil when the rewrite succeeds."
   (let* ((header-end-marker
           (overlay-get overlay 'pilish-header-end))
          (old-start (and (markerp header-end-marker)
@@ -5452,9 +5457,17 @@ mapping.  Return the result of `pilish--cool-tool-overlay'."
             ;; across exactly the newly inserted body.
             (new-end-marker (copy-marker old-start t)))
         (unwind-protect
-            (when (pilish--cool-tool-overlay overlay)
-              (pilish--restore-tool-cooling-view
-               view old-start old-end (marker-position new-end-marker))
+            (when-let* ((metadata (pilish--cool-tool-overlay overlay)))
+              (let ((spans (plist-get metadata :deleted-spans)))
+                (pilish--restore-tool-cooling-view
+                 view old-start old-end (marker-position new-end-marker)
+                 (when spans
+                   (lambda (position)
+                     ;; Subtract only deleted characters before POSITION.
+                     ;; Positions inside a removed tag clamp to its start.
+                     (- position
+                        (cl-loop for (beg . end) in spans
+                                 sum (max 0 (- (min position end) beg))))))))
               t)
           (set-marker new-end-marker nil))))))
 
@@ -7980,15 +7993,19 @@ Display-only table decoration is applied after the content is stable."
 
 (defun pilish--restore-tool-properties (beg end)
   "Restore literal tool metadata after tree-sitter fontification in BEG..END.
-Strip Markdown hiding, faces and link buttons from bounded child summaries,
-including cold summaries without overlays.  Restore `font-lock-face' values
-for all overlapping tool headers, live or finalized."
+Strip Markdown hiding, faces and link buttons from bounded child summaries
+and full-output paths, including cold text without overlays.  Preserve image
+preview display properties.  Restore `font-lock-face' values for all
+overlapping tool headers, live or finalized."
   (let ((inhibit-read-only t)
         (pos beg))
-    (while (setq pos (text-property-not-all pos end 'pilish-nested-summary nil))
-      (let ((limit (next-single-property-change pos 'pilish-nested-summary nil end)))
-        (md-ts--remove-link-button-properties pos limit)
-        (remove-text-properties pos limit '(invisible nil display nil face nil))
+    (while (< pos end)
+      (let ((limit (min (next-single-property-change pos 'pilish-nested-summary nil end)
+                        (next-single-property-change pos 'pilish-tool-section nil end))))
+        (when (or (get-text-property pos 'pilish-nested-summary)
+                  (eq (get-text-property pos 'pilish-tool-section) 'full-output))
+          (md-ts--remove-link-button-properties pos limit)
+          (remove-text-properties pos limit '(invisible nil display nil face nil)))
         (setq pos limit)))
     (dolist (ov (pilish--tool-block-overlays-in-region beg end))
       (when-let* ((ov-start (overlay-start ov))
