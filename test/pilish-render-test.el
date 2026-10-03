@@ -1374,6 +1374,61 @@ execution cannot retain a temporary record on this setup's evaluator stack."
     (should-not (pilish--nested-pending-p
                  (pilish--tool-block-from-overlay (car (pilish-test--all-tool-overlays)))))))
 
+(ert-deftest pilish-test-nested-history-empty-codemode-calls ()
+  "A saved codemode calls array enables readable code even without children."
+  ;; Gating on child rows sends valid local-only scripts back through the
+  ;; escaped JSON header/details path instead of the shared compound body.
+  (dolist (variant '(((:calls []) "")
+                     ((:calls [] :fullOutputPath "/tmp/LOCAL-FULL-OUTPUT")
+                      "Full output: /tmp/LOCAL-FULL-OUTPUT\n")))
+    (ert-info ((format "details: %S" (car variant)))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--display-history-messages
+         (vector '(:role "assistant" :content
+                   [(:type "toolCall" :id "local-only" :name "codemode"
+                     :arguments (:code "const total = 1 + 2;\ntext(total);"))])
+                 (list :role "toolResult" :toolCallId "local-only" :toolName "codemode"
+                       :content [(:type "text" :text "Script completed\nWall time 0.0 seconds\nOutput:\n3")]
+                       :details (car variant) :isError :false)))
+        (let* ((overlay (car (pilish-test--all-tool-overlays)))
+               (root (pilish--tool-block-from-overlay overlay)))
+          (should (equal (buffer-substring-no-properties (overlay-start overlay) (overlay-end overlay))
+                         (concat "codemode\n```javascript\nconst total = 1 + 2;\ntext(total);\n```\n"
+                                 "```\nScript completed\nWall time 0.0 seconds\nOutput:\n3\n```\n"
+                                 (cadr variant))))
+          (should-not (pilish-test--nested-summary-lines "local-only"))
+          (should-not (string-match-p (regexp-opt '("Child calls" "Child outputs are not saved"
+                                                   "Incomplete saved call summary" "**Details**"))
+                                      (buffer-string)))
+          (should-not (pilish--nested-tool-owner "local-only"))
+          (should-not (pilish--tool-block-get "local-only"))
+          (should-not (pilish--nested-pending-p root)))))))
+
+(ert-deftest pilish-test-nested-history-unrecognized-codemode-details-stay-legacy ()
+  "Absent or wrong-type codemode calls metadata keeps the old presentation."
+  ;; Tool name, unrelated metadata, or a calls object is not a calls array.
+  (dolist (details '(nil (:fullOutputPath "LEGACY-PATH") (:calls :null)
+                        (:calls "not an array")
+                        (:calls (:id "old/1" :name "read" :status "ok"))))
+    (ert-info ((format "details: %S" details))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--display-history-messages
+         (vector '(:role "assistant" :content
+                   [(:type "toolCall" :id "old-code" :name "codemode" :arguments (:code "text(1);"))])
+                 (append '(:role "toolResult" :toolCallId "old-code" :toolName "codemode"
+                           :content [(:type "text" :text "LEGACY-OUTPUT")] :isError :false)
+                         (when details (list :details details)))))
+        (let ((overlay (car (pilish-test--all-tool-overlays))))
+          (should (string-prefix-p "codemode { \"code\": \"text(1);\" }\n"
+                                   (buffer-substring-no-properties
+                                    (overlay-start overlay) (overlay-end overlay)))))
+        (should (string-match-p "LEGACY-OUTPUT" (buffer-string)))
+        (should-not (string-match-p "javascript" (buffer-string)))
+        (should-not (pilish-test--nested-summary-lines "old-code"))
+        (should-not (pilish--nested-tool-owner "old-code"))))))
+
 (ert-deftest pilish-test-nested-history-old-and-malformed-sessions ()
   "Old tool bodies are unchanged; malformed optional summary fields are safe."
   ;; Enabling compound rendering by tool name alone changes an old extension's

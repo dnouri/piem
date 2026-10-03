@@ -2099,12 +2099,15 @@ enables the shared compound presentation."
   nil)
 
 (defun pilish--merge-codemode-calls (block calls &optional saved-p)
-  "Merge codemode metadata into compound BLOCK.
+  "Merge codemode metadata into BLOCK.
 CALLS supplies exact-ID rows; previews are text, never arguments or output.
+A calls array, even empty, enables compound presentation.
 SAVED-P makes unmatched running metadata unfinished rather than live work."
   (when (and (equal (overlay-get (pilish--tool-block-overlay block) 'pilish-tool-name)
                     "codemode")
-             (or (vectorp calls) (listp calls)))
+             (vectorp calls))
+    (pilish--enable-compound-tool block (pilish--tool-block-args block)
+                                  (pilish--tool-block-history-p block))
     (setf (pilish--tool-block-nested-calls block)
           (seq-filter #'pilish--nested-call-id (pilish--tool-block-nested-calls block)))
     (dolist (row (append calls nil))
@@ -8149,8 +8152,6 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
     (pilish--merge-saved-nested-calls block (pilish--tool-arg-get result :nestedCalls))
     (pilish--merge-codemode-calls
      block (pilish--tool-arg-get (pilish--tool-arg-get result :details) :calls) t)
-    (when (pilish--tool-block-nested-calls block)
-      (pilish--enable-compound-tool block args t))
     (when (pilish--tool-block-compound-p block)
       (pilish--display-tool-update-header tool-name args block))
     (if result
