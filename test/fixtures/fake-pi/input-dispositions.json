@@ -1,0 +1,12 @@
+{
+  "description": "Pi 1.0 input dispositions with one intercepted text and one steering slot.",
+  "commands": [],
+  "prompt": {
+    "type": "text_stream",
+    "assistant_text": "Fake reply for: {message}",
+    "steer_assistant_text": "Steered fake reply for: {message}",
+    "handled_input": "consume without a run",
+    "chunk_count": 6,
+    "delay_ms": 50
+  }
+}

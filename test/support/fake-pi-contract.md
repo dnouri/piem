@@ -2,8 +2,8 @@
 
 This note defines the supported fake-pi surface used by deterministic tests.
 The fake is a protocol double for the RPC subprocess boundary, not a mock
-of internal Emacs functions. It targets Pi 0.85.0 and later; references to
-older releases below are historical comparisons, not compatibility guarantees.
+of internal Emacs functions. It targets Pi 1.0.0; references to older releases
+below are historical comparisons, not compatibility guarantees.
 The fake's persisted sessions deliberately omit the record kinds pi 0.86+
 added (usage, context_edit, leading system message); tolerance for those
 shapes is covered by the JSONL golden fixture tests.
@@ -55,7 +55,7 @@ These are still worth covering at the real subprocess boundary:
   - `new_session`
   - `get_fork_messages`
 - Integration prompt lifecycle:
-  - immediate `prompt` success plus delayed streamed events
+  - ordinary `prompt` acceptance with `data.disposition: "started"` plus streamed events
   - `agent_start` / `message_start` / `message_update` / `message_end` / `agent_end` / `agent_settled`
   - idle state after completion
   - persisted message count change
@@ -84,7 +84,11 @@ GUI/integration form when they still prove a real boundary risk:
 - Strict JSONL with `\n` as the record delimiter
 - Accept optional trailing `\r` on input lines
 - Flush each output record promptly
-- `prompt` must return an immediate success response before later events
+- Successful `prompt` responses carry `data.disposition: "started"|"queued"|"handled"`
+- Successful `steer` responses carry `data.disposition: "queued"|"handled"`
+- Ordinary fake agent prompts acknowledge before streamed events; handled extension
+  commands acknowledge after their work, so dialog/custom-message events can precede
+  the response. There is exactly one correlated response per accepted command
 - Ordinary stream events are uncorrelated; `extension_ui_request` carries its
   dialog id
 - Responses use `type: "response"` and mirror the request `id` when present
@@ -111,7 +115,8 @@ The current fake supports:
 - `set_thinking_level`
 - `extension_ui_response`
 
-`follow_up` is explicitly rejected.  Conversation navigation/mutation RPCs,
+`follow_up` and queued `prompt` with `streamingBehavior: "followUp"` are
+explicitly rejected. Conversation navigation/mutation RPCs,
 compaction/retry/bash RPCs, session listing, export, and HTML remain out of
 scope.
 
@@ -173,7 +178,7 @@ The Emacs normalizer lifts these to top-level `:location` and `:path`.
 
 Required behavior:
 
-1. send success response immediately
+1. send success response with `data: {"disposition": "started"}`
 2. later emit `agent_start`
 3. emit `message_start`
 4. emit one or more `message_update` events with
@@ -199,6 +204,25 @@ text-only and image-bearing `steer` commands fail.  `tool_stream` preserves
 prompt images on its ordinary user message.  The extension-owned
 `extension_dialog` and `custom_message` prompt behaviors reject nonempty image
 arrays before reporting prompt success.  No new scenario type is implied.
+
+### Input dispositions and bounded steering
+
+The `input-dispositions` fixture consumes one exact `handled_input` text as
+`handled` for either `prompt` or `steer`, before any busy/no-run rejection.
+It emits no messages or agent lifecycle events and persists no user entry.
+This is a data-driven interception case, not an extension runtime.
+
+During streaming, an ordinary raw `prompt` must explicitly carry
+`streamingBehavior: "steer"` to return `queued`; without it, the command fails.
+Only the existing text-stream steering slot is supported. Nonempty prompt
+images cannot enter that slot. A normal `steer` during a text stream also
+returns `queued`; intercepted steering returns `handled` without altering the
+slot. The fake still rejects normal steering when idle.
+
+The slot holds the last accepted text, not a full queue. Its
+`pendingMessageCount` is 1 while occupied and 0 after take/clear; persisting
+messages does not change it. Pilish's production sends are unchanged: it
+uses ordinary `prompt`, without a `streamingBehavior` option, for its local FIFO.
 
 ### Abort and queue clearing
 
@@ -282,6 +306,17 @@ Required response shape:
 - `type: "extension_ui_response"`
 - matching request `id`
 - one of `confirmed`, `value`, or `cancelled`
+
+The dialog request precedes the prompt acknowledgment. The fake's existing
+worker waits without setting `isStreaming` or emitting `agent_start`,
+`agent_end`, or `agent_settled`. After the answer (or timeout/cancellation), its
+custom-message output precedes the one `handled` response. Command text is not
+persisted as a user message. Overlapping dialogs are rejected: this double has
+one worker, not a concurrent extension engine. Stop/switch joins that worker,
+so any custom output and pending prompt acknowledgment precede stop/switch success.
+
+Likewise, `/test-message` emits its custom message before `handled` acceptance,
+while `/test-noop` emits no messages, lifecycle events, or session entries.
 
 Timeouts for dialog requests should be explicit scenario data, not hidden magic
 constants in the harness. Fast defaults are good for automated tests, but the

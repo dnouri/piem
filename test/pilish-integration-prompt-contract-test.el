@@ -43,6 +43,8 @@
     (should prompt-response)
     (should (eq (plist-get prompt-response :success) t))
     (should (equal (plist-get prompt-response :command) "prompt"))
+    (should (equal (plist-get (plist-get prompt-response :data) :disposition)
+                   "started"))
     (with-timeout (pilish-test-integration-timeout
                    (ert-fail "Timeout waiting for prompt lifecycle to finish"))
       (while (not got-agent-settled)

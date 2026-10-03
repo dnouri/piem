@@ -14,7 +14,9 @@ Current prompt kinds:
 ## `text_stream`
 
 Streams one assistant reply in chunks, writes real session-file messages, supports
-`abort`, and can deliver one queued `steer` turn after the current reply.
+`abort`, and can deliver one queued `steer` turn after the current reply. Ordinary
+prompt acceptance carries `data.disposition: "started"`; steering acceptance
+carries `"queued"`.
 
 Example:
 
@@ -24,6 +26,7 @@ Example:
     "type": "text_stream",
     "assistant_text": "Fake reply for: {message}",
     "steer_assistant_text": "Steered fake reply for: {message}",
+    "handled_input": "consume without a run",
     "chunk_count": 6,
     "delay_ms": 30,
     "echo_user": true
@@ -31,10 +34,25 @@ Example:
 }
 ```
 
+Optional `handled_input` consumes that exact text for both `prompt` and `steer`
+with `data.disposition: "handled"`, without messages, a run, user persistence, or
+queue changes. The `input-dispositions.json` fixture covers this Pi 1.0 case.
+
+A raw prompt during streaming must explicitly carry
+`streamingBehavior: "steer"` to queue text into the same single slot. Missing
+behavior fails; `"followUp"` is unsupported, as is the `follow_up` command.
+The slot holds the last accepted text. `pendingMessageCount` stays 1 until it
+is taken/cleared, including across message persistence. This does not change
+Pilish's ordinary prompt sends or add an extension engine.
+
 ## `extension_dialog`
 
-Emits an `extension_ui_request` and waits for a matching
-`extension_ui_response`.  The scenario owns the default timeout, but manual
+Emits an `extension_ui_request` before acknowledging the prompt and waits for a
+matching `extension_ui_response`. Its custom-message output precedes the one
+`data.disposition: "handled"` acknowledgment. No agent lifecycle events or
+synthetic user entry are emitted, and the waiting worker is not streaming.
+Only one dialog worker is supported; overlapping dialog prompts fail.
+The scenario owns the default timeout, but manual
 runs can override it with `--extension-timeout-ms <ms>`.  Pass `0` to disable
 that timeout for tmux debugging.
 
@@ -62,8 +80,11 @@ Example:
 ## `custom_message`
 
 A slash-command scenario that optionally emits one visible custom message
-without a full assistant turn.  This is useful for extension-like commands
-such as `/test-message` or `/test-noop`.
+without an agent run. Its custom-message output precedes the one
+`data.disposition: "handled"` acknowledgment; the command is not persisted as a
+user entry. `/test-noop` acknowledges as handled without emitting messages,
+lifecycle events, or session entries. These fixtures replay extension-like
+wire behavior; they do not execute extensions.
 
 Example:
 

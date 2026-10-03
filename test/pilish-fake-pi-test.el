@@ -942,17 +942,9 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
             (insert "this is not a pi session\n"))
           (pilish-fake-pi-test-with-process
               (proc "extension-confirm" "--extension-timeout-ms" "0")
-            (should
-             (eq (plist-get
-                  (pilish-fake-pi-test--rpc
-                   proc '(:id "blocking-prompt" :type "prompt"
-                          :message "/test-confirm"))
-                  :success)
-                 t))
-            (should (equal (plist-get
-                            (pilish-fake-pi-test--pop-object proc)
-                            :type)
-                           "agent_start"))
+            (pilish-fake-pi-test--send
+             proc '(:id "blocking-prompt" :type "prompt"
+                    :message "/test-confirm"))
             (should (equal (plist-get
                             (pilish-fake-pi-test--pop-object proc)
                             :type)
@@ -966,7 +958,7 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                           (cons "directory" target-dir)
                           (cons "malformed" malformed-path))))
               (should (eq (plist-get baseline-response :success) t))
-              (should (eq (plist-get baseline :isStreaming) t))
+              (should (eq (plist-get baseline :isStreaming) :false))
               (dolist (case invalid-targets)
                 (let* ((label (car case))
                        (response
@@ -1000,13 +992,18 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                          (and (equal (plist-get event :type) "response")
                               (equal (plist-get event :id) "missing-switch")))))
                      (response (car (last events)))
-                     (agent-end
+                     (prompt-ack
                       (seq-find (lambda (event)
-                                  (equal (plist-get event :type) "agent_end"))
+                                  (and (equal (plist-get event :type) "response")
+                                       (equal (plist-get event :id) "blocking-prompt")))
                                 events)))
-                (should agent-end)
-                (should (< (seq-position events agent-end #'eq)
+                (should (equal (plist-get (plist-get prompt-ack :data) :disposition)
+                               "handled"))
+                (should (< (seq-position events prompt-ack #'eq)
                            (seq-position events response #'eq)))
+                (should-not (seq-intersection
+                             (pilish-fake-pi-test--event-types events)
+                             '("agent_start" "agent_end" "agent_settled") #'equal))
                 (should
                  (pilish-fake-pi-test--json-equal-p
                   response
@@ -1248,34 +1245,246 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
           (plist-get session :process)))))))
 
 (ert-deftest pilish-fake-pi-test-custom-message-command-emits-visible-message ()
-  "A custom-message command emits visible custom message events."
+  "A custom command emits its message before handled acceptance, without a run."
   (pilish-fake-pi-test-with-process (proc "extension-message")
-    (pilish-fake-pi-test--send proc '(:type "prompt" :message "/test-message"))
-    (let ((response (pilish-fake-pi-test--pop-object proc)))
-      (should (eq (plist-get response :success) t))
-      (should (equal (plist-get response :command) "prompt")))
-    (let* ((start (pilish-fake-pi-test--pop-object proc))
+    (pilish-fake-pi-test--send
+     proc '(:id "custom" :type "prompt" :message "/test-message"))
+    (let* ((events (pilish-fake-pi-test--collect-until
+                    proc (lambda (obj)
+                           (and (equal (plist-get obj :type) "response")
+                                (equal (plist-get obj :id) "custom")))))
+           (response (car (last events)))
+           (start (car events))
+           (end (cadr events))
            (message (plist-get start :message)))
-      (should (equal (plist-get start :type) "message_start"))
+      (should (equal (pilish-fake-pi-test--event-types events)
+                     '("message_start" "message_end" "response")))
+      (should (eq (plist-get response :success) t))
+      (should (equal (plist-get response :command) "prompt"))
+      (should (equal (plist-get (plist-get response :data) :disposition)
+                     "handled"))
       (should (equal (plist-get message :role) "custom"))
       (should (eq (plist-get message :display) t))
-      (should (equal (plist-get message :content) "Test message from extension")))
-    (let* ((end (pilish-fake-pi-test--pop-object proc))
-           (message (plist-get end :message)))
-      (should (equal (plist-get end :type) "message_end"))
-      (should (equal (plist-get message :role) "custom")))))
+      (should (equal (plist-get message :content) "Test message from extension"))
+      (should (equal (plist-get end :message) message)))
+    (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_entries")))
+           (entries (plist-get (plist-get response :data) :entries)))
+      (should (= (length entries) 1))
+      (should (equal (plist-get (aref entries 0) :type) "custom_message")))
+    (let ((response (pilish-fake-pi-test--rpc proc '(:type "get_fork_messages"))))
+      (should (equal (plist-get (plist-get response :data) :messages) [])))))
 
 (ert-deftest pilish-fake-pi-test-custom-noop-command-skips-message-events ()
-  "A no-op custom-message command returns without emitting display events."
+  "A no-op command reports handled without messages, a run, or persistence."
   (pilish-fake-pi-test-with-process (proc "extension-noop")
-    (pilish-fake-pi-test--send proc '(:type "prompt" :message "/test-noop"))
-    (let ((response (pilish-fake-pi-test--pop-object proc)))
+    (pilish-fake-pi-test--send
+     proc '(:id "noop" :type "prompt" :message "/test-noop"))
+    (let* ((events (pilish-fake-pi-test--collect-until
+                    proc (lambda (obj)
+                           (and (equal (plist-get obj :type) "response")
+                                (equal (plist-get obj :id) "noop")))))
+           (response (car (last events))))
+      (should (equal (pilish-fake-pi-test--event-types events) '("response")))
       (should (eq (plist-get response :success) t))
-      (should (equal (plist-get response :command) "prompt")))
-    (pilish-fake-pi-test--send proc '(:type "get_state"))
-    (let ((response (pilish-fake-pi-test--pop-object proc)))
-      (should (equal (plist-get response :command) "get_state"))
-      (should (eq (plist-get response :success) t)))))
+      (should (equal (plist-get response :command) "prompt"))
+      (should (equal (plist-get (plist-get response :data) :disposition)
+                     "handled")))
+    (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+           (state (plist-get response :data)))
+      (should (eq (plist-get state :isStreaming) :false))
+      (should (= (plist-get state :messageCount) 0))
+      (should (= (plist-get state :pendingMessageCount) 0)))
+    (let ((response (pilish-fake-pi-test--rpc proc '(:type "get_entries"))))
+      (should (equal (plist-get (plist-get response :data) :entries) [])))))
+
+(ert-deftest pilish-fake-pi-test-input-dispositions ()
+  "Handled input bypasses a run; busy raw prompts need explicit steering."
+  (pilish-fake-pi-test-with-process
+      (proc "input-dispositions" "--pre-start-delay-ms" "1000")
+    (cl-labels ((exchange (command)
+                 (pilish-fake-pi-test--send proc command)
+                 (pilish-fake-pi-test--collect-until
+                  proc (lambda (obj)
+                         (and (equal (plist-get obj :type) "response")
+                              (equal (plist-get obj :id)
+                                     (plist-get command :id)))))))
+      (let* ((events (exchange '(:id "handled" :type "prompt"
+                                :message "consume without a run")))
+             (handled (car (last events)))
+             (types (pilish-fake-pi-test--event-types events)))
+        (should (eq (plist-get handled :success) t))
+        (should (equal (plist-get (plist-get handled :data) :disposition)
+                       "handled"))
+        (should (equal types '("response")))
+        (should-not (seq-intersection
+                     types '("agent_start" "agent_end" "agent_settled") #'equal)))
+      (let ((response (pilish-fake-pi-test--rpc proc '(:type "get_entries"))))
+        (should (equal (plist-get (plist-get response :data) :entries) [])))
+      (let ((normal (car (last (exchange '(:id "normal" :type "prompt"
+                                          :message "initial turn"))))))
+        (should (eq (plist-get normal :success) t))
+        (should (equal (plist-get (plist-get normal :data) :disposition)
+                       "started")))
+      (let* ((events (exchange '(:id "busy-handled" :type "prompt"
+                                :message "consume without a run")))
+             (handled (car (last events))))
+        (should (equal (pilish-fake-pi-test--event-types events) '("response")))
+        (should (eq (plist-get handled :success) t))
+        (should (equal (plist-get (plist-get handled :data) :disposition)
+                       "handled")))
+      (let ((rejected (car (last (exchange '(:id "busy" :type "prompt"
+                                            :message "must not queue"))))))
+        (should (eq (plist-get rejected :success) :false))
+        (should-not (plist-member rejected :data))
+        (should (string-match-p "streamingBehavior" (plist-get rejected :error))))
+      (let ((rejected (car (last (exchange '(:id "follow-up" :type "prompt"
+                                            :message "unsupported queue"
+                                            :streamingBehavior "followUp"))))))
+        (should (eq (plist-get rejected :success) :false))
+        (should (string-match-p "followUp" (plist-get rejected :error))))
+      (let ((queued (car (last (exchange '(:id "queued" :type "prompt"
+                                          :message "raw queued turn"
+                                          :streamingBehavior "steer"))))))
+        (should (eq (plist-get queued :success) t))
+        (should (equal (plist-get (plist-get queued :data) :disposition)
+                       "queued")))
+      (let ((state (car (last (exchange '(:id "queued-state" :type "get_state"))))))
+        (should (= (plist-get (plist-get state :data) :pendingMessageCount) 1)))
+      ;; A user append must not reset the still-pending slot's count.
+      (pilish-fake-pi-test--collect-until
+       proc (lambda (obj)
+              (and (equal (plist-get obj :type) "message_end")
+                   (equal (plist-get (plist-get obj :message) :role) "user"))))
+      (let ((state (car (last (exchange '(:id "user-state" :type "get_state"))))))
+        (should (= (plist-get (plist-get state :data) :pendingMessageCount) 1)))
+      (pilish-fake-pi-test--collect-until
+       proc (lambda (obj)
+              (and (equal (plist-get obj :type) "message_end")
+                   (equal (plist-get (plist-get obj :message) :role) "user"))))
+      (let ((state (car (last (exchange '(:id "taken-state" :type "get_state"))))))
+        (should (= (plist-get (plist-get state :data) :pendingMessageCount) 0)))
+      (pilish-fake-pi-test--collect-until
+       proc (lambda (obj) (equal (plist-get obj :type) "agent_settled")))
+      (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_fork_messages")))
+             (messages (plist-get (plist-get response :data) :messages)))
+        (should (equal (mapcar (lambda (message) (plist-get message :text))
+                               (append messages nil))
+                       '("initial turn" "raw queued turn")))))))
+
+(ert-deftest pilish-fake-pi-test-dialog-ack-follows-response ()
+  "A dialog waits for its answer and custom output before handled acceptance."
+  (pilish-fake-pi-test-with-process
+      (proc "extension-confirm" "--extension-timeout-ms" "0")
+    (pilish-fake-pi-test--send
+     proc '(:id "dialog" :type "prompt" :message "/test-confirm"))
+    (let ((request (pilish-fake-pi-test--pop-object proc)))
+      (should (equal (plist-get request :type) "extension_ui_request"))
+      (should (equal (plist-get request :method) "confirm"))
+      (should-not (plist-member request :timeout))
+      (should-not (pilish-test-wait-until
+                   (lambda () (process-get proc 'fake-pi-objects)) 0.2 0.01 proc))
+      (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+             (state (plist-get response :data)))
+        (should (eq (plist-get state :isStreaming) :false))
+        (should (= (plist-get state :messageCount) 0)))
+      ;; This bounded double has one worker, even though a dialog is not a run.
+      (let ((overlap (pilish-fake-pi-test--rpc
+                      proc '(:id "overlap" :type "prompt" :message "/test-confirm"))))
+        (should (eq (plist-get overlap :success) :false)))
+      (pilish-fake-pi-test--send
+       proc (list :type "extension_ui_response"
+                  :id (plist-get request :id) :confirmed t))
+      (let* ((events (pilish-fake-pi-test--collect-until
+                      proc (lambda (obj)
+                             (and (equal (plist-get obj :type) "response")
+                                  (equal (plist-get obj :id) "dialog")))))
+             (dialog-ack (car (last events)))
+             (types (pilish-fake-pi-test--event-types (cons request events))))
+        (should (equal types '("extension_ui_request" "message_start"
+                               "message_end" "response")))
+        (should-not (seq-intersection
+                     types '("agent_start" "agent_end" "agent_settled") #'equal))
+        (should (= (length (pilish-fake-pi-test--events-of-type events "response"))
+                   1))
+        (should (equal (plist-get (plist-get (cadr events) :message) :content)
+                       "CONFIRMED"))
+        (should (eq (plist-get dialog-ack :success) t))
+        (should (equal (plist-get dialog-ack :command) "prompt"))
+        (should (equal (plist-get (plist-get dialog-ack :data) :disposition)
+                       "handled")))
+      (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_entries")))
+             (entries (plist-get (plist-get response :data) :entries)))
+        (should (= (length entries) 1))
+        (should (equal (plist-get (aref entries 0) :type) "custom_message")))
+      (let ((response (pilish-fake-pi-test--rpc proc '(:type "get_fork_messages"))))
+        (should (equal (plist-get (plist-get response :data) :messages) []))))))
+
+(ert-deftest pilish-fake-pi-test-handled-steer-does-not-queue ()
+  "Handled steering neither fills nor replaces the pending steering slot."
+  (pilish-fake-pi-test-with-process
+      (proc "input-dispositions" "--pre-start-delay-ms" "1000")
+    (cl-labels ((exchange (command)
+                 (pilish-fake-pi-test--send proc command)
+                 (pilish-fake-pi-test--collect-until
+                  proc (lambda (obj)
+                         (and (equal (plist-get obj :type) "response")
+                              (equal (plist-get obj :id)
+                                     (plist-get command :id)))))))
+      (let* ((events (exchange '(:id "idle-handled" :type "steer"
+                                :message "consume without a run")))
+             (handled (car (last events))))
+        (should (equal (pilish-fake-pi-test--event-types events) '("response")))
+        (should (eq (plist-get handled :success) t))
+        (should (equal (plist-get (plist-get handled :data) :disposition)
+                       "handled")))
+      (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+             (state (plist-get response :data)))
+        (should (= (plist-get state :pendingMessageCount) 0))
+        (should (= (plist-get state :messageCount) 0)))
+      (let ((normal (car (last (exchange '(:id "normal" :type "prompt"
+                                          :message "initial turn"))))))
+        (should (equal (plist-get (plist-get normal :data) :disposition) "started")))
+      (let ((queued (car (last (exchange '(:id "steer" :type "steer"
+                                          :message "keep queued turn"))))))
+        (should (eq (plist-get queued :success) t))
+        (should (equal (plist-get (plist-get queued :data) :disposition) "queued")))
+      (let* ((events (exchange '(:id "busy-handled" :type "steer"
+                                :message "consume without a run")))
+             (handled (car (last events))))
+        (should (equal (pilish-fake-pi-test--event-types events) '("response")))
+        (should (eq (plist-get handled :success) t))
+        (should (equal (plist-get (plist-get handled :data) :disposition)
+                       "handled")))
+      (let ((state (car (last (exchange '(:id "queued-state" :type "get_state"))))))
+        (should (= (plist-get (plist-get state :data) :pendingMessageCount) 1)))
+      (let* ((events (exchange '(:id "clear" :type "clear_queue")))
+             (response (car (last events))))
+        (should (equal (pilish-fake-pi-test--event-types events)
+                       '("queue_update" "response")))
+        (should (equal (plist-get response :data)
+                       '(:steering ["keep queued turn"] :followUp []))))
+      (let ((state (car (last (exchange '(:id "cleared-state" :type "get_state"))))))
+        (should (= (plist-get (plist-get state :data) :pendingMessageCount) 0)))
+      (let ((queued (car (last (exchange '(:id "steer-again" :type "steer"
+                                          :message "keep queued turn"))))))
+        (should (equal (plist-get (plist-get queued :data) :disposition) "queued")))
+      (let* ((events (pilish-fake-pi-test--collect-until
+                      proc (lambda (obj) (equal (plist-get obj :type) "agent_settled"))))
+             (users (pilish-fake-pi-test--message-events events "message_end" "user")))
+        (should (equal
+                 (mapcar (lambda (event)
+                           (plist-get (aref (plist-get (plist-get event :message) :content) 0)
+                                      :text))
+                         users)
+                 '("initial turn" "keep queued turn"))))
+      (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+             (state (plist-get response :data)))
+        (should (= (plist-get state :pendingMessageCount) 0)))
+      (let* ((response (pilish-fake-pi-test--rpc proc '(:type "get_fork_messages")))
+             (messages (plist-get (plist-get response :data) :messages)))
+        (should (equal (mapcar (lambda (message) (plist-get message :text))
+                               (append messages nil))
+                       '("initial turn" "keep queued turn")))))))
 
 (ert-deftest pilish-fake-pi-test-lifecycle-emits-settled-after-final-run ()
   "The fake backend emits agent_settled after agent_end and is then idle."
@@ -1650,7 +1859,9 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
           (pcase (plist-get obj :type)
             ("response"
              (when (equal (plist-get obj :command) "steer")
-               (setq saw-steer-response (eq (plist-get obj :success) t))))
+               (setq saw-steer-response (eq (plist-get obj :success) t))
+               (should (equal (plist-get (plist-get obj :data) :disposition)
+                              "queued"))))
             ("message_start"
              (when (equal (plist-get (plist-get obj :message) :role) "user")
                (setq user-starts (1+ user-starts))))
@@ -1753,45 +1964,39 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                        "Fake Harness Session"))))))
 
 (ert-deftest pilish-fake-pi-test-extension-confirm-zero-timeout-disables-expiry ()
-  "An override of 0 disables dialog expiry for manual debugging." 
+  "An override of 0 disables dialog expiry for manual debugging."
   (pilish-fake-pi-test-with-process
       (proc "extension-confirm" "--extension-timeout-ms" "0")
-    (pilish-fake-pi-test--send proc '(:type "prompt" :message "/test-confirm"))
-    (should (equal (plist-get (pilish-fake-pi-test--pop-object proc) :command)
-                   "prompt"))
-    (should (equal (plist-get (pilish-fake-pi-test--pop-object proc) :type)
-                   "agent_start"))
+    (pilish-fake-pi-test--send
+     proc '(:id "no-timeout" :type "prompt" :message "/test-confirm"))
     (let ((request (pilish-fake-pi-test--pop-object proc)))
       (should (equal (plist-get request :type) "extension_ui_request"))
       (should-not (plist-member request :timeout))
-      (sleep-for 0.2)
-      (should-not (process-get proc 'fake-pi-objects))
+      (should-not (pilish-test-wait-until
+                   (lambda () (process-get proc 'fake-pi-objects)) 0.2 0.01 proc))
       (pilish-fake-pi-test--send
        proc
        (list :type "extension_ui_response"
              :id (plist-get request :id)
              :confirmed t))
       (let* ((events (pilish-fake-pi-test--collect-until
-                      proc
-                      (lambda (obj) (equal (plist-get obj :type) "agent_end"))))
-             (custom-end (seq-find
-                          (lambda (obj)
-                            (and (equal (plist-get obj :type) "message_end")
-                                 (equal (plist-get (plist-get obj :message) :content)
-                                        "CONFIRMED")))
-                          events)))
-        (should custom-end)))))
+                      proc (lambda (obj)
+                             (and (equal (plist-get obj :type) "response")
+                                  (equal (plist-get obj :id) "no-timeout")))))
+             (custom-end (car (pilish-fake-pi-test--message-events
+                               events "message_end" "custom"))))
+        (should (equal (plist-get (plist-get custom-end :message) :content)
+                       "CONFIRMED"))
+        (should (equal (plist-get (plist-get (car (last events)) :data) :disposition)
+                       "handled"))))))
 
 (ert-deftest pilish-fake-pi-test-extension-confirm-honors-timeout-override ()
   "CLI timeout override allows a delayed extension UI response to succeed."
   (pilish-fake-pi-test-with-process
       (proc "extension-confirm" "--extension-timeout-ms" "500")
-    (pilish-fake-pi-test--send proc '(:type "prompt" :message "/test-confirm"))
-    (let* ((prompt-response (pilish-fake-pi-test--pop-object proc))
-           (agent-start (pilish-fake-pi-test--pop-object proc))
-           (request (pilish-fake-pi-test--pop-object proc)))
-      (should (equal (plist-get prompt-response :command) "prompt"))
-      (should (equal (plist-get agent-start :type) "agent_start"))
+    (pilish-fake-pi-test--send
+     proc '(:id "delayed" :type "prompt" :message "/test-confirm"))
+    (let ((request (pilish-fake-pi-test--pop-object proc)))
       (should (equal (plist-get request :type) "extension_ui_request"))
       (should (equal (plist-get request :method) "confirm"))
       (should (= (plist-get request :timeout) 500))
@@ -1802,15 +2007,15 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
              :id (plist-get request :id)
              :confirmed t))
       (let* ((events (pilish-fake-pi-test--collect-until
-                      proc
-                      (lambda (obj) (equal (plist-get obj :type) "agent_end"))))
-             (custom-end (seq-find
-                          (lambda (obj)
-                            (and (equal (plist-get obj :type) "message_end")
-                                 (equal (plist-get (plist-get obj :message) :content)
-                                        "CONFIRMED")))
-                          events)))
-        (should custom-end)))))
+                      proc (lambda (obj)
+                             (and (equal (plist-get obj :type) "response")
+                                  (equal (plist-get obj :id) "delayed")))))
+             (custom-end (car (pilish-fake-pi-test--message-events
+                               events "message_end" "custom"))))
+        (should (equal (plist-get (plist-get custom-end :message) :content)
+                       "CONFIRMED"))
+        (should (equal (plist-get (plist-get (car (last events)) :data) :disposition)
+                       "handled"))))))
 
 (provide 'pilish-fake-pi-test)
 ;;; pilish-fake-pi-test.el ends here

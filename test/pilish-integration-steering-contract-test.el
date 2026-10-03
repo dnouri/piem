@@ -51,7 +51,9 @@
                            pilish-test-rpc-timeout)))
       (should steer-response)
       (should (eq (plist-get steer-response :success) t))
-      (should (equal (plist-get steer-response :command) "steer")))
+      (should (equal (plist-get steer-response :command) "steer"))
+      (should (equal (plist-get (plist-get steer-response :data) :disposition)
+                     "queued")))
     (with-timeout (pilish-test-integration-timeout
                    (ert-fail "Timeout waiting for queued steer delivery"))
       (while (not queued-delivered)

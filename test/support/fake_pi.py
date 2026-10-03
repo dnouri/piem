@@ -106,6 +106,7 @@ class TextStreamPrompt:
     delay_ms: int = 30
     echo_user: bool = True
     steer_assistant_text: str | None = None
+    handled_input: str | None = None
 
 
 @dataclass(frozen=True)
@@ -258,6 +259,7 @@ def load_scenario(path: Path, name: str) -> Scenario:
             delay_ms=int(prompt_data.get("delay_ms", 30)),
             echo_user=bool(prompt_data.get("echo_user", True)),
             steer_assistant_text=prompt_data.get("steer_assistant_text"),
+            handled_input=prompt_data.get("handled_input"),
         )
     elif prompt_type == "extension_dialog":
         prompt = ExtensionDialogPrompt(
@@ -449,10 +451,7 @@ class FakePiHarness:
         return tuple(images)
 
     def _handle_prompt(self, command: JsonDict) -> None:
-        """Validate and start the scenario-specific prompt behavior."""
-        if self.state.is_streaming:
-            self._fail(command, "Fake pi is already streaming")
-            return
+        """Validate input and report its scenario-specific disposition."""
         try:
             prompt_images = self._parse_prompt_images(command)
         except ValueError as exc:
@@ -467,11 +466,34 @@ class FakePiHarness:
                 "Prompt images are not supported by extension-owned fake scenarios",
             )
             return
-        self._abort_requested.clear()
         message = str(command["message"])
+        if isinstance(behavior, TextStreamPrompt) and message == behavior.handled_input:
+            self._respond(command, data={"disposition": "handled"})
+            return
+        if self.state.is_streaming:
+            streaming_behavior = command.get("streamingBehavior")
+            if streaming_behavior is None:
+                self._fail(
+                    command,
+                    "Fake pi is already streaming; specify streamingBehavior to queue input",
+                )
+            elif streaming_behavior != "steer":
+                self._fail(
+                    command,
+                    f"streamingBehavior {streaming_behavior!r} is out of scope for this fake",
+                )
+            elif prompt_images:
+                self._fail(command, "Steering images are out of scope for this fake")
+            else:
+                self._queue_steer(command)
+            return
+        if isinstance(behavior, ExtensionDialogPrompt) and self._run_thread is not None:
+            self._fail(command, "This fake supports only one active dialog worker")
+            return
+        self._abort_requested.clear()
         match behavior:
             case TextStreamPrompt() as behavior:
-                self._respond(command)
+                self._respond(command, data={"disposition": "started"})
                 self._start_run(
                     name=f"fake-pi-text-stream-{self.scenario.name}",
                     target=lambda: self._run_text_prompt(
@@ -487,12 +509,12 @@ class FakePiHarness:
                         f"Scenario {self.scenario.name} only supports {behavior.command_name}",
                     )
                     return
-                self._respond(command)
                 self._start_run(
                     name=f"fake-pi-dialog-{self.scenario.name}",
                     target=lambda: self._run_extension_dialog(
-                        message, cast(ExtensionDialogPrompt, behavior)
+                        command, cast(ExtensionDialogPrompt, behavior)
                     ),
+                    streaming=False,
                 )
             case CustomMessagePrompt() as behavior:
                 if message != behavior.command_name:
@@ -501,10 +523,10 @@ class FakePiHarness:
                         f"Scenario {self.scenario.name} only supports {behavior.command_name}",
                     )
                     return
-                self._respond(command)
                 self._run_custom_message_prompt(message, behavior)
+                self._respond(command, data={"disposition": "handled"})
             case ToolStreamPrompt() as behavior:
-                self._respond(command)
+                self._respond(command, data={"disposition": "started"})
                 self._start_run(
                     name=f"fake-pi-tool-stream-{self.scenario.name}",
                     target=lambda: self._run_tool_prompt(
@@ -519,14 +541,27 @@ class FakePiHarness:
         if "images" in command:
             self._fail(command, "Steering images are out of scope for this fake")
             return
+        behavior = self.scenario.prompt
+        if (
+            isinstance(behavior, TextStreamPrompt)
+            and str(command["message"]) == behavior.handled_input
+        ):
+            self._respond(command, data={"disposition": "handled"})
+            return
         if not self.state.is_streaming:
             self._fail(command, "Cannot steer when no prompt is streaming")
             return
+        self._queue_steer(command)
+
+    def _queue_steer(self, command: JsonDict) -> None:
+        """Accept text into the scenario's single pending steering slot."""
         if not isinstance(self.scenario.prompt, TextStreamPrompt):
             self._fail(command, "Current fake scenario does not support steer")
             return
-        self._pending_steer_message = str(command["message"])
-        self._respond(command)
+        with self._session_lock:
+            self._pending_steer_message = str(command["message"])
+            self.state.pending_message_count = 1
+        self._respond(command, data={"disposition": "queued"})
 
     def _handle_new_session(self, command: JsonDict) -> None:
         """Reset the fake to a fresh session."""
@@ -730,17 +765,14 @@ class FakePiHarness:
 
     def _run_extension_dialog(
         self,
-        command_text: str,
+        command: JsonDict,
         behavior: ExtensionDialogPrompt,
     ) -> None:
-        """Run an extension dialog scenario until it resolves or times out."""
-        self._persist_user_message(self._build_user_message(command_text))
-        self._write_json({"type": "agent_start"})
+        """Resolve a dialog and emit its custom output before handled acceptance."""
         request_id = f"ext-{uuid.uuid4().hex[:8]}"
         request = self._build_extension_request(request_id, behavior)
-        self._write_json(request)
         response = self._wait_for_extension_response(
-            request_id, self._dialog_timeout_ms(behavior)
+            request, self._dialog_timeout_ms(behavior)
         )
         result_key = self._dialog_result_key(behavior.method, response)
         message_text = behavior.response_messages.get(
@@ -751,7 +783,7 @@ class FakePiHarness:
         self._persist_custom_message(followup)
         self._write_json({"type": "message_start", "message": followup})
         self._write_json({"type": "message_end", "message": followup})
-        self._finish_run([followup])
+        self._respond(command, data={"disposition": "handled"})
 
     def _run_custom_message_prompt(
         self,
@@ -759,7 +791,6 @@ class FakePiHarness:
         behavior: CustomMessagePrompt,
     ) -> None:
         """Run a slash command that may emit one visible custom message."""
-        self._persist_user_message(self._build_user_message(command_text))
         if not behavior.message_text:
             return
         followup = self._build_custom_message(
@@ -944,13 +975,14 @@ class FakePiHarness:
         return request
 
     def _wait_for_extension_response(
-        self, request_id: str, timeout_ms: int | None
+        self, request: JsonDict, timeout_ms: int | None
     ) -> JsonDict | None:
-        """Wait for a matching extension dialog response."""
-        self._pending_extension_id = request_id
+        """Emit a dialog request with its waiter ready, then await its response."""
+        self._pending_extension_id = request["id"]
         self._extension_response = None
         self._extension_waiter.clear()
         try:
+            self._write_json(request)
             if timeout_ms is None:
                 while not self._extension_waiter.wait(0.01):
                     if self._abort_requested.is_set():
@@ -995,7 +1027,7 @@ class FakePiHarness:
         thread = self._run_thread
         if thread is None:
             self.state.is_streaming = False
-            self._pending_steer_message = None
+            self._take_pending_steer()
             self._abort_requested.clear()
             return
         self._abort_requested.set()
@@ -1004,32 +1036,36 @@ class FakePiHarness:
         if self._run_thread is thread:
             self._run_thread = None
         self.state.is_streaming = False
-        self._pending_steer_message = None
+        self._take_pending_steer()
         self._abort_requested.clear()
 
-    def _start_run(self, *, name: str, target: Callable[[], None]) -> None:
+    def _start_run(
+        self, *, name: str, target: Callable[[], None], streaming: bool = True
+    ) -> None:
         """Start a daemon worker for prompt playback."""
 
         def runner() -> None:
             try:
-                # Image the ack->agent_start window so tests can deterministically
-                # exercise submission that has not started its run yet.
-                self._sleep_ms(self.pre_start_delay_ms, abortable=False)
+                # Image the ack->agent_start window for actual agent runs only.
+                if streaming:
+                    self._sleep_ms(self.pre_start_delay_ms, abortable=False)
                 target()
             finally:
                 if self._run_thread is thread:
                     self._run_thread = None
 
         thread = threading.Thread(target=runner, name=name, daemon=True)
-        self.state.is_streaming = True
+        self.state.is_streaming = streaming
         self._run_thread = thread
         thread.start()
 
     def _take_pending_steer(self) -> str | None:
         """Return and clear the queued steering message, if any."""
-        message = self._pending_steer_message
-        self._pending_steer_message = None
-        return message
+        with self._session_lock:
+            message = self._pending_steer_message
+            self._pending_steer_message = None
+            self.state.pending_message_count = 0
+            return message
 
     def _finish_run(self, messages: list[JsonDict], *, settled: bool = True) -> None:
         """End a low-level run, settling only when no continuation remains."""
@@ -1039,7 +1075,7 @@ class FakePiHarness:
         if settled:
             self.state.is_streaming = False
             self._abort_requested.clear()
-            self._pending_steer_message = None
+            self._take_pending_steer()
             self._write_json({"type": "agent_settled"})
 
     def _finish_aborted_run(self, message: JsonDict | None = None) -> None:
@@ -1660,7 +1696,6 @@ class FakePiHarness:
             self.state.session_id = snapshot["header"]["id"]
             self.state.session_name = snapshot["sessionName"]
             self.state.message_count = snapshot["messageCount"]
-            self.state.pending_message_count = 0
 
     def _append_session_entry(self, payload: JsonDict, *, prefix: str) -> str:
         """Persist one complete v3 entry, advance the leaf, and refresh projections."""
