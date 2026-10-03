@@ -1037,6 +1037,442 @@ execution cannot retain a temporary record on this setup's evaluator stack."
            (when parent (list :parentToolCallId parent))
            properties)))
 
+(ert-deftest pilish-test-nested-updates-ingest-before-one-owner-paint ()
+  "Missed starts retain both execution obligations before one owner repaint."
+  ;; Dropping facts during latest-wins coalescing, painting per update, or
+  ;; cancelling compound paints at agent_end each breaks this contract.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "root" nil :toolName "runner" :args '(:job "parent"))
+    (pilish-test--nested-event
+     "tool_execution_update" "root" nil
+     :partialResult '(:content [(:type "text" :text "INITIAL-PARENT")]))
+    (let ((root (pilish--tool-block-get "root"))
+          (before (buffer-string)))
+      (should (equal (plist-get (pilish--tool-block-result root) :content)
+                     [(:type "text" :text "INITIAL-PARENT")]))
+      (dolist (id '("one" "two"))
+        (pilish-test--nested-event
+         "tool_execution_update" id "root" :toolName "read" :args (list :path id)
+         :partialResult '(:content [(:type "text" :text "not a final result")])))
+      (should (equal before (buffer-string)))
+      (should (equal (plist-get (pilish--tool-block-result root) :content)
+                     [(:type "text" :text "INITIAL-PARENT")]))
+      (should (equal (mapcar #'pilish--nested-call-id
+                            (pilish--tool-block-nested-calls root)) '("one" "two")))
+      (dolist (id '("one" "two"))
+        (let ((call (pilish--nested-call-get root id)))
+          (should (equal (pilish--nested-call-arguments call) (list :path id)))
+          (should (pilish--nested-call-pending-end-p call))
+          (should-not (pilish--nested-call-duration-ms call))
+          (should-not (pilish--nested-call-result call))))
+      (pilish-test--nested-event
+       "tool_execution_update" "root" nil
+       :partialResult '(:content [(:type "text" :text "PARENT-PARTIAL")]))
+      (should (equal (plist-get (pilish--tool-block-result root) :content)
+                     [(:type "text" :text "PARENT-PARTIAL")]))
+      (should (equal before (buffer-string)))
+      (should (= 1 (length pilish--pending-tool-updates)))
+      (should (eq root (cdr (assoc "root" pilish--pending-tool-updates))))
+      (let ((timer pilish--tool-update-flush-timer))
+        (should (timerp timer))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (should (eq timer pilish--tool-update-flush-timer))
+        (should (= 1 (length pilish--pending-tool-updates)))
+        (cancel-timer timer))
+      (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+        (pilish--flush-tool-updates (current-buffer)))
+      (should (equal (pilish-test--nested-summary-lines "root")
+                     '(("one" . "  … read {\"path\":\"one\"}")
+                       ("two" . "  … read {\"path\":\"two\"}"))))
+      (pilish-test--nested-event
+       "tool_execution_update" "one" "root" :toolName "read" :args '(:path "stale")
+       :partialResult '(:content [(:type "text" :text "stale preview")]))
+      (pilish-test--nested-event
+       "tool_execution_end" "one" "root" :toolName "read" :isError nil
+       :result '(:content [(:type "text" :text "authoritative")]))
+      (should-not (assoc "root" pilish--pending-tool-updates))
+      (should (equal (pilish-test--nested-summary-lines "root")
+                     '(("one" . "  ✓ read {\"path\":\"one\"}")
+                       ("two" . "  … read {\"path\":\"two\"}"))))
+      (should-not (string-match-p "stale preview" (buffer-string)))
+      (should (string-match-p "PARENT-PARTIAL" (buffer-string)))
+      (should (pilish--nested-pending-p root)))))
+
+(defun pilish-test--nested-tab (root-id section)
+  "Use public TAB on ROOT-ID's SECTION, or its header when SECTION is nil."
+  (let* ((root (pilish--nested-tool-owner root-id))
+         (overlay (pilish--tool-block-overlay root))
+         (position (overlay-start overlay)))
+    (when section
+      (setq position (text-property-any
+                      (marker-position (pilish--tool-block-header-end root))
+                      (overlay-end overlay) 'pilish-tool-section section))
+      ;; `text-property-any' uses eq, while child section keys are conses.
+      (unless position
+        (setq position (marker-position (pilish--tool-block-header-end root)))
+        (while (and (< position (overlay-end overlay))
+                    (not (equal section (get-text-property position 'pilish-tool-section))))
+          (setq position (next-single-property-change
+                          position 'pilish-tool-section nil (overlay-end overlay))))))
+    (should (< position (overlay-end overlay)))
+    (goto-char position)
+    (pilish-toggle-tool-section)))
+
+(ert-deftest pilish-test-nested-list-and-child-output-folds ()
+  "List, parent output, and received child outputs have independent folds."
+  ;; A whole-body toggle, first-N list, or repaint-reset fold choice loses
+  ;; an open sibling or exposes output which the user has not opened.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 10) (now 10))
+      (cl-letf (((symbol-function 'current-time) (lambda () (seconds-to-time now))))
+        (pilish-test--nested-event
+         "tool_execution_start" "fold-root" nil :toolName "runner" :args '(:job "folds"))
+        (dotimes (index 12)
+          (let ((id (format "call-%02d" index)))
+            (pilish-test--nested-event
+             "tool_execution_start" id "fold-root" :toolName "read"
+             :args (list :path (format "child-%02d.el" index)))
+            (setq now (+ now 0.012))
+            (pilish-test--nested-event
+             "tool_execution_end" id "fold-root" :toolName "read" :isError nil
+             :result (list :content (vector (list :type "text" :text (format "SECRET-%02d" index)))))))
+        (pilish-test--nested-event
+         "tool_execution_end" "fold-root" nil :toolName "runner" :isError nil
+         :result (list :content (vector (list :type "text" :text
+                                              (mapconcat (lambda (i) (format "PARENT-%02d" i))
+                                                         (number-sequence 0 14) "\n")))))
+        (should (equal (mapcar #'car (pilish-test--nested-summary-lines "fold-root"))
+                       '("call-02" "call-03" "call-04" "call-05" "call-06"
+                         "call-07" "call-08" "call-09" "call-10" "call-11")))
+        (should (string-match-p (regexp-quote "... (2 earlier calls)") (buffer-string)))
+        (should-not (string-match-p "SECRET-" (buffer-string)))
+        (should-not (string-match-p "PARENT-14" (buffer-string)))
+        ;; Header TAB defaults to the list, not parent output.
+        (pilish-test--nested-tab "fold-root" nil)
+        (should (= 12 (length (pilish-test--nested-summary-lines "fold-root"))))
+        (let ((with-duration (cdr (car (pilish-test--nested-summary-lines "fold-root"))))
+              (without-duration (cdr (car (pilish-test--nested-summary-lines "fold-root" t)))))
+          (should (equal with-duration "  ✓ read {\"path\":\"child-00.el\"} 12ms"))
+          (should (equal without-duration "  ✓ read {\"path\":\"child-00.el\"}"))
+          (should-not (string-match-p (regexp-opt '("output" "earlier" "[-]")) with-duration)))
+        (pilish-test--nested-tab "fold-root" '(child . "call-00"))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (should-not (string-match-p "SECRET-01" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" 'output)
+        (should (string-match-p "PARENT-14" (buffer-string)))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (pilish-test--nested-event
+         "tool_execution_update" "repaint-child" "fold-root" :toolName "read"
+         :args '(:path "repaint.el") :partialResult '(:content []))
+        (should (eq (pilish--nested-tool-owner "fold-root")
+                    (cdr (assoc "fold-root" pilish--pending-tool-updates))))
+        (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+          (pilish--flush-tool-updates (current-buffer)))
+        (should (= 13 (length (pilish-test--nested-summary-lines "fold-root"))))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (should (string-match-p "PARENT-14" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" 'output)
+        (should-not (string-match-p "PARENT-14" (buffer-string)))
+        (should (string-match-p "SECRET-00" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" '(child . "call-00"))
+        (should-not (string-match-p "SECRET-00" (buffer-string)))
+        (pilish-test--nested-tab "fold-root" 'children)
+        (let ((pilish-tool-preview-lines 0))
+          (pilish-test--nested-event
+           "tool_execution_start" "pending" "fold-root" :toolName "read" :args '(:path "pending.el"))
+          (should-not (pilish-test--nested-summary-lines "fold-root"))
+          (should (string-match-p (regexp-quote "... (14 earlier calls)") (buffer-string)))
+          (should (string-match-p (regexp-quote "... (15 more lines)") (buffer-string)))
+          (pilish-test--nested-tab "fold-root" 'children)
+          (should (= 14 (length (pilish-test--nested-summary-lines "fold-root"))))
+          (let ((text (buffer-string)))
+            (pilish-test--nested-tab "fold-root" '(child . "pending"))
+            (should (equal text (buffer-string)))))
+        (should (= 1 (length (pilish-test--all-tool-overlays))))))))
+
+(ert-deftest pilish-test-nested-mid-buffer-rewrite-preserves-view ()
+  "Late expansion keeps two windows' text, section offsets and tail following."
+  ;; Restoring unmapped positions or body-wide offsets moves readers after
+  ;; the block and readers in an unchanged sibling to different text.
+  (let ((buffer (generate-new-buffer " *pi-nested-view*"))
+        (pilish-quit-without-confirmation t))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (pilish-chat-mode)
+          (let ((inhibit-read-only t))
+            (insert "BEFORE-START\nBEFORE-POINT\n"))
+          (pilish-test--nested-event
+           "tool_execution_start" "view-root" nil :toolName "runner" :args '(:job "view"))
+          (pilish-test--nested-event
+           "tool_execution_start" "before-child" "view-root" :toolName "read" :args '(:path "before.el"))
+          (pilish-test--nested-event
+           "tool_execution_start" "stable-child" "view-root" :toolName "read" :args '(:path "stable.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" "stable-child" "view-root" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "UNCHANGED-SECTION\nUNCHANGED-OFFSET")]))
+          (pilish-test--nested-event
+           "tool_execution_end" "view-root" nil :toolName "runner" :isError nil
+           :result '(:content [(:type "text" :text "PARENT-VIEW")]))
+          (pilish-test--nested-tab "view-root" '(child . "stable-child"))
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (dotimes (index 10) (insert (format "filler %02d\n" index)))
+            (insert "VIEW-A-START context\nVIEW-A-POINT sentinel\n")
+            (dotimes (index 10) (insert (format "between %02d\n" index)))
+            (insert "VIEW-B-START context\nVIEW-B-POINT sentinel\n")
+            (dotimes (index 60) (insert (format "tail filler %02d\n" index))))
+          (let ((selected (selected-window)) (other (split-window-right)))
+            (set-window-buffer other buffer)
+            (cl-labels ((position (text)
+                          (save-excursion (goto-char (point-min)) (search-forward text) (match-beginning 0)))
+                        (button (section)
+                          (let ((ov (pilish--tool-block-overlay (pilish--nested-tool-owner "view-root"))))
+                            (pilish--find-toggle-button-in-region (overlay-start ov) (overlay-end ov) section))))
+              ;; Both views before the root stay fixed through late insertion.
+              (goto-char (position "BEFORE-POINT"))
+              (set-window-start selected (position "BEFORE-START") t)
+              (set-window-point other (position "BEFORE-POINT"))
+              (set-window-start other (position "BEFORE-START") t)
+              (pilish-test--nested-event
+               "tool_execution_end" "before-child" "view-root" :toolName "read" :isError nil
+               :result (list :content (vector (list :type "text" :text
+                                                    (mapconcat (lambda (i) (format "LATE-%02d" i))
+                                                               (number-sequence 0 24) "\n")))))
+              (should (pilish-test--window-point-text-p selected "BEFORE-POINT"))
+              (should (pilish-test--window-point-text-p other "BEFORE-POINT"))
+              (should (equal "BEFORE-START" (pilish-test--window-start-line selected)))
+              (should (equal "BEFORE-START" (pilish-test--window-start-line other)))
+              ;; Both views after it keep their literal strings on expansion.
+              (goto-char (position "VIEW-A-POINT"))
+              (set-window-start selected (position "VIEW-A-START") t)
+              (set-window-point other (position "VIEW-B-POINT"))
+              (set-window-start other (position "VIEW-B-START") t)
+              (button-activate (button '(child . "before-child")))
+              (should (looking-at-p "VIEW-A-POINT sentinel"))
+              (should (pilish-test--window-point-text-p selected "VIEW-A-POINT sentinel"))
+              (should (pilish-test--window-point-text-p other "VIEW-B-POINT sentinel"))
+              (should (equal "VIEW-A-START context" (pilish-test--window-start-line selected)))
+              (should (equal "VIEW-B-START context" (pilish-test--window-start-line other)))
+              ;; A sibling's offset survives; the collapsed section clamps to
+              ;; its own summary, not to the parent's first output fence.
+              (goto-char (position "UNCHANGED-OFFSET"))
+              (set-window-start selected (position "UNCHANGED-SECTION") t)
+              (set-window-point other (+ (position "LATE-24") 4))
+              (set-window-start other (position "LATE-20") t)
+              (button-activate (button '(child . "before-child")))
+              (should (looking-at-p "UNCHANGED-OFFSET"))
+              (should (equal "UNCHANGED-SECTION" (pilish-test--window-start-line selected)))
+              (should (pilish-test--window-point-text-p other "  ✓ read {\"path\":\"before.el\"}"))
+              (should (string-match-p "before.el" (pilish-test--window-start-line other)))
+              ;; No action should dislodge an actual following window.
+              (goto-char (point-max))
+              (recenter -1)
+              (should (pilish--window-following-p selected))
+              (button-activate (button '(child . "before-child")))
+              (should (= (point) (point-max)))
+              (should (= (window-point selected) (point-max))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest pilish-test-nested-child-results-preserve-text-images-and-diffs ()
+  "Public folds retain rich results and never annotate a failed parent as success."
+  ;; Losing destination-buffer insertion loses diff overlays; whole-body
+  ;; insertion leaks closed images and can damage adjacent tool output.
+  (dolist (parent-name '("edit" "read"))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (cl-letf (((symbol-function 'display-images-p) (lambda (&rest _) nil)))
+        (pilish-test--nested-event
+         "tool_execution_start" "rich-root" nil :toolName parent-name
+         :args '(:path "parent.svg"))
+        (pilish-test--nested-event
+         "tool_execution_start" "image-child" "rich-root" :toolName "image_tool" :args '(:label "image"))
+        (pilish-test--nested-event
+         "tool_execution_end" "image-child" "rich-root" :toolName "image_tool" :isError nil
+         :result `(:content [(:type "text" :text "IMAGE-TEXT")
+                             (:type "image" :mimeType "image/png" :data ,pilish-test--png-base64)]))
+        (pilish-test--nested-event
+         "tool_execution_start" "edit-child" "rich-root" :toolName "edit" :args '(:path "child.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "edit-child" "rich-root" :toolName "edit" :isError nil
+         :result '(:content [(:type "text" :text "Edited child")]
+                   :details (:diff "+ 1 CHILD-ADDED\n- 2 CHILD-REMOVED")))
+        (pilish-test--nested-event
+         "tool_execution_start" "failed-child" "rich-root" :toolName "read" :args '(:path "missing.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "failed-child" "rich-root" :toolName "read" :isError t
+         :result '(:content [(:type "text" :text "No file\nretry\tdenied")]))
+        (pilish-test--nested-event
+         "tool_execution_end" "rich-root" nil :toolName parent-name :isError t
+         :result '(:content [(:type "text" :text "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>")]
+                   :details (:diff "+ 1 PARENT-FAILED-DIFF")))
+        (should (string-match-p (regexp-quote " — No file\\nretry\\tdenied")
+                                (cdr (assoc "failed-child" (pilish-test--nested-summary-lines "rich-root" t)))))
+        (should-not (pilish-test--image-preview-positions))
+        (should-not (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                (overlays-in (point-min) (point-max))))
+        ;; Adjacent diff overlays must survive every parent redraw.
+        (pilish-test--nested-event
+         "tool_execution_start" "adjacent" nil :toolName "edit" :args '(:path "adjacent.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "adjacent" nil :toolName "edit" :isError nil
+         :result '(:content [(:type "text" :text "Edited adjacent")]
+                   :details (:diff "+ 1 ADJACENT-INTACT")))
+        (dotimes (_ 2)
+          (pilish-test--nested-tab "rich-root" '(child . "image-child"))
+          (should (= 1 (length (pilish-test--image-preview-positions))))
+          (should (= 1 (how-many "IMAGE-TEXT" (point-min) (point-max))))
+          (pilish-test--nested-tab "rich-root" '(child . "edit-child"))
+          (should (string-match-p "CHILD-ADDED" (buffer-string)))
+          (let ((diffs (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                  (overlays-in (point-min) (point-max)))))
+            (should (= 6 (length diffs)))
+            (dolist (overlay diffs)
+              (let ((section (get-text-property (overlay-start overlay) 'pilish-tool-section)))
+                (when section (should (equal section '(child . "edit-child")))))))
+          (pilish-test--nested-event
+           "tool_execution_update" "ongoing" "rich-root" :toolName "read"
+           :args '(:path "ongoing.el") :partialResult '(:content []))
+          (should (assoc "rich-root" pilish--pending-tool-updates))
+          (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+          (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+            (pilish--flush-tool-updates (current-buffer)))
+          (should (= 1 (length (pilish-test--image-preview-positions))))
+          (should (= 1 (how-many "IMAGE-TEXT" (point-min) (point-max))))
+          (should (= 1 (how-many "ADJACENT-INTACT" (point-min) (point-max))))
+          (should (string-match-p (if (equal parent-name "edit") "PARENT-FAILED-DIFF" "<svg") (buffer-string)))
+          (pilish-test--nested-tab "rich-root" '(child . "edit-child"))
+          (should-not (string-match-p "CHILD-ADDED" (buffer-string)))
+          (should (= 2 (length (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                          (overlays-in (point-min) (point-max))))))
+          (pilish-test--nested-tab "rich-root" '(child . "image-child"))
+          (should-not (pilish-test--image-preview-positions))
+          (should-not (string-match-p "IMAGE-TEXT" (buffer-string))))
+        (should (= 2 (length (pilish-test--all-tool-overlays))))))))
+
+(ert-deftest pilish-test-nested-cold-form-retains-all-visible-sections ()
+  "Cooling freezes the displayed selection, not a newly computed preview."
+  ;; First-fence cooling loses children; a fresh render after width/budget
+  ;; changes freezes different text and may expose closed full payloads.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish-tool-preview-lines 2) (width 80))
+      (cl-letf (((symbol-function 'pilish--chat-display-width) (lambda () width))
+                ((symbol-function 'display-images-p) (lambda (&rest _) t))
+                ((symbol-function 'image-type-available-p) (lambda (_) t))
+                ((symbol-function 'create-image) (lambda (&rest _) 'frozen-image-spec)))
+        (pilish-test--nested-event
+         "tool_execution_start" "cold-root" nil :toolName "read" :args '(:path "parent.el"))
+        (pilish-test--nested-event
+         "tool_execution_update" "cold-root" nil
+         :partialResult '(:content [(:type "text" :text "initial parent preview")]))
+        (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+          (pilish--flush-tool-updates (current-buffer)))
+        (dolist (id '("open-child" "closed-child"))
+          (pilish-test--nested-event
+           "tool_execution_start" id "cold-root" :toolName "edit" :args '(:path "child.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" id "cold-root" :toolName "edit" :isError nil
+           :result (list :content (vector (list :type "image" :mimeType "image/png" :data pilish-test--png-base64))
+                         :details (list :diff (if (equal id "open-child")
+                                                 "+ 1 OPEN-VISIBLE\n- 2 OPEN-REMOVED\n```md\nINNER-CODE\n```"
+                                               "+ 1 CLOSED-SECRET")))))
+        (should (string-match-p "initial parent preview" (buffer-string)))
+        (pilish-test--nested-event
+         "tool_execution_end" "cold-root" nil :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "PARENT-A\nPARENT-B\nPARENT-HIDDEN")]))
+        (pilish-test--nested-tab "cold-root" '(child . "open-child"))
+        (let* ((root (pilish--nested-tool-owner "cold-root"))
+               (calls (pilish--tool-block-nested-calls root))
+               (overlay (pilish--tool-block-overlay root))
+               (header (pilish--tool-block-header-end root))
+               (end (pilish--tool-block-end-marker root))
+               (rows (pilish-test--nested-summary-lines "cold-root" t))
+               (body-start (marker-position header))
+               (displayed (buffer-substring-no-properties body-start (marker-position end))))
+          (should (pilish--tool-block-last-tail root))
+          (should (string-match-p "PARENT-B" displayed))
+          (should (string-match-p "OPEN-VISIBLE" displayed))
+          (should-not (string-match-p (regexp-opt '("PARENT-HIDDEN" "CLOSED-SECRET")) displayed))
+          (should (= 1 (length (pilish-test--image-preview-positions))))
+          (setq width 1 pilish-tool-preview-lines 0)
+          (should (pilish--cool-tool-overlay overlay))
+          ;; Language tags are the only text removed: the exact displayed
+          ;; preview, inert fold labels and open child selection are frozen.
+          (should (equal (replace-regexp-in-string
+                          "~~~emacs-lisp" "~~~"
+                          (replace-regexp-in-string "```emacs-lisp" "```" displayed))
+                         (buffer-substring-no-properties
+                          body-start (next-single-property-change
+                                      body-start 'pilish-cold-tool-block nil (point-max)))))
+          (should (string-match-p "```md\nINNER-CODE\n```" (buffer-string)))
+          (should (equal rows (pilish-test--nested-summary-lines "cold-root" t)))
+          (let ((images (pilish-test--image-preview-positions)))
+            (should (= 1 (length images)))
+            (should (eq 'frozen-image-spec (get-text-property (car images) 'display))))
+          (should-not (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                  (overlays-in (point-min) (point-max))))
+          (should-not (pilish--find-toggle-button-in-region (point-min) (point-max)))
+          (should-not (text-property-not-all (point-min) (point-max) 'button nil))
+          (should-not (text-property-not-all (point-min) (point-max) 'pilish-full-content nil))
+          (should (= 0 (hash-table-count pilish--nested-tool-owners)))
+          (should-not (overlay-buffer overlay))
+          (should-not (marker-buffer header))
+          (should-not (marker-buffer end))
+          (should-not (pilish--tool-block-folds root))
+          (should-not (pilish--tool-block-last-tail root))
+          (should-not (pilish--tool-block-nested-calls root))
+          (should-not (pilish--tool-block-args root))
+          (should-not (pilish--tool-block-result root))
+          (dolist (call calls)
+            (should-not (pilish--nested-call-arguments call))
+            (should-not (pilish--nested-call-result call))))))))
+
+(ert-deftest pilish-test-nested-child-sections-do-not-inherit-parent-file-target ()
+  "Only the parent's header/output retain its path and read-line mapping."
+  ;; Falling through to parent authority in a child can open the wrong file;
+  ;; falling through to visible child text invents unrequested child navigation.
+  (dolist (budget '(2 20))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((pilish-tool-preview-lines budget) (default-directory "/tmp/"))
+        (pilish-test--nested-event
+         "tool_execution_start" "file-root" nil :toolName "read" :args '(:path "parent.el" :offset 10))
+        (pilish-test--nested-event
+         "tool_execution_start" "file-child" "file-root" :toolName "read" :args '(:path "child.el"))
+        (pilish-test--nested-event
+         "tool_execution_end" "file-child" "file-root" :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "Open other/path.el:99")]))
+        (pilish-test--nested-event
+         "tool_execution_end" "file-root" nil :toolName "read" :isError nil
+         :result '(:content [(:type "text" :text "PARENT-FIRST\n\nPARENT-THIRD\nPARENT-HIDDEN")]))
+        (pilish-test--nested-tab "file-root" '(child . "file-child"))
+        (let* ((root (pilish--nested-tool-owner "file-root"))
+               (overlay (pilish--tool-block-overlay root))
+               (header-start (overlay-start overlay)))
+          (when (= budget 20)
+            (should (string-match-p "PARENT-FIRST\n\nPARENT-THIRD" (buffer-string))))
+          (dotimes (state 2)
+            (goto-char header-start)
+            (should (equal "/tmp/parent.el" (plist-get (pilish--file-target-at-point) :emacs-path)))
+            (goto-char header-start)
+            (search-forward "PARENT-THIRD")
+            (let ((target (pilish--file-target-at-point)))
+              (should (equal "/tmp/parent.el" (plist-get target :emacs-path)))
+              (should (= 12 (plist-get target :line))))
+            (dolist (text '("Child calls" "child.el" "other/path.el:99"))
+              (goto-char header-start)
+              (search-forward text)
+              (backward-char 1)
+              (should-not (pilish--file-target-at-point)))
+            (when (= state 0) (should (pilish--cool-tool-overlay overlay)))))))))
+
 (ert-deftest pilish-test-nested-routes-grandchildren-and-concurrent-roots ()
   "Explicit immediate parents route opaque IDs into exactly two root blocks."
   (with-temp-buffer
@@ -1070,6 +1506,10 @@ execution cannot retain a temporary record on this setup's evaluator stack."
             (should-not (pilish--tool-block-get id)))
           (should (eq a (pilish--nested-tool-owner "opaque-grandchild")))
           (should (eq b (pilish--nested-tool-owner "different-id")))
+          (should (equal (mapcar #'car (pilish-test--nested-summary-lines "root-A"))
+                         '("opaque-child" "opaque-grandchild")))
+          (should (equal (mapcar #'car (pilish-test--nested-summary-lines "root-B"))
+                         '("different-id")))
           (should (gethash "opaque-grandchild"
                            (plist-get pilish--state :active-tools)))
           ;; Missing assistant preview membership is not execution evidence.
@@ -1137,6 +1577,13 @@ execution cannot retain a temporary record on this setup's evaluator stack."
                            '(:content [(:type "text" :text "parent done")]
                              :details (:parent-only t) :isError t)))
             (should (= 2 (length (pilish--tool-block-nested-calls a))))
+            (pilish-test--nested-tab "root-A" '(child . "opaque-grandchild"))
+            (should (= 1 (how-many "grandchild done" (point-min) (point-max))))
+            (should (equal (mapcar #'car (pilish-test--nested-summary-lines "root-A"))
+                           '("opaque-child" "opaque-grandchild")))
+            (goto-char (point-min))
+            (search-forward "grandchild done")
+            (should (eq (pilish--tool-block-overlay a) (pilish--tool-overlay-at-point)))
             (should (= 2 (length (pilish-test--all-tool-overlays))))))))))
 
 ;;; Response Display
@@ -5373,6 +5820,9 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
             (pilish-test--nested-event
              "tool_execution_start" "newer-tool" nil :toolName "bash"
              :args '(:command "newer work"))
+            (let ((inhibit-read-only t))
+              (goto-char (point-max))
+              (insert "\nNEWER-TAIL\n"))
             (setq pilish--followup-queue '("queued newer prompt")
                   pilish--local-user-message "newer input owner")
             (pilish--update-hot-tail-boundary)
@@ -5390,15 +5840,18 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
             (should (equal (pilish--tool-block-result root)
                            '(:content [(:type "text" :text "root finished")]
                              :details (:parent-only "retained") :isError t)))
-            (let ((text (buffer-string))
-                  (phase pilish--activity-phase)
+            (let ((phase pilish--activity-phase)
                   (newer (pilish--tool-block-get "newer-tool")))
               (setq now 20)
               (pilish-test--nested-event
                "tool_execution_end" "late-child" "retained-root"
                :toolName "read" :isError nil
                :result '(:content [(:type "text" :text "late result")]))
-              (should (equal text (buffer-string)))
+              (should (equal (pilish-test--nested-summary-lines "retained-root")
+                             '(("late-child" . "  ✓ read {\"path\":\"original.el\"} 10.0s"))))
+              (goto-char (point-min))
+              (search-forward "  ✓ read")
+              (should (< (point) (save-excursion (search-forward "NEWER-TAIL") (match-beginning 0))))
               (should (equal phase pilish--activity-phase))
               (should (eq 'streaming pilish--status))
               (should (eq newer (pilish--tool-block-get "newer-tool")))
@@ -5414,6 +5867,11 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
               ;; No extra agent_end is needed to release the last obligation.
               (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
                 (pilish-test--invoke-recorded-cooling-timer (pop jobs)))
+              (should (equal (pilish-test--nested-summary-lines "retained-root")
+                             '(("late-child" . "  ✓ read {\"path\":\"original.el\"} 10.0s"))))
+              (goto-char (point-min))
+              (search-forward "  ✓ read")
+              (should (< (point) (save-excursion (search-forward "NEWER-TAIL") (match-beginning 0))))
               (should-not (overlay-buffer overlay))
               (should-not (marker-buffer header))
               (should-not (marker-buffer end))
@@ -5543,6 +6001,11 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
             (should-not (pilish--nested-call-started-at call))
             (should-not (pilish--nested-call-duration-ms call))
             (should-not (pilish--nested-call-result call))
+            (when (timerp pilish--tool-update-flush-timer) (cancel-timer pilish--tool-update-flush-timer))
+            (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+              (pilish--flush-tool-updates (current-buffer)))
+            (should (equal (pilish-test--nested-summary-lines "ordinary")
+                           '(("update-only" . "  … read {\"path\":\"updated.el\"}"))))
             (setq now 50)
             (pilish-test--nested-event
              "tool_execution_end" "update-only" "ordinary"
@@ -5613,8 +6076,7 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
                                  '(:command "actual start arguments")))
                   (setq now 14
                         pilish--local-user-message "accepted owner")
-                  (let ((text (buffer-string))
-                        (phase pilish--activity-phase))
+                  (let ((phase pilish--activity-phase))
                     (pilish-test--nested-event
                      "tool_execution_end" "failed" "stop-root" :toolName "bash"
                      :isError t
@@ -5623,7 +6085,9 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
                      "tool_execution_end" "successful" "stop-root" :toolName "read"
                      :isError nil
                      :result '(:content [(:type "text" :text "success")]))
-                    (should (equal text (buffer-string)))
+                    (should (equal (pilish-test--nested-summary-lines "stop-root" t)
+                                   '(("failed" . "  ✗ bash {\"command\":\"actual start arguments\"} — generic failure")
+                                     ("successful" . "  ✓ read {\"path\":\"successful.el\"}"))))
                     (should (equal phase pilish--activity-phase))
                     (should (eq 'streaming pilish--status))
                     (should pilish--aborted)
@@ -5705,6 +6169,8 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
                    (root (pilish-test--nested-retained-root))
                    (completed (pilish--nested-call-get root "complete-child"))
                    (pending (pilish--nested-call-get root "pending-child"))
+                   (header (pilish--tool-block-header-end root))
+                   (end (pilish--tool-block-end-marker root))
                    (owners pilish--nested-tool-owners))
               ;; An unchanged process is not a teardown.
               (pilish--set-process first)
@@ -5713,6 +6179,13 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
               (pilish-test--nested-event
                "tool_execution_update" "reused-root" nil
                :partialResult '(:content [(:type "text" :text "old queued payload")]))
+              (pilish-test--nested-event
+               "tool_execution_update" "pending-child" "reused-root"
+               :toolName "read" :partialResult '(:content []))
+              (should (timerp pilish--tool-update-flush-timer))
+              (should (eq root (cdr (assoc "reused-root" pilish--pending-tool-updates))))
+              (should (marker-buffer header))
+              (should (marker-buffer end))
               (pcase boundary
                 ('clear (pilish--clear-render-artifacts))
                 ('history
@@ -5723,6 +6196,11 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
                 ('exit (pilish--mark-process-exited first '(:error "Expected exit")))
                 ('kill (set-buffer-modified-p nil) (kill-buffer chat)))
               (should (= 0 (hash-table-count owners)))
+              (should-not pilish--tool-update-flush-timer)
+              (should-not pilish--pending-tool-updates)
+              (should-not (marker-buffer header))
+              (should-not (marker-buffer end))
+              (should-not (pilish--tool-block-folds root))
               (should-not (pilish--tool-block-args root))
               (should-not (pilish--tool-block-result root))
               (should-not (pilish--tool-block-nested-calls root))
@@ -5732,13 +6210,18 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
               (should-not (pilish--nested-call-started-at pending))
               (should-not (pilish--nested-call-pending-end-p pending))
               (when (memq boundary '(replacement exit))
-                (should (eq 'unfinished (pilish--nested-call-status pending))))
+                (should (eq 'unfinished (pilish--nested-call-status pending)))
+                (should (equal (cdr (assoc "pending-child" (pilish-test--nested-summary-lines "reused-root" t)))
+                               "  ? read {\"path\":\"pending.el\"} unfinished"))
+                (should-not (pilish--find-toggle-button-in-region (point-min) (point-max))))
               (when (buffer-live-p chat)
                 (should-not (assoc "reused-root" pilish--pending-tool-updates))
                 (pilish--release-nested-tool-state t)
                 (pilish--release-nested-tool-state t)
                 (should (= 0 (hash-table-count owners)))
                 (let ((text (buffer-string)))
+                  (pilish--release-nested-tool-state t)
+                  (should (equal text (buffer-string)))
                   (funcall old-handler
                            '(:type "tool_execution_end" :toolCallId "pending-child"
                              :parentToolCallId "reused-root" :toolName "read"
@@ -5772,7 +6255,10 @@ When EXPANDED is non-nil, expand its preview before returning the overlay."
                                      (plist-get pilish--state :active-tools))))
                   (should-not (pilish--nested-call-get new-root "stale-child"))
                   (should (pilish--nested-pending-p new-root))
-                  (should (= 2 (length (pilish--tool-block-nested-calls new-root))))))
+                  (should (= 2 (length (pilish--tool-block-nested-calls new-root))))
+                  (let ((rows (pilish-test--nested-summary-lines "reused-root" t)))
+                    (should (equal (mapcar #'car (last rows 2)) '("complete-child" "pending-child")))
+                    (should (equal (cdr (car (last rows))) "  … read {\"path\":\"pending.el\"}")))))
               (unless (buffer-live-p chat)
                 (funcall old-handler
                          '(:type "tool_execution_start" :toolCallId "after-kill"

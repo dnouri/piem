@@ -363,6 +363,27 @@ Automatically cleans up chat and input buffers."
            (progn (pilish) ,@body)
          (pilish-test--kill-session-buffers ,dir)))))
 
+(defun pilish-test--nested-summary-lines (root-id &optional omit-duration)
+  "Return ordered (ID . SUMMARY) rows displayed for ROOT-ID.
+When OMIT-DURATION is non-nil, exclude only duration spans.  Keep duplicate
+nil IDs; buttons and notices are outside summary spans."
+  (let ((position (point-min)) rows)
+    (while (< position (point-max))
+      (let ((end (next-single-property-change
+                  position 'pilish-nested-summary nil (point-max))))
+        (when (and (get-text-property position 'pilish-nested-summary)
+                   (equal root-id (get-text-property position 'pilish-nested-root-id)))
+          (push (cons (get-text-property position 'pilish-nested-call-id)
+                      (if omit-duration
+                          (mapconcat
+                           (lambda (range) (pilish--visible-text (car range) (cdr range)))
+                           (pilish--ranges-excluding-property
+                            position end 'pilish-nested-duration) "")
+                        (pilish--visible-text position end)))
+                rows))
+        (setq position end)))
+    (nreverse rows)))
+
 (defun pilish-test--chat-buffer-name (dir &optional session)
   "Return the chat buffer name for DIR and optional SESSION."
   (pilish--buffer-name :chat dir session))
