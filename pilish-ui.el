@@ -2250,7 +2250,7 @@ Returns nil if MS is nil."
 (defconst pilish--pi-package "@earendil-works/pi-coding-agent"
   "Npm package name for the pi CLI supported by Pilish.")
 
-(defconst pilish--minimum-pi-version "0.85.0"
+(defconst pilish--minimum-pi-version "1.0.0"
   "Minimum supported pi CLI version.")
 
 (defun pilish--pi-install-command ()
@@ -2416,9 +2416,9 @@ warnings for missing dependencies."
   (when (pilish--pi-version-outdated-p version)
     (display-warning
      'pi
-     (format "Pi CLI version %s is older than the supported minimum %s. Upgrade with: %s"
-             version
+     (format "Pilish requires Pi %s or later; found Pi %s. Upgrade with: %s"
              pilish--minimum-pi-version
+             version
              (pilish--pi-install-command))
      :warning)))
 

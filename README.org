@@ -58,14 +58,14 @@ is the shortest path to a working session.
 
 - Emacs 29.1 or later, built with tree-sitter support
 - Node.js 22.19 or later for the Pi CLI
-- [[https://pi.dev][pi coding agent]] =@earendil-works/pi-coding-agent@0.85.0= or later,
+- [[https://pi.dev][pi coding agent]] =@earendil-works/pi-coding-agent@1.0.0= or later,
   installed and in =PATH= on the host where Pi runs
 - Pi CLI authentication: a provider API key, or a one-time =/login=
   run in a terminal (see below)
 - A C compiler if Emacs needs to compile tree-sitter grammars
 
 Upgrade older Pi installations before using Pilish, for example with
-=npm install -g @earendil-works/pi-coding-agent@latest=.  Pi 0.85.0 or
+=npm install -g @earendil-works/pi-coding-agent@latest=.  Pi 1.0.0 or
 later is required for run settlement, queue clearing, and compaction
 abort handling; older protocol versions are not supported.
 
