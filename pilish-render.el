@@ -933,14 +933,17 @@ the unpainted batch."
           (goto-char (point-max))
           (skip-chars-backward " \t\n" last-tool-header)
           (delete-region (point) (point-max))
-          (insert "\n\n" (propertize "[Aborted]" 'face 'error) "\n")))
+          (unless (eq (char-before) ?\n)
+            (insert "\n"))
+          (insert "\n" (propertize "[Aborted]" 'face 'error) "\n")))
       (pilish--clear-followup-queue))
     (pilish--with-scroll-preservation
       (save-excursion
         (goto-char (point-max))
         (skip-chars-backward "\n" last-tool-header)
         (delete-region (point) (point-max))
-        (insert "\n"))))
+        (unless (eq (char-before) ?\n)
+          (insert "\n")))))
   (pilish--set-activity-phase
    (if (eq pilish--status 'sending) "thinking" "idle"))
   (pilish--refresh-header))
@@ -3960,8 +3963,10 @@ Each element is a plist `(:content-index N :tool-call TOOL-CALL)'."
     (nreverse tool-calls)))
 
 (defun pilish--clear-toolcall-preview-body (block)
-  "Clear stale streamed body state from tool preview BLOCK."
-  (unless (pilish--tool-block-execution-backed-p block)
+  "Clear stale streamed body state from ordinary tool preview BLOCK."
+  ;; Compound redraw owns its body replacement, including view capture.
+  (unless (or (pilish--tool-block-compound-p block)
+              (pilish--tool-block-execution-backed-p block))
     (pilish--tool-block-set-last-tail block nil)
     (pilish--tool-block-replace-body block "" nil nil)))
 

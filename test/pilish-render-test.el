@@ -1145,6 +1145,48 @@ execution cannot retain a temporary record on this setup's evaluator stack."
     (should-not (pilish-test--all-tool-overlays))
     (should-not (pilish--nested-tool-owner "corrected"))))
 
+(ert-deftest pilish-test-codemode-final-preview-preserves-script-view ()
+  "Final pre-execution authority preserves both readers' unchanged script views."
+  ;; Clearing the readable preview before compound redraw loses its section
+  ;; geometry.  Presentation must not make the preview execution-backed.
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let* ((call '(:type "toolCall" :id "p" :name "codemode"
+                    :arguments (:code "const first = 1;\nconst MARKER = 2;\nconst OTHER = 3;\nreturn first;")))
+             (selected (selected-window))
+             (other (split-window-right)))
+        (set-window-buffer other (current-buffer))
+        (pilish--handle-toolcall-message-event
+         '(:type "toolcall_start" :contentIndex 0 :id "p" :toolName "codemode"))
+        (pilish--handle-toolcall-message-event
+         (list :type "toolcall_end" :contentIndex 0 :toolCall call))
+        (goto-char (+ 2 (pilish-test--hover-pos "MARKER")))
+        (set-window-start selected (pilish-test--hover-pos "const first") t)
+        (set-window-point other (+ 1 (pilish-test--hover-pos "OTHER")))
+        (set-window-start other (pilish-test--hover-pos "const OTHER") t)
+        (let ((point-before (point))
+              (selected-start (window-start selected))
+              (other-point (window-point other))
+              (other-start (window-start other))
+              (text (buffer-substring-no-properties (point-min) (point-max))))
+          (pilish--reconcile-toolcall-previews
+           (list :role "assistant" :content (vector call)))
+          (should (= point-before (point)))
+          (should (looking-at-p "RKER"))
+          (should (= point-before (window-point selected)))
+          (should (= selected-start (window-start selected)))
+          (should (= other-point (window-point other)))
+          (should (pilish-test--window-point-text-p other "THER"))
+          (should (= other-start (window-start other)))
+          (should (equal text (buffer-substring-no-properties (point-min) (point-max)))))
+        (should-not (pilish--tool-block-execution-backed-p (pilish--tool-block-get "p")))
+        (pilish--reconcile-toolcall-previews '(:role "assistant" :content []))
+        (should-not (pilish-test--all-tool-overlays))
+        (should-not (pilish--nested-tool-owner "p"))))))
+
 (ert-deftest pilish-test-codemode-details-only-preserves-script-and-output ()
   "Metadata snapshots enrich one list without replacing script or parent text."
   ;; Empty publication content must not erase previously received output;
@@ -2480,6 +2522,63 @@ as the top-level structure."
     (pilish--append-to-chat "Some response")
     (pilish--display-agent-end)
     (should (string-suffix-p "response\n" (buffer-string)))))
+
+(ert-deftest pilish-test-agent-end-unexecuted-toolcall-has-single-newline ()
+  "A streamed tool call that never executes ends with one header terminator."
+  ;; The trim boundary retains the header newline; appending another newline
+  ;; would add an empty line to the exact visible stream projection.
+  (pilish-test--with-streaming-assistant
+    (let ((call '(:type "toolCall" :id "unexecuted" :name "bash"
+                  :arguments (:command "echo final"))))
+      (pilish-test--send-assistant-message-update
+       '(:type "toolcall_start" :contentIndex 0 :id "unexecuted" :toolName "bash"))
+      (pilish-test--send-raw-toolcall-delta 0 "{\"command\":\"echo")
+      (pilish-test--send-raw-toolcall-delta 0 " final\"}")
+      (pilish-test--send-assistant-message-update
+       (list :type "toolcall_end" :contentIndex 0 :toolCall call))
+      (pilish--handle-display-event
+       (list :type "message_end" :message (list :role "assistant" :content (vector call))))
+      (let* ((block (pilish--tool-block-get "unexecuted"))
+             (overlay (pilish--tool-block-overlay block)))
+        (should-not (pilish--tool-block-execution-start block))
+        (pilish--handle-display-event '(:type "agent_end" :messages []))
+        (should (equal (buffer-substring-no-properties (overlay-start overlay) (point-max))
+                       "$ echo final\n"))
+        (should (= (marker-position (pilish--tool-block-header-end block)) (point-max)))))))
+
+(ert-deftest pilish-test-agent-end-aborted-empty-tool-preserves-late-child-boundary ()
+  "Abort adds one blank line after an empty retained tool without damaging it."
+  ;; A child update can owe an end before its owner paint.  The empty header's
+  ;; newline must count toward abort spacing and remain a late-redraw boundary.
+  (pilish-test--with-streaming-assistant
+    (unwind-protect
+        (progn
+          (pilish-test--nested-event
+           "tool_execution_start" "p" nil :toolName "runner" :args nil)
+          (pilish-test--nested-event
+           "tool_execution_update" "child" "p" :toolName "read" :args '(:path "late.el")
+           :partialResult '(:content []))
+          (let* ((root (pilish--nested-tool-owner "p"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (header (pilish--tool-block-header-end root)))
+            (should (= (marker-position header)
+                       (marker-position (pilish--tool-block-end-marker root))))
+            (setq pilish--aborted t)
+            (pilish--handle-display-event '(:type "agent_end" :messages []))
+            (should (equal (buffer-substring-no-properties (overlay-start overlay) (point-max))
+                           "runner\n\n[Aborted]\n"))
+            (should (pilish--nested-pending-p root))
+            (should (eq (char-before header) ?\n))
+            (pilish-test--nested-event
+             "tool_execution_end" "child" "p" :toolName "read" :isError nil
+             :result '(:content []))
+            (should (equal (buffer-substring-no-properties (overlay-start overlay) header)
+                           "runner\n"))
+            (should (string-prefix-p "Child calls\n" (buffer-substring-no-properties header (point-max))))
+            (should (equal (pilish-test--nested-summary-lines "p")
+                           '(("child" . "  ✓ read {\"path\":\"late.el\"}"))))
+            (should (string-suffix-p "\n\n[Aborted]\n" (buffer-string)))))
+      (pilish--cancel-tool-update-flush))))
 
 (ert-deftest pilish-test-spacing-blank-line-after-user-header ()
   "User header has a blank line after setext underline."
