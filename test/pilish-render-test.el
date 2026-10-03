@@ -4685,6 +4685,96 @@ The banner is toggled before thinking blocks and outline cycling."
         (should (= 12 (length headings)))
         (should (= 10 (length items)))))))
 
+(ert-deftest pilish-test-startup-banner-pathless-commands-have-no-file-action ()
+  "RET cannot invent a source for pathless commands, even after refontification."
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (pilish-chat-mode)
+      (pilish--set-chat-session-identity "/tmp/project/")
+      (setq pilish--commands
+            (mapcar
+             (lambda (command)
+               (pilish--normalize-command command "/tmp/project/"))
+             (list
+              (list :name "mcp" :source "extension"
+                    :sourceInfo (list :scope "temporary" :path "builtin:mcp"))
+              (list :name "llama" :source "extension"
+                    :sourceInfo (list :scope "temporary"
+                                      :path "builtin:llama.cpp")))))
+      (dolist (command pilish--commands)
+        (should-not (plist-member command :path)))
+      (let ((pilish-visit-file-other-window t)
+            opened refusals)
+        (cl-letf (((symbol-function 'pilish--startup-context-files) #'ignore)
+                  ((symbol-function 'find-file-other-window)
+                   (lambda (path &rest _) (push path opened)))
+                  ((symbol-function 'find-file)
+                   (lambda (path &rest _) (push path opened))))
+          (pilish--display-startup-header)
+          (goto-char (point-min))
+          (search-forward "TAB details")
+          (execute-kbd-macro (kbd "TAB"))
+          (dolist (refontify '(nil t))
+            (when refontify
+              (font-lock-flush)
+              (font-lock-ensure))
+            (dolist (name '("/mcp" "/llama"))
+              (goto-char (point-min))
+              (search-forward name)
+              (backward-char)
+              ;; Collect both phases even on RED; no real root file is opened.
+              (push (condition-case err
+                        (progn (execute-kbd-macro (kbd "RET")) nil)
+                      (user-error (error-message-string err)))
+                    refusals))))
+        (should-not opened)
+        (should (equal (nreverse refusals)
+                       '("No file at point" "No file at point"
+                         "No file at point" "No file at point")))))))
+
+(ert-deftest pilish-test-startup-banner-source-ownership-preserves-file-actions ()
+  "Known sources and ordinary chat paths still open before and after refontifying."
+  (let ((path (make-temp-file "pilish-test-banner source-" nil ".ts" "source\n"))
+        opened)
+    (unwind-protect
+        (save-window-excursion
+          (with-temp-buffer
+            (switch-to-buffer (current-buffer))
+            (pilish-chat-mode)
+            (pilish--set-chat-session-identity "/tmp/project/")
+            (setq pilish--commands
+                  (list (pilish--normalize-command
+                         (list :name "z-local" :source "extension"
+                               :sourceInfo (list :scope "project" :path path))
+                         "/tmp/project/")))
+            (let ((pilish-visit-file-other-window t))
+              (cl-letf (((symbol-function 'pilish--startup-context-files) #'ignore)
+                        ((symbol-function 'find-file-other-window)
+                         (lambda (file &rest _) (push file opened)))
+                        ((symbol-function 'find-file)
+                         (lambda (file &rest _) (push file opened))))
+                (pilish--display-session-history
+                 [(:role "user" :content [(:type "text" :text "Ordinary path: /mcp")]
+                   :timestamp 1704067200000)]
+                 (current-buffer))
+                (goto-char (point-min))
+                (search-forward "TAB details")
+                (execute-kbd-macro (kbd "TAB"))
+                (dolist (refontify '(nil t))
+                  (when refontify
+                    (font-lock-flush)
+                    (font-lock-ensure))
+                  (dolist (name '("/z-local" "/mcp"))
+                    (goto-char (point-min))
+                    (search-forward name)
+                    (backward-char)
+                    (when (equal name "/mcp")
+                      (should-not (get-text-property (point) 'pilish-startup-banner)))
+                    (execute-kbd-macro (kbd "RET")))))))
+          (should (equal (nreverse opened) (list path "/mcp" path "/mcp"))))
+      (delete-file path))))
+
 (ert-deftest pilish-test-startup-banner-source-links-visit-real-files ()
   "RET on each kind of source opens its file, including unusual path names."
   (let ((dir (pilish-test--make-temp-directory "pilish-test-banner-links-"))

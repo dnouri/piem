@@ -7495,12 +7495,16 @@ Return nil outside a cold tool.  Any chat restriction is restored exactly."
 (defun pilish--file-target-at-point ()
   "Return the file target at point, or nil.
 Resolution priority is authoritative hot/cold tool metadata, semantic Markdown
-link ownership, then strict visible text.  Invalid or absent tool metadata never
-falls through.  Semantic lookup is explicitly tri-state, so an owned non-file,
-reference, or malformed link also never falls through to a path-like label.
+link ownership, then strict visible text.  Generated startup banners without
+known source metadata have no file target.  Invalid or absent tool metadata
+never falls through.  Semantic lookup is explicitly tri-state, so an owned
+non-file, reference, or malformed link also never falls through to a path-like
+label.
 Child sections deliberately have no file-navigation authority."
   (let ((section (get-text-property (point) 'pilish-tool-section)))
-    (unless (or (eq section 'children) (eq (car-safe section) 'child))
+    (unless (or (eq section 'children) (eq (car-safe section) 'child)
+                (and (get-text-property (point) 'pilish-startup-banner)
+                     (not (get-text-property (point) 'pilish-startup-source))))
       (if-let* ((overlay (pilish--tool-overlay-at-point)))
           (pilish--tool-file-target overlay)
         (if-let* ((cold-block (pilish--cold-tool-block-at-point)))
