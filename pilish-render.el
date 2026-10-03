@@ -2038,7 +2038,8 @@ HISTORY-P distinguishes saved unfinished work from a stopped live process."
                  (unless (string-empty-p error-text)
                    (concat " — " (pilish--truncate-string
                                   (pilish--tool-display-value-string error-text) 80))))))
-     'pilish-nested-summary t 'pilish-nested-call-id (pilish--nested-call-id call))))
+     'pilish-nested-summary t 'pilish-nested-call-id (pilish--nested-call-id call)
+     'pilish-no-fontify t)))
 
 (defun pilish--insert-compound-tool-button (label section)
   "Insert a fold button with LABEL for compound SECTION."
@@ -2130,10 +2131,11 @@ Reuse ordinary result selection and rich-output insertion directly."
               (block (pilish--tool-block-from-overlay overlay))
               ((pilish--tool-block-compound-p block)))
     (let* ((section (button-get button 'pilish-tool-section))
-           (folds (pilish--tool-block-folds block)))
+           (folds (pilish--tool-block-folds block))
+           (collapsing (member section folds)))
       (setf (pilish--tool-block-folds block)
-            (if (member section folds) (remove section folds) (cons section folds)))
-      (pilish--redraw-compound-tool block))))
+            (if collapsing (remove section folds) (cons section folds)))
+      (pilish--redraw-compound-tool block (and collapsing section)))))
 
 (defun pilish--tool-section-bounds (start end)
   "Return transient (KEY START END) section bounds in START..END."
@@ -2145,22 +2147,29 @@ Reuse ordinary result selection and rich-output insertion directly."
         (setq position next)))
     (nreverse sections)))
 
-(defun pilish--map-tool-section-position (position old-sections new-sections start old-end new-end)
+(defun pilish--map-tool-section-position
+    (position old-sections new-sections start old-end new-end &optional collapse)
   "Map POSITION through transient OLD-SECTIONS and NEW-SECTIONS.
 START, OLD-END and NEW-END delimit the body rewrite.  Outside positions
 use the existing cooling mapper.  A vanished or shortened section clamps
-to its summary, or the list header when the list hides that child."
+to its summary, or the list header when the list hides that child.
+COLLAPSE is (KEY . RETAINED-PREFIX-LENGTH) for an explicitly collapsed
+section: removed text clamps even when the new fold label is longer."
   (if-let* ((old (seq-find (lambda (section)
                             (and (>= position (nth 1 section)) (< position (nth 2 section))))
                           old-sections)))
       (if-let* ((new (assoc (car old) new-sections)))
-          (let ((offset (- position (nth 1 old))))
-            (+ (nth 1 new) (if (< offset (- (nth 2 new) (nth 1 new))) offset 0)))
+          (let ((offset (- position (nth 1 old)))
+                (limit (if (equal (car old) (car collapse))
+                           (cdr collapse)
+                         (- (nth 2 new) (nth 1 new)))))
+            (+ (nth 1 new) (if (< offset limit) offset 0)))
         (or (nth 1 (assq 'children new-sections)) start))
     (pilish--map-tool-cooling-position position start old-end new-end)))
 
-(defun pilish--redraw-compound-tool (block)
-  "Rewrite compound BLOCK within retained bounds and preserve each reader's view."
+(defun pilish--redraw-compound-tool (block &optional collapsing-section)
+  "Rewrite compound BLOCK within retained bounds and preserve each reader's view.
+COLLAPSING-SECTION identifies the fold whose removed text must clamp."
   (when-let* ((overlay (pilish--tool-block-overlay block))
               ((eq (overlay-buffer overlay) (current-buffer)))
               (header (pilish--tool-block-header-end block))
@@ -2168,6 +2177,9 @@ to its summary, or the list header when the list hides that child."
     (let* ((start (marker-position header))
            (old-end (marker-position end))
            (old-sections (pilish--tool-section-bounds start old-end))
+           (collapse-text
+            (when-let* ((section (and collapsing-section (assoc collapsing-section old-sections))))
+              (buffer-substring-no-properties (nth 1 section) (nth 2 section))))
            (view (pilish--capture-tool-cooling-view))
            (inhibit-read-only t))
       (save-excursion
@@ -2180,12 +2192,21 @@ to its summary, or the list header when the list hides that child."
         (pilish--tool-block-refresh-overlay block)
         (pilish--font-lock-ensure-excluding-property start (point) 'pilish-no-fontify))
       (let* ((new-end (marker-position end))
-             (new-sections (pilish--tool-section-bounds start new-end)))
+             (new-sections (pilish--tool-section-bounds start new-end))
+             (collapse
+              (when-let* ((section (and collapse-text (assoc collapsing-section new-sections))))
+                (let ((comparison
+                       (compare-strings collapse-text nil nil
+                                        (buffer-substring-no-properties (nth 1 section) (nth 2 section))
+                                        nil nil)))
+                  ;; A mismatch is a signed, one-based character position.
+                  (cons collapsing-section
+                        (if (eq comparison t) (length collapse-text) (1- (abs comparison))))))))
         (pilish--restore-tool-cooling-view
          view start old-end new-end
          (lambda (position)
            (pilish--map-tool-section-position
-            position old-sections new-sections start old-end new-end)))))))
+            position old-sections new-sections start old-end new-end collapse)))))))
 
 (defun pilish--release-nested-tool-block (block)
   "Release BLOCK's retained routing, payloads, fold choices and markers."
@@ -2587,8 +2608,9 @@ absent or previously owned help.  Links, images and buttons keep precedence."
 (defun pilish--fontify-with-hover-help (function start end &rest args)
   "Fontify START..END with FUNCTION and ARGS, letting native help win.
 Mask fallback at the native unfontification seam: its bounds already include
-line/multiline expansion, unlike the original fontification request.  Restore
-cached fallback after native links have supplied their more-specific help."
+line/multiline expansion, unlike the original fontification request.  Repair
+literal tool metadata in the actual fontified bounds, then restore cached
+fallback after native links have supplied their more-specific help."
   (let ((unfontify font-lock-unfontify-region-function)
         ranges)
     (let ((font-lock-unfontify-region-function
@@ -2609,7 +2631,14 @@ cached fallback after native links have supplied their more-specific help."
              (funcall unfontify beg end))))
       (with-silent-modifications
         (unwind-protect
-            (apply function start end args)
+            (let ((result (apply function start end args)))
+              (save-restriction
+                (widen)
+                (pcase result
+                  (`(jit-lock-bounds ,beg . ,end)
+                   (pilish--restore-tool-properties beg end))
+                  (_ (pilish--restore-tool-properties start end))))
+              result)
           (save-restriction
             (widen)
             (dolist (range ranges)
@@ -7642,12 +7671,17 @@ Display-only table decoration is applied after the content is stable."
 ;;;; Tool Property Restoration
 
 (defun pilish--restore-tool-properties (beg end)
-  "Restore tool header faces after tree-sitter fontification in BEG..END.
-Tree-sitter markdown applies `invisible' and `face' properties to markup
-patterns in tool headers (for example, `$ echo **hello**').  This strips
-that markdown damage and restores the intended `font-lock-face' values for
-all overlapping tool headers, live or finalized."
-  (let ((inhibit-read-only t))
+  "Restore literal tool metadata after tree-sitter fontification in BEG..END.
+Strip Markdown hiding, faces and link buttons from bounded child summaries,
+including cold summaries without overlays.  Restore `font-lock-face' values
+for all overlapping tool headers, live or finalized."
+  (let ((inhibit-read-only t)
+        (pos beg))
+    (while (setq pos (text-property-not-all pos end 'pilish-nested-summary nil))
+      (let ((limit (next-single-property-change pos 'pilish-nested-summary nil end)))
+        (md-ts--remove-link-button-properties pos limit)
+        (remove-text-properties pos limit '(invisible nil display nil face nil))
+        (setq pos limit)))
     (dolist (ov (pilish--tool-block-overlays-in-region beg end))
       (when-let* ((ov-start (overlay-start ov))
                   (ov-end (overlay-end ov))

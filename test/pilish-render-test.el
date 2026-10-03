@@ -1194,6 +1194,120 @@ execution cannot retain a temporary record on this setup's evaluator stack."
             (should (equal text (buffer-string)))))
         (should (= 1 (length (pilish-test--all-tool-overlays))))))))
 
+(defun pilish-test--nested-markup-summary ()
+  "Render a completed compound tool with Markdown-bearing child metadata."
+  (pilish-test--nested-event
+   "tool_execution_start" "literal-root" nil :toolName "runner" :args '(:job "literal"))
+  (pilish-test--nested-event
+   "tool_execution_start" "literal-child" "literal-root" :toolName "bash"
+   :args '(:command "echo **danger** [target](somewhere) `quoted`"))
+  (pilish-test--nested-event
+   "tool_execution_end" "literal-child" "literal-root" :toolName "bash" :isError t
+   :result '(:content [(:type "text" :text "denied **retry** [help](elsewhere) `later`")]))
+  (pilish-test--nested-event
+   "tool_execution_end" "literal-root" nil :toolName "runner" :isError nil
+   :result '(:content [(:type "text" :text "PARENT-OUTPUT")]))
+  (pilish--tool-block-overlay (pilish--nested-tool-owner "literal-root")))
+
+(ert-deftest pilish-test-nested-summary-metadata-stays-literal-after-refontification ()
+  "Real Markdown fontification cannot hide or activate child argument/error text."
+  ;; Losing literal-text protection changes the received command/error and
+  ;; gives its apparent links actions unrelated to compound output folds.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-markup-summary)
+    (pilish--append-to-chat "\nNormal **rendered** [outside](https://example.org/outside).\n")
+    (dotimes (pass 3)
+      (if (= pass 2)
+          ;; md-ts expands this tiny request to the entire metadata line.
+          (let ((start (text-property-any (point-min) (point-max) 'pilish-nested-summary t)))
+            (font-lock-fontify-region start (1+ start)))
+        (font-lock-flush)
+        (font-lock-ensure))
+      (save-excursion
+        (goto-char (point-min))
+        (search-forward "outside")
+        (should (button-at (match-beginning 0))))
+      (should (equal (pilish-test--nested-summary-lines "literal-root" t)
+                     '(("literal-child" . "  ✗ bash {\"command\":\"echo **danger** [target](somewhere) `quoted`\"} — denied **retry** [help](elsewhere) `later`"))))
+      (let* ((start (text-property-any (point-min) (point-max) 'pilish-nested-summary t))
+             (end (next-single-property-change start 'pilish-nested-summary nil (point-max))))
+        (should-not (text-property-not-all start end 'button nil))))))
+
+(ert-deftest pilish-test-nested-cold-summary-stays-literal-and-inert-after-refontification ()
+  "Cooling leaves literal metadata with no links after real refontification."
+  ;; Removing current buttons is insufficient when md-ts can recreate them.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((overlay (pilish-test--nested-markup-summary)))
+      (font-lock-ensure)
+      (should (pilish--cool-tool-overlay overlay)))
+    (dotimes (pass 3)
+      ;; Check the frozen display immediately and after repeated fontification.
+      (unless (= pass 0)
+        (font-lock-flush)
+        (font-lock-ensure))
+      (should-not (text-property-not-all (point-min) (point-max) 'button nil))
+      (should (equal (pilish-test--nested-summary-lines "literal-root" t)
+                     '(("literal-child" . "  ✗ bash {\"command\":\"echo **danger** [target](somewhere) `quoted`\"} — denied **retry** [help](elsewhere) `later`")))))))
+
+(ert-deftest pilish-test-nested-short-output-collapse-clamps-removed-content ()
+  "Public collapse clamps hidden text even when its replacement is longer."
+  ;; A new-section-length check maps HIDDEN into the closing fence instead
+  ;; of the section anchor.  Retained preview text and siblings must not move.
+  (let ((buffer (generate-new-buffer " *pi-nested-short-collapse*"))
+        (pilish-quit-without-confirmation t)
+        (pilish-tool-preview-lines 1))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer buffer)
+          (pilish-chat-mode)
+          (pilish-test--nested-event
+           "tool_execution_start" "short-root" nil :toolName "runner" :args '(:job "short"))
+          (pilish-test--nested-event
+           "tool_execution_start" "stable-child" "short-root" :toolName "read" :args '(:path "stable.el"))
+          (pilish-test--nested-event
+           "tool_execution_end" "stable-child" "short-root" :toolName "read" :isError nil
+           :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
+          (pilish-test--nested-event
+           "tool_execution_end" "short-root" nil :toolName "runner" :isError nil
+           :result '(:content [(:type "text" :text "FIRST\nHIDDEN")]))
+          (pilish-test--nested-tab "short-root" '(child . "stable-child"))
+          (pilish-test--nested-tab "short-root" 'output)
+          (let* ((root (pilish--nested-tool-owner "short-root"))
+                 (overlay (pilish--tool-block-overlay root))
+                 (start (marker-position (pilish--tool-block-header-end root)))
+                 (old-output (assq 'output (pilish--tool-section-bounds start (overlay-end overlay))))
+                 (selected (selected-window))
+                 (other (split-window-right)))
+            (set-window-buffer other buffer)
+            (cl-labels ((position (text)
+                          (save-excursion (goto-char (point-min)) (search-forward text) (match-beginning 0)))
+                        (collapse ()
+                          (button-activate
+                           (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))))
+              (goto-char (position "HIDDEN"))
+              (set-window-start selected (position "FIRST") t)
+              (set-window-point other (position "UNCHANGED-OFFSET"))
+              (set-window-start other (position "UNCHANGED-OFFSET") t)
+              (collapse)
+              (let ((new-output (assq 'output (pilish--tool-section-bounds start (overlay-end overlay)))))
+                (should (> (- (nth 2 new-output) (nth 1 new-output))
+                           (- (nth 2 old-output) (nth 1 old-output)))))
+              (should (= (point) start))
+              (should (= (window-point selected) start))
+              (should (equal "FIRST" (pilish-test--window-start-line selected)))
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+              (should (equal "UNCHANGED-OFFSET" (pilish-test--window-start-line other)))
+              ;; The still-visible prefix keeps its exact offset on collapse.
+              (pilish-test--nested-tab "short-root" 'output)
+              (goto-char (+ (position "FIRST") 2))
+              (collapse)
+              (should (looking-at-p "RST"))
+              (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET")))))
+      (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
 (ert-deftest pilish-test-nested-mid-buffer-rewrite-preserves-view ()
   "Late expansion keeps two windows' text, section offsets and tail following."
   ;; Restoring unmapped positions or body-wide offsets moves readers after
