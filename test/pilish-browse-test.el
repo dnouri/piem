@@ -5641,7 +5641,13 @@ and non-munged directories.  scope=current scans one directory."
         (progn
           (make-directory flat)
           (make-directory nested t)
-          (should (= (call-process "git" nil nil nil "-C" project "init" "-q") 0))
+          ;; Git hook settings must not redirect this fixture's initialization.
+          (let ((process-environment
+                 (cl-remove-if (lambda (entry) (string-prefix-p "GIT_" entry))
+                               process-environment)))
+            (should (= (call-process "git" nil nil nil
+                                     "-C" project "init" "-q")
+                       0)))
           (pilish-test--write-session-file path-a "Nested work" nested)
           ;; A separate pi cwd inside the same Git project is not current.
           (pilish-test--write-session-file path-b "Root work" project)
