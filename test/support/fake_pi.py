@@ -625,7 +625,7 @@ class FakePiHarness:
         self._respond(command, data={"cancelled": False})
 
     def _handle_set_session_name(self, command: JsonDict) -> None:
-        """Persist a session name to the real session file."""
+        """Append a name, buffering it until the first conversation message."""
         if not isinstance(raw_name := command.get("name"), str):
             self._fail(command, "Session name must be a string")
             return
@@ -1690,7 +1690,7 @@ class FakePiHarness:
             self.state.message_count = snapshot["messageCount"]
 
     def _append_session_entry(self, payload: JsonDict, *, prefix: str) -> str:
-        """Persist one complete v3 entry, advance the leaf, and refresh projections."""
+        """Record a v3 entry, flushing buffered records on first conversation."""
         with self._session_lock:
             entry_id = self._entry_id(prefix)
             timestamp_ms = max(now_ms(), self._last_entry_timestamp_ms + 1)
@@ -1704,25 +1704,29 @@ class FakePiHarness:
                 {key: value for key, value in payload.items() if key != "type"}
             )
             entries = [*self._session_entries, entry]
-            snapshot = self._build_session_snapshot(
-                Path(self.state.session_file), self._session_header, entries
-            )
-            with Path(self.state.session_file).open(
-                "a", encoding="utf-8", newline="\n"
-            ) as handle:
-                handle.write(self._encode_json(entry) + "\n")
+            path = Path(self.state.session_file)
+            snapshot = self._build_session_snapshot(path, self._session_header, entries)
+            if path.exists():
+                with path.open("a", encoding="utf-8", newline="\n") as handle:
+                    handle.write(self._encode_json(entry) + "\n")
+            elif entry["type"] == "message" and entry["message"]["role"] in (
+                "user", "assistant"
+            ):
+                with path.open("x", encoding="utf-8", newline="\n") as handle:
+                    for record in (self._session_header, *entries):
+                        handle.write(self._encode_json(record) + "\n")
             self._apply_session_snapshot(snapshot)
             return entry_id
 
     def _reset_session_file(self) -> None:
-        """Create and install a fresh valid empty v3 session file."""
-        self._message_serial = 0
-        session_id = f"fake-{uuid.uuid4().hex[:8]}"
-        path = self._session_root / f"{session_id}.jsonl"
-        header = self._new_session_header(session_id, cwd=str(Path.cwd().resolve()))
-        snapshot = self._build_session_snapshot(path, header, [])
-        path.write_bytes((self._encode_json(header) + "\n").encode("utf-8"))
-        self._apply_session_snapshot(snapshot)
+        """Allocate a fresh v3 header and path in memory without writing bytes."""
+        with self._session_lock:
+            self._message_serial = 0
+            session_id = f"fake-{uuid.uuid4().hex[:8]}"
+            path = self._session_root / f"{session_id}.jsonl"
+            header = self._new_session_header(session_id, cwd=str(Path.cwd().resolve()))
+            snapshot = self._build_session_snapshot(path, header, [])
+            self._apply_session_snapshot(snapshot)
 
     def _entry_id(self, prefix: str) -> str:
         """Return a deterministic entry ID that does not collide after switches."""

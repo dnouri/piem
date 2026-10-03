@@ -8,7 +8,89 @@
 ;;; Code:
 
 (require 'ert)
+(require 'seq)
 (require 'pilish-integration-test-common)
+
+(pilish-integration-deftest
+    (session-contract-first-user-persists)
+  "The first user persists a named session even if its assistant is interrupted."
+  (let* ((initial (pilish--rpc-sync proc '(:type "get_state")
+                                  pilish-test-rpc-timeout))
+         (session-file (plist-get (plist-get initial :data) :sessionFile))
+         (user-end nil)
+         (got-agent-settled nil))
+    (should (eq (plist-get initial :success) t))
+    (should (stringp session-file))
+    (should-not (file-exists-p session-file))
+    (let ((response (pilish--rpc-sync
+                     proc '(:type "set_session_name" :name "Named before first user")
+                     pilish-test-rpc-timeout)))
+      (should (eq (plist-get response :success) t)))
+    (let* ((response (pilish--rpc-sync proc '(:type "get_state")
+                                    pilish-test-rpc-timeout))
+           (named (plist-get response :data)))
+      (should (eq (plist-get response :success) t))
+      (should (equal (plist-get named :sessionFile) session-file))
+      (should (equal (plist-get named :sessionName) "Named before first user"))
+      (should-not (file-exists-p session-file)))
+    (push (lambda (event)
+            (pcase (plist-get event :type)
+              ("message_end"
+               (when (equal (plist-get (plist-get event :message) :role) "user")
+                 (setq user-end event)))
+              ("agent_settled" (setq got-agent-settled t))))
+          pilish--event-handlers)
+    (let ((response (pilish--rpc-sync
+                     proc `(:type "prompt"
+                            :message ,pilish-integration--prompt-abort-message)
+                     pilish-test-rpc-timeout)))
+      (should (eq (plist-get response :success) t)))
+    (should (pilish-test-wait-until
+             (lambda () user-end)
+             pilish-test-rpc-timeout pilish-test-poll-interval proc))
+    ;; Pi emits the user event before appending it.  Poll complete user bytes
+    ;; outside the event callback; an existing header alone is not enough.
+    (should (pilish-test-wait-until
+             (lambda ()
+               (and (file-exists-p session-file)
+                    (with-temp-buffer
+                      (insert-file-contents session-file)
+                      (re-search-forward
+                       "\"role\"[[:space:]]*:[[:space:]]*\"user\"[^\n]*\n" nil t))))
+             pilish-test-rpc-timeout 0.01 proc))
+    (let ((response (pilish--rpc-sync proc '(:type "abort")
+                                    pilish-test-rpc-timeout)))
+      (should (eq (plist-get response :success) t)))
+    (should (pilish-test-wait-until
+             (lambda () got-agent-settled)
+             pilish-test-rpc-timeout pilish-test-poll-interval proc))
+    (let* ((records (with-temp-buffer
+                      (insert-file-contents session-file)
+                      (mapcar (lambda (line)
+                                (json-parse-string line :object-type 'plist
+                                                   :array-type 'array))
+                              (split-string (buffer-string) "\n" t))))
+           (entries (cdr records))
+           (names (seq-filter
+                   (lambda (entry) (equal (plist-get entry :type) "session_info"))
+                   entries))
+           (users (seq-filter
+                   (lambda (entry)
+                     (and (equal (plist-get entry :type) "message")
+                          (equal (plist-get (plist-get entry :message) :role) "user")))
+                   entries)))
+      (should (equal (plist-get (car records) :type) "session"))
+      (should (= (plist-get (car records) :version) 3))
+      (should (= (seq-count (lambda (entry)
+                             (equal (plist-get entry :type) "session"))
+                           records)
+                 1))
+      (should (= (length names) 1))
+      (should (equal (plist-get (car names) :name) "Named before first user"))
+      (should (= (length users) 1))
+      (should (equal (pilish-integration--message-text
+                      (plist-get (car users) :message))
+                     pilish-integration--prompt-abort-message)))))
 
 (pilish-integration-deftest
     (session-contract-name-persists-across-session-file)

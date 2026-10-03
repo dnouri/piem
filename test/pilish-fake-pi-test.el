@@ -604,7 +604,8 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
       (should (equal (plist-get response :type) "response"))
       (should (eq (plist-get response :success) t))
       (should (equal (plist-get response :command) "get_state"))
-      (should (file-exists-p session-file)))))
+      (should (stringp session-file))
+      (should-not (file-exists-p session-file)))))
 
 (ert-deftest pilish-fake-pi-test-requires-newline-before-eof ()
   "EOF alone must not act as an implicit JSONL record delimiter."
@@ -717,6 +718,116 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
       (should (equal (plist-get model :provider) "fake-provider"))
       (should (equal (plist-get model :id) "fake-large"))
       (should (equal (plist-get data :thinkingLevel) "high")))))
+
+(ert-deftest pilish-fake-pi-test-first-user-materializes-session ()
+  "The first user flushes the header and buffered name before any assistant ends."
+  (let ((scenario-dir (make-temp-file "pilish-fake-pi-first-user-" t)))
+    (unwind-protect
+        (progn
+          (pilish-fake-pi-test--write-jsonl-file
+           (expand-file-name "first-user.json" scenario-dir)
+           '((:description "First-user persistence without a completed assistant"
+              :commands []
+              :prompt (:type "text_stream" :assistant_text "Not completed"
+                       :chunk_count 2 :delay_ms 10000 :echo_user t))))
+          (pilish-fake-pi-test-with-process
+              (proc "first-user" "--scenario-dir" scenario-dir)
+            (let* ((state (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+                   (data (plist-get state :data))
+                   (session-file (plist-get data :sessionFile)))
+              (should (stringp session-file))
+              (should-not (file-exists-p session-file))
+              (should (eq (plist-get (pilish-fake-pi-test--rpc
+                                     proc '(:type "set_session_name"
+                                            :name "Named before conversation"))
+                                    :success)
+                          t))
+              (let ((named (plist-get (pilish-fake-pi-test--rpc
+                                      proc '(:type "get_state"))
+                                     :data)))
+                (should (equal (plist-get named :sessionFile) session-file))
+                (should (equal (plist-get named :sessionName)
+                               "Named before conversation"))
+                (should-not (file-exists-p session-file)))
+              (should (eq (plist-get (pilish-fake-pi-test--rpc
+                                     proc '(:type "prompt" :message "Keep this user"))
+                                    :success)
+                          t))
+              (let* ((events (pilish-fake-pi-test--collect-until
+                              proc (lambda (event)
+                                     (and (equal (plist-get event :type) "message_end")
+                                          (equal (plist-get (plist-get event :message)
+                                                            :role)
+                                                 "user")))))
+                     (records (pilish-fake-pi-test--read-jsonl-file session-file))
+                     (entries (seq-subseq records 1)))
+                (should-not (pilish-fake-pi-test--message-events
+                             events "message_end" "assistant"))
+                (should (= (length records) 3))
+                (pilish-fake-pi-test--assert-valid-v3-records
+                 (aref records 0) entries)
+                (should (equal (plist-get (aref records 0) :id)
+                               (plist-get data :sessionId)))
+                (should (equal (mapcar (lambda (entry) (plist-get entry :type))
+                                       (append entries nil))
+                               '("session_info" "message")))
+                (should (equal (plist-get (aref entries 0) :name)
+                               "Named before conversation"))
+                (should (equal (plist-get (aref entries 1) :parentId)
+                               (plist-get (aref entries 0) :id)))
+                (should (equal (plist-get (plist-get (aref entries 1) :message) :role)
+                               "user"))
+                (should (equal (plist-get (plist-get (aref entries 1) :message) :content)
+                               [(:type "text" :text "Keep this user")]))
+                (pilish-fake-pi-test--send
+                 proc '(:id "abort-first-user" :type "abort"))
+                (let* ((abort-events
+                        (pilish-fake-pi-test--collect-until
+                         proc (lambda (event)
+                                (equal (plist-get event :id) "abort-first-user"))))
+                       (response (car (last abort-events))))
+                  (should (eq (plist-get response :success) t))
+                  (should-not (pilish-fake-pi-test--message-events
+                               abort-events "message_end" "assistant")))
+                (should (equal (pilish-fake-pi-test--read-jsonl-file session-file)
+                               records))))))
+      (delete-directory scenario-dir t))))
+
+(ert-deftest pilish-fake-pi-test-setup-only-does-not-materialize-session ()
+  "Naming and custom-only messages update memory without creating a session file."
+  (pilish-fake-pi-test-with-process (proc "extension-message")
+    (let* ((state (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+           (session-file (plist-get (plist-get state :data) :sessionFile)))
+      (should (stringp session-file))
+      (should-not (file-exists-p session-file))
+      (should (eq (plist-get (pilish-fake-pi-test--rpc
+                             proc '(:type "set_session_name" :name "Setup only"))
+                            :success)
+                  t))
+      (let ((named (plist-get (pilish-fake-pi-test--rpc proc '(:type "get_state"))
+                             :data)))
+        (should (equal (plist-get named :sessionName) "Setup only"))
+        (should (= (plist-get named :messageCount) 0))
+        (should-not (file-exists-p session-file)))
+      (pilish-fake-pi-test--send
+       proc '(:id "custom-only" :type "prompt" :message "/test-message"))
+      (let ((events (pilish-fake-pi-test--collect-until
+                     proc (lambda (event)
+                            (equal (plist-get event :id) "custom-only")))))
+        (should (eq (plist-get (car (last events)) :success) t)))
+      (let* ((after (plist-get (pilish-fake-pi-test--rpc proc '(:type "get_state"))
+                              :data))
+             (entries-response (pilish-fake-pi-test--rpc proc '(:type "get_entries")))
+             (entries (plist-get (plist-get entries-response :data) :entries)))
+        (should (equal (plist-get after :sessionFile) session-file))
+        (should (equal (plist-get after :sessionName) "Setup only"))
+        (should (= (plist-get after :messageCount) 1))
+        (should (equal (mapcar (lambda (entry) (plist-get entry :type))
+                               (append entries nil))
+                       '("session_info" "custom_message")))
+        (should (equal (plist-get (aref entries 1) :content)
+                       "Test message from extension"))
+        (should-not (file-exists-p session-file))))))
 
 (ert-deftest pilish-fake-pi-test-generated-session-is-valid-v3-with-entry-rpcs ()
   "A normal fake prompt persists valid v3 entries and exposes their raw IDs."
@@ -1962,7 +2073,7 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
         (should (equal (plist-get (aref messages 1) :text) "second turn"))))))
 
 (ert-deftest pilish-fake-pi-test-new-session-resets-count-and-path ()
-  "new_session resets state and returns a fresh real session file path."
+  "new_session resets state and allocates a fresh path without writing bytes."
   (pilish-fake-pi-test-with-process (proc "prompt-lifecycle")
     (pilish-fake-pi-test--send proc '(:type "prompt" :message "before reset"))
     (should (equal (plist-get (pilish-fake-pi-test--pop-object proc) :command)
@@ -1974,6 +2085,7 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
            (before-data (plist-get before-state :data))
            (before-file (plist-get before-data :sessionFile)))
       (should (> (plist-get before-data :messageCount) 0))
+      (should (file-exists-p before-file))
       (pilish-fake-pi-test--send proc '(:type "new_session"))
       (let ((response (pilish-fake-pi-test--pop-object proc)))
         (should (eq (plist-get response :success) t))
@@ -1983,8 +2095,10 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
              (after-data (plist-get after-state :data))
              (after-file (plist-get after-data :sessionFile)))
         (should (equal (plist-get after-data :messageCount) 0))
+        (should (stringp after-file))
         (should (not (equal after-file before-file)))
-        (should (file-exists-p after-file))))))
+        (should-not (file-exists-p after-file))
+        (should (file-exists-p before-file))))))
 
 (ert-deftest pilish-fake-pi-test-new-session-waits-for-old-run-to-stop ()
   "new_session should not leak stale streaming events after it succeeds."

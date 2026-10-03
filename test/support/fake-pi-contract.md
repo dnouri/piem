@@ -298,9 +298,10 @@ Required behavior:
 
 - `set_session_name` requires a string, collapses CR/LF runs to one space,
   trims it, and succeeds only when the result is nonempty
-- fake writes a real valid v3 session file on disk
 - naming appends a complete `session_info` entry with `id`, `parentId`,
-  `timestamp`, and `name`
+  `timestamp`, and `name`; `get_state.sessionName` updates immediately
+- before the first conversation message, that entry stays in memory without
+  creating the allocated session file; after materialization it appends to disk
 - latest `session_info` wins; whitespace is trimmed and a blank/null latest name
   clears `sessionName`
 
@@ -339,9 +340,21 @@ the CLI so a human can inspect the UI before responding.
 
 ## Valid v3 session files and inspection RPCs
 
-The fake creates real temporary files, not invented paths.  Generated files use
-strict LF-delimited UTF-8 JSONL.  The switch loader also accepts blank lines and
-an optional CR before LF, but every nonblank line must be strict JSON.
+Fresh startup and `new_session` allocate a string `sessionFile` path and a v3
+header in memory, but leave the file absent. Naming and custom-only messages
+update the in-memory entries and inspection RPCs without writing bytes. The
+first user **or assistant** message creates the file exclusively and flushes
+the header plus all accumulated entries once. Later entries append normally.
+This keeps the first user on disk even if its assistant never completes.
+File existence is checked under the existing session lock; there is no second
+persistence-state owner.
+
+Materialized files use strict LF-delimited UTF-8 JSONL. The switch loader also
+accepts blank lines and an optional CR before LF, but every nonblank line must
+be strict JSON. Real Pi emits `message_end` before appending that message;
+consumers must poll disk bytes rather than assume the event is a write barrier.
+The fake's ordinary messages are persisted before their end events, so the
+shared contract tests explicitly allow the real ordering.
 
 ### Header and entry invariants
 
@@ -483,10 +496,13 @@ A deliberate deterministic initialization rule supports resume edge tests: a
 nonexistent absolute target and an existing zero-byte regular file are
 materialized as a valid header-only v3 session, then selected.  Missing parent
 directories are created.  The result has empty entries/tree/messages, null
-leaf, no session name, and message count zero.  This is not exact Pi 0.84.2
-startup behavior: Pi materializes an existing empty file but leaves a missing
-file absent until later persistence, and runtime setup may append a thinking
-level entry.  The fake's header-only result is the bounded edge-test contract.
+leaf, no session name, and message count zero. This explicitly materialized
+switch target is a deliberate deviation from Pi 1.0.0: Pi initializes an
+existing empty file but leaves a missing file absent until its first
+conversation message, and runtime setup may append bookkeeping entries.
+The fake's header-only result is the bounded edge-test contract, distinct
+from normal startup and `new_session`. Subsequent entries append to these
+materialized switch targets even without a conversation.
 
 ## Backend helper API
 
