@@ -3669,6 +3669,62 @@ since we don't display them locally. Let pi's message_start handle it."
         (should (equal (plist-get response-sent :id) "req-5"))
         (should (equal (plist-get response-sent :value) "user input"))))))
 
+(ert-deftest pilish-test-extension-ui-input-placeholder-is-not-initial-text ()
+  "Ordinary paste submits only pasted text, keeping any hint in the prompt."
+  (dolist (case '(("John Doe" "Enter name: (John Doe) ")
+                  (nil "Enter name: ")
+                  ("" "Enter name: ")))
+    (pcase-let ((`(,placeholder ,expected-prompt) case))
+      (let (read-args sent messages)
+        (cl-letf (((symbol-function 'read-string)
+                   (lambda (&rest args)
+                     (setq read-args args)
+                     (concat (nth 1 args) "PASTED_TEXT")))
+                  ((symbol-function 'pilish--send-extension-ui-response)
+                   (lambda (proc response)
+                     (push (list proc response) sent)))
+                  ((symbol-function 'message)
+                   (lambda (fmt &rest args)
+                     (when fmt (push (apply #'format fmt args) messages)))))
+          (pilish--extension-ui-input
+           (list :type "extension_ui_request" :id "req-paste" :method "input"
+                 :title "Enter name:" :placeholder placeholder)
+           'test-proc))
+        (should (equal (plist-get (cadar sent) :value) "PASTED_TEXT"))
+        (should (equal sent
+                       '((test-proc (:type "extension_ui_response"
+                                     :id "req-paste" :value "PASTED_TEXT")))))
+        (should (equal (car read-args) expected-prompt))
+        (should-not (nth 1 read-args))
+        (should-not (nth 3 read-args))
+        (should-not messages)))))
+
+(ert-deftest pilish-test-extension-ui-input-empty-does-not-submit-placeholder ()
+  "Untouched input submits an empty string, never its hint or a default."
+  (let (read-args sent messages)
+    (cl-letf (((symbol-function 'read-string)
+               (lambda (&rest args)
+                 (setq read-args args)
+                 (or (nth 1 args) (nth 3 args) "")))
+              ((symbol-function 'pilish--send-extension-ui-response)
+               (lambda (proc response)
+                 (push (list proc response) sent)))
+              ((symbol-function 'message)
+               (lambda (fmt &rest args)
+                 (when fmt (push (apply #'format fmt args) messages)))))
+      (pilish--extension-ui-input
+       '(:type "extension_ui_request" :id "req-empty" :method "input"
+         :title "Enter name:" :placeholder "John Doe")
+       'test-proc))
+    (should (equal (plist-get (cadar sent) :value) ""))
+    (should (equal sent
+                   '((test-proc (:type "extension_ui_response"
+                                 :id "req-empty" :value "")))))
+    (should (equal (car read-args) "Enter name: (John Doe) "))
+    (should-not (nth 1 read-args))
+    (should-not (nth 3 read-args))
+    (should-not messages)))
+
 (ert-deftest pilish-test-extension-ui-set-editor-text ()
   "extension_ui_request set_editor_text inserts text into input buffer."
   (let ((input-buf (get-buffer-create "*pi-test-input*")))

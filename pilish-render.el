@@ -1284,7 +1284,10 @@ completes normally."
      (let* ((id (plist-get event :id))
             (title (plist-get event :title))
             (placeholder (plist-get event :placeholder))
-            (value (read-string (concat title " ") placeholder)))
+            (prompt (if (and placeholder (not (string-empty-p placeholder)))
+                        (format "%s (%s) " title placeholder)
+                      (concat title " ")))
+            (value (read-string prompt)))
        (list :type "extension_ui_response"
              :id id
              :value value)))))
