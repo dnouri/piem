@@ -1251,10 +1251,10 @@ execution cannot retain a temporary record on this setup's evaluator stack."
       (should (equal (pilish-test--nested-summary-lines "literal-root" t)
                      '(("literal-child" . "  ✗ bash {\"command\":\"echo **danger** [target](somewhere) `quoted`\"} — denied **retry** [help](elsewhere) `later`")))))))
 
-(ert-deftest pilish-test-nested-short-output-collapse-clamps-removed-content ()
-  "Public collapse clamps hidden text even when its replacement is longer."
-  ;; A new-section-length check maps HIDDEN into the closing fence instead
-  ;; of the section anchor.  Retained preview text and siblings must not move.
+(defun pilish-test--nested-short-output-collapse-view (output target retained-p)
+  "Collapse OUTPUT with point on TARGET and check both readers' views.
+With RETAINED-P, point must stay on FIRST; otherwise it must clamp to the
+section anchor.  Preview text and an expanded sibling retain their views."
   (let ((buffer (generate-new-buffer " *pi-nested-short-collapse*"))
         (pilish-quit-without-confirmation t)
         (pilish-tool-preview-lines 1))
@@ -1272,7 +1272,7 @@ execution cannot retain a temporary record on this setup's evaluator stack."
            :result '(:content [(:type "text" :text "UNCHANGED-OFFSET")]))
           (pilish-test--nested-event
            "tool_execution_end" "short-root" nil :toolName "runner" :isError nil
-           :result '(:content [(:type "text" :text "FIRST\nHIDDEN")]))
+           :result (list :content (vector (list :type "text" :text output))))
           (pilish-test--nested-tab "short-root" '(child . "stable-child"))
           (pilish-test--nested-tab "short-root" 'output)
           (let* ((root (pilish--nested-tool-owner "short-root"))
@@ -1287,7 +1287,7 @@ execution cannot retain a temporary record on this setup's evaluator stack."
                         (collapse ()
                           (button-activate
                            (pilish--find-toggle-button-in-region start (overlay-end overlay) 'output))))
-              (goto-char (position "HIDDEN"))
+              (goto-char (position target))
               (set-window-start selected (position "FIRST") t)
               (set-window-point other (position "UNCHANGED-OFFSET"))
               (set-window-start other (position "UNCHANGED-OFFSET") t)
@@ -1295,18 +1295,48 @@ execution cannot retain a temporary record on this setup's evaluator stack."
               (let ((new-output (assq 'output (pilish--tool-section-bounds start (overlay-end overlay)))))
                 (should (> (- (nth 2 new-output) (nth 1 new-output))
                            (- (nth 2 old-output) (nth 1 old-output)))))
-              (should (= (point) start))
-              (should (= (window-point selected) start))
+              (let ((expected (if retained-p (position "FIRST") start)))
+                (should (= (point) expected))
+                (should (= (window-point selected) expected)))
+              (should (= (window-start selected) (position "FIRST")))
               (should (equal "FIRST" (pilish-test--window-start-line selected)))
               (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET"))
+              (should (= (window-start other) (position "UNCHANGED-OFFSET")))
               (should (equal "UNCHANGED-OFFSET" (pilish-test--window-start-line other)))
-              ;; The still-visible prefix keeps its exact offset on collapse.
+              ;; Retained source text also keeps an exact interior offset.
               (pilish-test--nested-tab "short-root" 'output)
               (goto-char (+ (position "FIRST") 2))
+              (set-window-start selected (position "FIRST") t)
               (collapse)
               (should (looking-at-p "RST"))
+              (should (pilish-test--window-point-text-p selected "RST"))
+              (should (= (window-start selected) (position "FIRST")))
               (should (pilish-test--window-point-text-p other "UNCHANGED-OFFSET")))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
+
+(ert-deftest pilish-test-nested-short-output-collapse-clamps-removed-content ()
+  "Public collapse clamps hidden text even when its replacement is longer."
+  ;; A new-section-length check maps HIDDEN into the closing fence instead
+  ;; of the section anchor.  Retained preview text and siblings must not move.
+  (pilish-test--nested-short-output-collapse-view "FIRST\nHIDDEN" "HIDDEN" nil))
+
+(ert-deftest pilish-test-nested-output-collapse-clamps-fence-prefix-collision ()
+  "A removed backtick is content, not part of the replacement closing fence."
+  ;; Comparing rendered prefixes mistakes the hidden backtick for a retained
+  ;; fence character and leaves point on the replacement closing fence.
+  (pilish-test--nested-short-output-collapse-view "FIRST\n`HIDDEN" "`HIDDEN" nil))
+
+(ert-deftest pilish-test-nested-output-collapse-retains-content-across-fence-change ()
+  "Retained content keeps point and window start when the wrapper fence changes."
+  ;; The full output needs a tilde fence; its FIRST-only preview needs a
+  ;; backtick fence.  A rendered-prefix limit incorrectly clamps FIRST.
+  (pilish-test--nested-short-output-collapse-view "FIRST\n```" "FIRST" t))
+
+(ert-deftest pilish-test-nested-output-collapse-retains-content-after-leading-blank ()
+  "Retained source content follows the preview's original-line map."
+  ;; A preview omits the leading blank line, so FIRST survives at a different
+  ;; section offset even though the wrapper fence does not change.
+  (pilish-test--nested-short-output-collapse-view "\nFIRST\nHIDDEN" "FIRST" t))
 
 (ert-deftest pilish-test-nested-mid-buffer-rewrite-preserves-view ()
   "Late expansion keeps two windows' text, section offsets and tail following."

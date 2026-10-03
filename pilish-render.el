@@ -2147,23 +2147,53 @@ Reuse ordinary result selection and rich-output insertion directly."
         (setq position next)))
     (nreverse sections)))
 
+(defun pilish--tool-section-content-lines (section)
+  "Return transient content-line spans for SECTION, excluding decoration.
+Output spans omit the wrapper fences and its final newline.  A child keeps
+its summary; the list keeps its heading.  Each span is (START END)."
+  (let* ((start (nth 1 section))
+         (end (nth 2 section))
+         (bounds
+          (pcase (car section)
+            ('output (pilish--tool-fenced-content-bounds start end))
+            ('children
+             (cons start (save-excursion
+                           (goto-char start)
+                           (min end (line-beginning-position 2)))))
+            (`(child . ,_)
+             (cons start (next-single-property-change
+                          start 'pilish-nested-summary nil end)))))
+         lines)
+    (when bounds
+      (save-excursion
+        (goto-char (car bounds))
+        (while (< (point) (cdr bounds))
+          (push (list (point) (min (cdr bounds) (line-beginning-position 2))) lines)
+          (forward-line 1))))
+    (vconcat (nreverse lines))))
+
 (defun pilish--map-tool-section-position
     (position old-sections new-sections start old-end new-end &optional collapse)
   "Map POSITION through transient OLD-SECTIONS and NEW-SECTIONS.
 START, OLD-END and NEW-END delimit the body rewrite.  Outside positions
 use the existing cooling mapper.  A vanished or shortened section clamps
 to its summary, or the list header when the list hides that child.
-COLLAPSE is (KEY . RETAINED-PREFIX-LENGTH) for an explicitly collapsed
-section: removed text clamps even when the new fold label is longer."
+COLLAPSE is (KEY . RANGES) for an explicitly collapsed section.  Each
+retained content range is (OLD-START OLD-END NEW-START); all other positions
+in that section clamp to its anchor, regardless of fence or fold text."
   (if-let* ((old (seq-find (lambda (section)
                             (and (>= position (nth 1 section)) (< position (nth 2 section))))
                           old-sections)))
       (if-let* ((new (assoc (car old) new-sections)))
-          (let ((offset (- position (nth 1 old)))
-                (limit (if (equal (car old) (car collapse))
-                           (cdr collapse)
-                         (- (nth 2 new) (nth 1 new)))))
-            (+ (nth 1 new) (if (< offset limit) offset 0)))
+          (if (equal (car old) (car collapse))
+              (if-let* ((range (seq-find
+                               (lambda (range)
+                                 (and (>= position (nth 0 range)) (< position (nth 1 range))))
+                               (cdr collapse))))
+                  (+ (nth 2 range) (- position (nth 0 range)))
+                (nth 1 new))
+            (let ((offset (- position (nth 1 old))))
+              (+ (nth 1 new) (if (< offset (- (nth 2 new) (nth 1 new))) offset 0))))
         (or (nth 1 (assq 'children new-sections)) start))
     (pilish--map-tool-cooling-position position start old-end new-end)))
 
@@ -2177,9 +2207,9 @@ COLLAPSING-SECTION identifies the fold whose removed text must clamp."
     (let* ((start (marker-position header))
            (old-end (marker-position end))
            (old-sections (pilish--tool-section-bounds start old-end))
-           (collapse-text
+           (old-content-lines
             (when-let* ((section (and collapsing-section (assoc collapsing-section old-sections))))
-              (buffer-substring-no-properties (nth 1 section) (nth 2 section))))
+              (pilish--tool-section-content-lines section)))
            (view (pilish--capture-tool-cooling-view))
            (inhibit-read-only t))
       (save-excursion
@@ -2194,14 +2224,21 @@ COLLAPSING-SECTION identifies the fold whose removed text must clamp."
       (let* ((new-end (marker-position end))
              (new-sections (pilish--tool-section-bounds start new-end))
              (collapse
-              (when-let* ((section (and collapse-text (assoc collapsing-section new-sections))))
-                (let ((comparison
-                       (compare-strings collapse-text nil nil
-                                        (buffer-substring-no-properties (nth 1 section) (nth 2 section))
-                                        nil nil)))
-                  ;; A mismatch is a signed, one-based character position.
-                  (cons collapsing-section
-                        (if (eq comparison t) (length collapse-text) (1- (abs comparison))))))))
+              (when-let* ((section (and collapsing-section (assoc collapsing-section new-sections))))
+                (let ((line-map (and (eq collapsing-section 'output)
+                                     (pilish--tool-block-line-map block))))
+                  (cons
+                   collapsing-section
+                   ;; Preview rows name their original lines.  Only their
+                   ;; surviving characters map, never fence or fold text.
+                   (seq-map-indexed
+                    (lambda (line index)
+                      (let* ((source (aref old-content-lines
+                                           (if line-map (1- (aref line-map index)) index)))
+                             (span-length (min (- (cadr source) (car source))
+                                               (- (cadr line) (car line)))))
+                        (list (car source) (+ (car source) span-length) (car line))))
+                    (pilish--tool-section-content-lines section)))))))
         (pilish--restore-tool-cooling-view
          view start old-end new-end
          (lambda (position)
@@ -4836,6 +4873,28 @@ The result is ordered from the end of the buffer backward."
         (pilish--completed-tool-overlay-before-p overlay boundary))
       (overlays-in (point-min) boundary)))))
 
+(defun pilish--tool-fenced-content-bounds (start end)
+  "Return the first tool wrapper's content bounds within START..END, or nil.
+Exclude the wrapper newline immediately before the closing fence."
+  (save-excursion
+    (goto-char start)
+    (when-let* ((opening-fence (pilish--fence-line-info-at-point)))
+      (forward-line 1)
+      (let ((content-start (point))
+            (closing-start nil))
+        (while (and (not closing-start) (< (point) end))
+          (let ((line-info (pilish--fence-line-info-at-point)))
+            (when (pilish--fence-closing-line-p opening-fence line-info)
+              (setq closing-start (line-beginning-position))))
+          (unless closing-start
+            (forward-line 1)))
+        (when closing-start
+          (cons content-start
+                (if (and (> closing-start content-start)
+                         (eq (char-before closing-start) ?\n))
+                    (1- closing-start)
+                  closing-start)))))))
+
 (defun pilish--tool-overlay-visible-body (overlay)
   "Return the currently visible body text for completed tool OVERLAY.
 Extracts the text between the outer fence lines, removing only the
@@ -4844,25 +4903,9 @@ therefore cool into their visible preview only."
   (when-let* ((header-end-marker (overlay-get overlay 'pilish-header-end))
               (header-end (and (markerp header-end-marker)
                                (marker-position header-end-marker)))
-              (overlay-end (overlay-end overlay)))
-    (save-excursion
-      (goto-char header-end)
-      (when-let* ((opening-fence (pilish--fence-line-info-at-point)))
-        (forward-line 1)
-        (let ((content-start (point))
-              (closing-start nil))
-          (while (and (not closing-start) (< (point) overlay-end))
-            (let ((line-info (pilish--fence-line-info-at-point)))
-              (when (pilish--fence-closing-line-p opening-fence line-info)
-                (setq closing-start (line-beginning-position))))
-            (unless closing-start
-              (forward-line 1)))
-          (when closing-start
-            (let ((wrapped-body (buffer-substring-no-properties
-                                 content-start closing-start)))
-              (if (string-suffix-p "\n" wrapped-body)
-                  (substring wrapped-body 0 -1)
-                wrapped-body))))))))
+              (overlay-end (overlay-end overlay))
+              (bounds (pilish--tool-fenced-content-bounds header-end overlay-end)))
+    (buffer-substring-no-properties (car bounds) (cdr bounds))))
 
 (defun pilish--cold-tool-target-metadata
     (overlay header-end collapsed)
