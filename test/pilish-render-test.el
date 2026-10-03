@@ -6281,6 +6281,31 @@ since we don't display them locally. Let pi's message_start handle it."
         (should message-shown)
         (should (string-match-p "Extension loaded successfully" message-shown))))))
 
+(ert-deftest pilish-test-mcp-notifies-use-existing-echo-area ()
+  "MCP info, warnings, and errors use the echo area without RPC responses."
+  (pilish-test-with-rpc-session (chat _input _proc commands)
+    (let (responses)
+      (cl-letf (((symbol-function 'pilish--send-extension-ui-response)
+                 (lambda (proc response) (push (list proc response) responses))))
+        (with-current-buffer chat
+          (let ((before (buffer-string)))
+            (dolist (case '(("info"
+                            "MCP servers are still connecting; their tools become available once connected."
+                            "Pi: MCP servers are still connecting; their tools become available once connected.")
+                           ("warning" "MCP configuration error" "Pi: ⚠ MCP configuration error")
+                           ("error" "MCP connection failed" "Pi: ✗ MCP connection failed")))
+              (let (notices)
+                (cl-letf (((symbol-function 'message)
+                           (lambda (fmt &rest args)
+                             (push (apply #'format fmt args) notices))))
+                  (pilish--handle-display-event
+                   (list :type "extension_ui_request" :id "mcp-notify"
+                         :method "notify" :message (nth 1 case) :notifyType (car case))))
+                (should (equal notices (list (nth 2 case))))))
+            (should (equal (buffer-string) before))))
+        (should-not responses)
+        (should-not commands)))))
+
 (ert-deftest pilish-test-extension-ui-confirm-yes ()
   "extension_ui_request confirm method uses yes-or-no-p and sends response."
   (let ((response-sent nil))

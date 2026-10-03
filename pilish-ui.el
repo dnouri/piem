@@ -2932,11 +2932,22 @@ Accesses state from the linked chat buffer."
          (activity-phase (or (and chat-buf
                                   (buffer-local-value 'pilish--activity-phase chat-buf))
                              "idle"))
+         (activity-label
+          (if (and chat-buf
+                   (with-current-buffer chat-buf
+                     (and (eq pilish--status 'sending)
+                          (pilish--prompt-start-wait-active-p)
+                          (not (pilish--prompt-wait-accepted pilish--prompt-wait))
+                          (not (pilish--prompt-wait-started pilish--prompt-wait))
+                          (not (pilish--prompt-wait-echoed pilish--prompt-wait)))))
+              (propertize "waiting for Pi"
+                          'help-echo "MCP servers may be connecting during startup.")
+            activity-phase))
          (activity-phase-str
           (or (and chat-buf
                    (with-current-buffer chat-buf
                      (pilish--inactivity-status activity-phase)))
-              (propertize (format "%-8s" activity-phase)
+              (propertize (format "%-8s" activity-label)
                           'face 'pilish-activity-phase))))
     (concat
      (pilish--header-format-identity model-short thinking activity-phase-str)
@@ -3177,6 +3188,7 @@ ON-NO-AGENT-START runs only for accepted requests confirmed to have no turn."
                        (setf (pilish--prompt-wait-accepted wait) t
                              (pilish--prompt-wait-disposition wait)
                              (plist-get (plist-get response :data) :disposition))
+                       (force-mode-line-update t)
                        (unwind-protect
                            (when on-success (funcall on-success))
                          (when (pilish--prompt-start-current-p wait)

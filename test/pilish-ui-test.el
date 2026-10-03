@@ -1488,6 +1488,187 @@ Buffer is read-only with `inhibit-read-only' used for insertion.
                                        'mouse-face header)
                     'highlight))))))
 
+;;; Pending prompt acceptance presentation
+
+(ert-deftest pilish-test-header-pending-acceptance-copy ()
+  "Each unacknowledged prompt shows honest wait copy without reading config."
+  (pilish-test-with-rpc-session (chat input proc commands)
+    (let (phases)
+      (let ((pilish-activity-phase-functions
+             (list (lambda (_chat _input _old new _reason) (push new phases)))))
+        (dolist (text '("first ordinary prompt" "second ordinary prompt"))
+          (with-current-buffer input (insert text) (pilish-send))
+          (let ((request (car commands))
+                (phases-before (copy-sequence phases))
+                (commands-before (copy-tree commands)))
+            (cl-letf (((symbol-function 'file-exists-p)
+                       (lambda (&rest _) (ert-fail "Header checked disk config")))
+                      ((symbol-function 'insert-file-contents)
+                       (lambda (&rest _) (ert-fail "Header read disk config")))
+                      ((symbol-function 'directory-files)
+                       (lambda (&rest _) (ert-fail "Header scanned disk config"))))
+              (should (string-match-p "waiting for Pi"
+                                      (pilish-test--input-header input)))
+              (dolist (buffer (list input chat))
+                (let* ((header (with-current-buffer buffer (pilish--header-line-string)))
+                       (start (string-match (regexp-quote "waiting for Pi") header)))
+                  (should start)
+                  (should (equal (get-text-property start 'help-echo header)
+                                 "MCP servers may be connecting during startup."))
+                  (should (eq (get-text-property start 'face header)
+                              'pilish-activity-phase)))))
+            (with-current-buffer chat
+              (should (eq pilish--status 'sending))
+              (should (equal pilish--activity-phase "thinking"))
+              (should-not (pilish--prompt-wait-accepted pilish--prompt-wait)))
+            (should (equal phases phases-before))
+            (should (equal commands commands-before))
+            ;; A handled acknowledgment permits the next ordinary submission.
+            (pilish-test--stdout
+             proc (list :type "response" :command "prompt" :success t
+                        :id (plist-get request :id) :data '(:disposition "handled"))))))
+      (should (equal (mapcar (lambda (command) (plist-get command :message))
+                            (reverse commands))
+                     '("first ordinary prompt" "second ordinary prompt"))))))
+
+(ert-deftest pilish-test-header-pending-acceptance-acknowledgments ()
+  "Acceptance redisplays normal thinking, handled idle, or queued feedback."
+  (dolist (case '(((:disposition "started") sending "thinking" nil)
+                  (nil sending "thinking" nil)
+                  ((:disposition "handled") idle "idle" nil)
+                  ((:disposition "queued") sending "queued"
+                   "Pi: Prompt acknowledged as queued")))
+    (ert-info ((format "prompt acknowledgment data=%S" (car case)))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let ((schedule (symbol-function 'run-at-time)) refreshed notices)
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (seconds repeat function &rest args)
+                       (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                           'fake-prompt-start-timer
+                         (apply schedule seconds repeat function args))))
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args) (push (apply #'format fmt args) notices))))
+            (with-current-buffer input (insert "ordinary prompt") (pilish-send))
+            (let ((request (car commands)))
+              (cl-letf (((symbol-function 'force-mode-line-update)
+                         (lambda (&optional all)
+                           (when (or all (eq (current-buffer) input))
+                             (push (pilish-test--input-header input) refreshed)))))
+                (pilish-test--stdout
+                 proc (append (list :type "response" :command "prompt" :success t
+                                    :id (plist-get request :id))
+                              (when (car case) (list :data (car case))))))
+              (should refreshed)
+              (dolist (header refreshed)
+                (should-not (string-match-p "waiting for Pi" header)))
+              (let ((header (pilish-test--input-header input)))
+                (should (string-match-p (nth 2 case) header))
+                (should-not (string-match-p "waiting for Pi" header)))
+              (with-current-buffer chat
+                (should (eq pilish--status (nth 1 case)))
+                (should (equal pilish--activity-phase (nth 2 case))))
+              (should (equal notices (when (nth 3 case) (list (nth 3 case)))))
+              (should (equal (mapcar (lambda (command) (plist-get command :type)) commands)
+                             '("prompt"))))))))))
+
+(ert-deftest pilish-test-header-pending-acceptance-observed-work ()
+  "Start, echo, compaction, and ended independent runs outrank wait feedback."
+  (dolist (case '((start ((:type "agent_start")) streaming "thinking")
+                  (ended ((:type "agent_start") (:type "agent_end" :messages []))
+                         sending "thinking")
+                  (echo-only ((:type "message_start" :message
+                                     (:role "user" :timestamp 1704067200000
+                                      :content [(:type "text" :text "ordinary prompt")])))
+                             sending "thinking")
+                  (compaction ((:type "compaction_start" :reason "manual"))
+                              compacting "compact")
+                  (settled ((:type "agent_start") (:type "agent_end" :messages [])
+                            (:type "agent_settled")) idle "idle")
+                  (newer-ended ((:type "agent_start") (:type "agent_end" :messages [])
+                                (:type "agent_settled") (:type "agent_start")
+                                (:type "agent_end" :messages [])) sending "thinking")))
+    (ert-info ((format "observed before acknowledgment=%s" (car case)))
+      (pilish-test-with-rpc-session (chat input proc commands)
+        (let ((schedule (symbol-function 'run-at-time)) notices)
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (seconds repeat function &rest args)
+                       (if (eq function 'pilish--clear-sending-if-no-agent-start)
+                           'fake-prompt-start-timer
+                         (apply schedule seconds repeat function args))))
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args) (push (apply #'format fmt args) notices))))
+            (with-current-buffer input (insert "ordinary prompt") (pilish-send))
+            (let ((request (car commands)))
+              (dolist (event (nth 1 case)) (pilish-test--stdout proc event))
+              ;; Both the observed event and a later acknowledgment retain phase.
+              (dotimes (after-acceptance 2)
+                (when (= after-acceptance 1)
+                  (pilish-test--stdout
+                   proc (list :type "response" :command "prompt" :success t
+                              :id (plist-get request :id) :data '(:disposition "started"))))
+                (let ((header (pilish-test--input-header input)))
+                  (should (string-match-p (nth 3 case) header))
+                  (should-not (string-match-p "waiting for Pi" header)))
+                (with-current-buffer chat
+                  (should (eq pilish--status (nth 2 case)))
+                  (should (equal pilish--activity-phase (nth 3 case)))))
+              (should (equal notices (when (eq (car case) 'compaction)
+                                       '("Pi: Compacting..."))))
+              (should (equal (mapcar (lambda (command) (plist-get command :type)) commands)
+                             '("prompt"))))))))))
+
+(ert-deftest pilish-test-header-pending-acceptance-does-not-expire ()
+  "Twelve silent seconds never time out an unacknowledged prompt or draft."
+  (pilish-test-with-clock now
+    (pilish-test-with-rpc-session (chat input proc commands)
+      (let ((schedule (symbol-function 'run-at-time))
+            (pilish-session-inactivity-timeout 10) fallbacks)
+        (pilish-test--adopt-rpc-process chat proc)
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (seconds repeat function &rest args)
+                     (when (eq function 'pilish--clear-sending-if-no-agent-start)
+                       (push (cons function args) fallbacks))
+                     (apply schedule seconds repeat function args))))
+          (with-current-buffer input (insert "slow prompt") (pilish-send))
+          (let ((wait (buffer-local-value 'pilish--prompt-wait chat)))
+            (with-current-buffer input (insert "unsent newer draft"))
+            (setq now 1012.0)
+            (let ((header (pilish-test--input-header input)))
+              (should (string-match-p "waiting for Pi" header))
+              (should-not (string-match-p "no output" header)))
+            (with-current-buffer chat
+              (should (eq pilish--prompt-wait wait))
+              (should (eq pilish--status 'sending))
+              (should (equal pilish--activity-phase "thinking"))
+              (should-not (pilish--prompt-wait-accepted wait))
+              (should-not pilish--prompt-start-timer))
+            (should-not fallbacks)
+            (should (= 1 (hash-table-count (pilish--get-pending-requests proc))))
+            (should (equal (mapcar (lambda (command) (plist-get command :type)) commands)
+                           '("prompt")))
+            (with-current-buffer input
+              (should (equal (buffer-string) "unsent newer draft")))))))))
+
+(ert-deftest pilish-test-header-pending-acceptance-inactivity-precedence ()
+  "A silent observed run keeps its existing warning despite an unacked prompt."
+  (pilish-test-with-inactivity-session (chat input proc commands now)
+    (with-current-buffer input (insert "ordinary prompt") (pilish-send))
+    (pilish-test--stdout proc '(:type "agent_start"))
+    (setq now 1300.0)
+    (let* ((header (with-current-buffer input (pilish--header-line-string)))
+           (start (string-match (regexp-quote "thinking (no output 5m)") header)))
+      (should start)
+      (should (eq (get-text-property start 'face header) 'warning))
+      (should (string-match-p "Pi may still be working"
+                              (get-text-property start 'help-echo header)))
+      (should-not (string-match-p "waiting for Pi" header)))
+    (with-current-buffer chat
+      (should (eq pilish--status 'streaming))
+      (should (equal pilish--activity-phase "thinking"))
+      (should-not (pilish--prompt-wait-accepted pilish--prompt-wait)))
+    (should (equal (mapcar (lambda (command) (plist-get command :type)) commands)
+                   '("prompt")))))
+
 (ert-deftest pilish-test-kill-ring-save-strips-by-default ()
   "kill-ring-save strips hidden markup by default."
   (pilish-test--with-chat-markup "Hello **bold** world"
