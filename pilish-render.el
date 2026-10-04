@@ -2881,7 +2881,7 @@ absent or previously owned help.  Links, images and buttons keep precedence."
   "Fontify START..END with FUNCTION and ARGS, letting native help win.
 Mask fallback at the native unfontification seam: its bounds already include
 line/multiline expansion, unlike the original fontification request.  Repair
-literal tool metadata in the actual fontified bounds, then restore cached
+literal metadata in the actual fontified bounds, then restore cached
 fallback after native links have supplied their more-specific help."
   (let ((unfontify font-lock-unfontify-region-function)
         ranges)
@@ -8005,20 +8005,24 @@ Display-only table decoration is applied after the content is stable."
 ;;;; Tool Property Restoration
 
 (defun pilish--restore-tool-properties (beg end)
-  "Restore literal tool metadata after tree-sitter fontification in BEG..END.
-Strip Markdown hiding, faces and link buttons from bounded child summaries
-and full-output paths, including cold text without overlays.  Preserve image
-preview display properties.  Restore `font-lock-face' values for all
+  "Restore literal metadata after tree-sitter fontification in BEG..END.
+Strip Markdown hiding, faces and link buttons from saved assistant outcomes,
+child summaries and full-output paths, including cold text without overlays.
+Preserve image preview display properties and the outcome notice face.
+Restore `font-lock-face' values for all
 overlapping tool headers, live or finalized."
   (let ((inhibit-read-only t)
         (pos beg))
     (while (< pos end)
       (let ((limit (min (next-single-property-change pos 'pilish-nested-summary nil end)
-                        (next-single-property-change pos 'pilish-tool-section nil end))))
-        (when (or (get-text-property pos 'pilish-nested-summary)
+                        (next-single-property-change pos 'pilish-tool-section nil end)
+                        (next-single-property-change pos 'pilish-assistant-outcome nil end)))
+            (outcome (get-text-property pos 'pilish-assistant-outcome)))
+        (when (or outcome (get-text-property pos 'pilish-nested-summary)
                   (eq (get-text-property pos 'pilish-tool-section) 'full-output))
           (md-ts--remove-link-button-properties pos limit)
-          (remove-text-properties pos limit '(invisible nil display nil face nil)))
+          (remove-text-properties pos limit '(invisible nil display nil face nil))
+          (when outcome (put-text-property pos limit 'face 'pilish-error-notice)))
         (setq pos limit)))
     (dolist (ov (pilish--tool-block-overlays-in-region beg end))
       (when-let* ((ov-start (overlay-start ov))
@@ -8199,7 +8203,7 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
     (pilish--tool-block-apply-hover block)))
 
 (defun pilish--render-history-assistant-content (message results)
-  "Render assistant MESSAGE content blocks in source order.
+  "Render assistant MESSAGE content in order, followed by its saved outcome.
 RESULTS maps toolCallId strings to matching toolResult messages."
   (let ((content (plist-get message :content))
         (help (pilish--assistant-hover-help message))
@@ -8232,7 +8236,19 @@ RESULTS maps toolCallId strings to matching toolResult messages."
                (flush-text)
                (pilish--render-history-tool
                 block (gethash (plist-get block :id) results))))))
-        (flush-text))))))
+        (flush-text)))))
+  (when-let* ((label (pcase (plist-get message :stopReason)
+                      ("error" "Error")
+                      ("aborted" "Aborted"))))
+    (let ((explanation (plist-get message :errorMessage)))
+      (pilish--append-to-chat
+       (concat "\n"
+               (propertize (concat "[" label
+                                   (when (and (stringp explanation) (not (string-empty-p explanation)))
+                                     (concat ": " explanation))
+                                   "]")
+                           'face 'pilish-error-notice 'pilish-assistant-outcome t)
+               "\n")))))
 
 (defun pilish--rewrite-tail-window-p
     (window-point window-end point-max point-row body-height)

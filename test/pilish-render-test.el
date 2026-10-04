@@ -4202,6 +4202,98 @@ and no disturbance to a following assistant turn."
       (should (string-match-p "Assistant" text))
       (should (string-match-p "Plain string reply" text)))))
 
+(defun pilish-test--history-assistant-outcome (reason explanation annotation &optional partial-text)
+  "Replay saved REASON with EXPLANATION and require one literal ANNOTATION.
+When PARTIAL-TEXT is supplied it must precede the outcome, never be erased."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (let ((pilish--status 'streaming)
+          (pilish--aborted t)
+          (pilish--local-user-message "WAITING USER")
+          (pilish--followup-queue '("FOLLOWUP"))
+          (messages
+           (vector '(:role "user" :content [(:type "text" :text "USER INPUT")])
+                   (append (list :role "assistant" :stopReason reason
+                                 :content (if partial-text
+                                              (vector (list :type "text" :text partial-text))
+                                            []))
+                           (when explanation (list :errorMessage explanation))))))
+      (dotimes (_ 2)
+        (pilish--display-session-history messages (current-buffer))
+        (font-lock-ensure)
+        (should (string-match-p (regexp-quote annotation)
+                                (pilish--visible-text (point-min) (point-max))))
+        (should (= 1 (pilish-test--count-matches "\\[\\(?:Error\\|Aborted\\)" (buffer-string))))
+        (should (= 1 (pilish-test--count-matches "USER INPUT" (buffer-string))))
+        (when partial-text
+          (should (= 1 (pilish-test--count-matches (regexp-quote partial-text) (buffer-string))))
+          (should (< (pilish-test--hover-pos partial-text) (pilish-test--hover-pos annotation))))
+        ;; Replaying a saved outcome is not a live message_end or agent_end.
+        (should (eq pilish--status 'streaming))
+        (should pilish--aborted)
+        (should (equal pilish--local-user-message "WAITING USER"))
+        (should (equal pilish--followup-queue '("FOLLOWUP")))))))
+
+(ert-deftest pilish-test-history-saved-assistant-empty-error ()
+  "The real empty Stop shape stays an error, not an inferred cancellation."
+  (pilish-test--history-assistant-outcome
+   "error" "This operation was aborted" "[Error: This operation was aborted]"))
+
+(ert-deftest pilish-test-history-saved-assistant-empty-aborted ()
+  "An empty saved aborted message retains its supplied explanation."
+  (pilish-test--history-assistant-outcome
+   "aborted" "Request was aborted" "[Aborted: Request was aborted]"))
+
+(ert-deftest pilish-test-history-saved-assistant-partial-error ()
+  "Failed partial content stays visible with its literal saved explanation."
+  ;; Markdown in the error is server text, not emphasis or a clickable link.
+  (pilish-test--history-assistant-outcome
+   "error" "Connection failed: **retry** [help](there) `later`"
+   "[Error: Connection failed: **retry** [help](there) `later`]" "PARTIAL ANSWER"))
+
+(ert-deftest pilish-test-history-saved-assistant-partial-aborted ()
+  "A partial aborted answer must not look complete after reload."
+  (pilish-test--history-assistant-outcome
+   "aborted" "Stopped by user" "[Aborted: Stopped by user]" "PARTIAL ANSWER"))
+
+(ert-deftest pilish-test-history-saved-assistant-error-without-explanation ()
+  "An unexplained saved error still has a small visible failure annotation."
+  (pilish-test--history-assistant-outcome "error" nil "[Error]"))
+
+(ert-deftest pilish-test-history-saved-assistant-aborted-without-explanation ()
+  "An unexplained saved abort still has a small visible interruption annotation."
+  (pilish-test--history-assistant-outcome "aborted" nil "[Aborted]"))
+
+(ert-deftest pilish-test-history-saved-assistant-without-terminal-facts ()
+  "Old empty and nonempty messages do not acquire fabricated terminal outcomes."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish--display-session-history
+     [(:role "assistant" :content [])
+      (:role "assistant" :content [(:type "text" :text "OLD REPLY")])]
+     (current-buffer))
+    (should (= 1 (pilish-test--count-matches "OLD REPLY" (buffer-string))))
+    (should-not (string-match-p "\\[\\(?:Error\\|Aborted\\)" (buffer-string)))))
+
+(ert-deftest pilish-test-history-saved-assistant-consecutive-outcomes ()
+  "Grouped assistant messages retain exactly one outcome each in message order."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (dotimes (_ 2)
+      (pilish--display-session-history
+       [(:role "assistant" :content [(:type "text" :text "FIRST PARTIAL")]
+         :stopReason "error" :errorMessage "Connection failed")
+        (:role "assistant" :content [] :stopReason "aborted" :errorMessage "Stopped")
+        (:role "assistant" :content [(:type "text" :text "NEXT ANSWER")])]
+       (current-buffer))
+      (should (= 1 (pilish-test--count-matches "Assistant\n===" (buffer-string))))
+      (should (= 1 (pilish-test--count-matches (regexp-quote "[Error: Connection failed]") (buffer-string))))
+      (should (= 1 (pilish-test--count-matches (regexp-quote "[Aborted: Stopped]") (buffer-string))))
+      (should (< (pilish-test--hover-pos "FIRST PARTIAL")
+                 (pilish-test--hover-pos "[Error: Connection failed]")
+                 (pilish-test--hover-pos "[Aborted: Stopped]")
+                 (pilish-test--hover-pos "NEXT ANSWER"))))))
+
 (ert-deftest pilish-test-history-renders-branch-summary-between-assistant-groups ()
   "Branch summaries keep source order and split adjacent assistant groups."
   (with-temp-buffer
