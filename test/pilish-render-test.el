@@ -2491,6 +2491,75 @@ PREVIEW-AT-TAB changes the budget after painting, before the public fold."
    'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);"
    "const FIRST = 1;" "const SECOND = 2;" 1))
 
+(defun pilish-test--nested-collapse-to-full-source-view (section budget-change-p)
+  "Collapse SECTION after it fits and preserve both readers' source positions.
+BUDGET-CHANGE-P increases the preview budget instead of the display width."
+  (save-window-excursion
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (delete-other-windows)
+      (switch-to-buffer (current-buffer))
+      (let* ((pilish-tool-preview-lines 2)
+             (width 30)
+             (first "const FIRST = 111111111111111111111111111111;")
+             (second "const SECOND = 222222222222222222222222222222;")
+             (source (concat "\n" first "\n\n" second)))
+        (cl-letf (((symbol-function 'pilish--chat-display-width) (lambda () width)))
+          (pilish--append-to-chat "OLDER TURN\nunchanged prelude\n")
+          (pilish-test--nested-event
+           "tool_execution_start" "fit-root" nil :toolName "codemode"
+           :args (list :code (if (eq section 'script) source "text(1);")))
+          (when (eq section 'output)
+            (pilish-test--nested-event
+             "tool_execution_end" "fit-root" nil :toolName "codemode" :isError :false
+             :result (list :content (vector (list :type "text" :text source)))))
+          (should-not (string-match-p "SECOND" (buffer-string)))
+          (goto-char (+ (pilish-test--hover-pos "FIRST") 2))
+          (pilish-toggle-tool-section)
+          (should (string-match-p (regexp-quote source) (buffer-string)))
+          (pilish--append-to-chat "\nNEWER TURN\nunchanged epilogue\n")
+          (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "fit-root")))
+                 (prefix (buffer-substring-no-properties (point-min) (overlay-start overlay)))
+                 (suffix (buffer-substring-no-properties (overlay-end overlay) (point-max)))
+                 (selected (selected-window))
+                 (other (split-window-right)))
+            (set-window-buffer other (current-buffer))
+            (goto-char (+ (pilish-test--hover-pos "SECOND") 2))
+            (set-window-start selected (pilish-test--hover-pos first) t)
+            (set-window-point other (1+ (pilish-test--hover-pos "FIRST")))
+            (set-window-start other (pilish-test--hover-pos second) t)
+            (if budget-change-p (setq pilish-tool-preview-lines 4) (setq width 120))
+            ;; No rows are hidden now: collapse inserts full source, not a
+            ;; nonblank preview.  Its row identities must include the blanks.
+            (pilish-toggle-tool-section)
+            (should (string-match-p (regexp-quote source) (buffer-string)))
+            (should-not (pilish--find-toggle-button-in-region
+                         (overlay-start overlay) (overlay-end overlay) section))
+            (should (= (point) (+ (pilish-test--hover-pos "SECOND") 2)))
+            (should (= (window-point selected) (point)))
+            (should (looking-at-p "COND"))
+            (should (= (window-start selected) (pilish-test--hover-pos first)))
+            (should (equal first (pilish-test--window-start-line selected)))
+            (should (= (window-point other) (1+ (pilish-test--hover-pos "FIRST"))))
+            (should (pilish-test--window-point-text-p other "IRST"))
+            (should (= (window-start other) (pilish-test--hover-pos second)))
+            (should (equal second (pilish-test--window-start-line other)))
+            (should (equal prefix (buffer-substring-no-properties (point-min) (overlay-start overlay))))
+            (should (equal suffix (buffer-substring-no-properties (overlay-end overlay) (point-max))))))))))
+
+(ert-deftest pilish-test-codemode-script-collapse-after-widening-preserves-full-source-view ()
+  "Collapse after widening keeps full script rows, blanks and both readers."
+  ;; Assigning preview identities to full source raises args-out-of-range.
+  (pilish-test--nested-collapse-to-full-source-view 'script nil))
+
+(ert-deftest pilish-test-nested-output-collapse-after-widening-preserves-full-source-view ()
+  "Parent output also keeps full source coordinates when the preview fits."
+  (pilish-test--nested-collapse-to-full-source-view 'output nil))
+
+(ert-deftest pilish-test-codemode-script-collapse-after-budget-change-preserves-full-source-view ()
+  "An increased budget cannot make full script rows use preview identities."
+  (pilish-test--nested-collapse-to-full-source-view 'script t))
+
 (ert-deftest pilish-test-nested-output-expansion-before-pending-update-keeps-displayed-snapshot ()
   "Expansion uses painted source rows while a newer parent result awaits paint."
   ;; Folding retained facts instead of the displayed snapshot either maps

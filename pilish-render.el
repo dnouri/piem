@@ -2457,7 +2457,12 @@ retained facts through the existing queue."
              (new-sections
               (pilish--tool-section-bounds
                start new-end
-               (list (cons 'script (and (not script-expanded) script-line-map))
+               ;; A closed script with no hidden rows was inserted in full,
+               ;; including blanks.  Only a real preview needs source-row IDs.
+               (list (cons 'script
+                           (and (not script-expanded)
+                                (pilish--find-toggle-button-in-region start new-end 'script)
+                                script-line-map))
                      (cons 'output (pilish--tool-block-line-map block))))))
         (pilish--restore-tool-cooling-view
          view start old-end new-end
