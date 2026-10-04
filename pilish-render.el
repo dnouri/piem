@@ -2161,7 +2161,9 @@ SAVED-P makes unmatched running metadata unfinished rather than live work."
   "Return CALL's compact, propertized summary.
 HISTORY-P distinguishes saved unfinished work from a stopped live process."
   (let* ((arguments (pilish--nested-call-arguments call))
-         (preview (if arguments (json-serialize arguments)
+         ;; Native JSON serialization returns UTF-8 bytes, not display characters.
+         (preview (if arguments
+                      (decode-coding-string (json-serialize arguments) 'utf-8)
                     (pilish--nested-call-args-preview call)))
          (status (pilish--nested-call-status call))
          (duration (pilish--nested-call-duration-ms call)))

@@ -2343,6 +2343,24 @@ execution cannot retain a temporary record on this setup's evaluator stack."
    :result '(:content [(:type "text" :text "PARENT-OUTPUT")]))
   (pilish--tool-block-overlay (pilish--nested-tool-owner "literal-root")))
 
+(ert-deftest pilish-test-nested-summary-arguments-decode-json-utf8 ()
+  "Native JSON bytes must display as the received Unicode argument characters."
+  ;; Passing json-serialize's unibyte UTF-8 output to character escaping
+  ;; corrupts non-ASCII event/saved arguments, unlike decoded details previews.
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish-test--nested-event
+     "tool_execution_start" "unicode-root" nil :toolName "runner" :args '(:job "unicode"))
+    (pilish-test--nested-event
+     "tool_execution_start" "unicode-child" "unicode-root" :toolName "bash"
+     :args '(:command "echo café λ 😀"))
+    (pilish-test--nested-event
+     "tool_execution_end" "unicode-child" "unicode-root" :toolName "bash" :isError :false
+     :result '(:content [(:type "text" :text "DONE")]))
+    (font-lock-ensure)
+    (should (equal (pilish-test--nested-summary-lines "unicode-root" t)
+                   '(("unicode-child" . "  ✓ bash {\"command\":\"echo café λ 😀\"}"))))))
+
 (ert-deftest pilish-test-nested-summary-metadata-stays-literal-after-refontification ()
   "Real Markdown fontification cannot hide or activate child argument/error text."
   ;; Losing literal-text protection changes the received command/error and
