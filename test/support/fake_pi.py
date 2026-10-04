@@ -977,10 +977,14 @@ class FakePiHarness:
         self._persist_user_message(user_message)
         self._write_json({"type": "message_start", "message": user_message})
         self._write_json({"type": "message_end", "message": user_message})
+        loop_ended = False
         for record in behavior.records:
             if not self._sleep_ms(30, abortable=True):
                 if self.state.is_streaming:
-                    self._finish_aborted_run()
+                    if loop_ended:
+                        self._settle_run()
+                    else:
+                        self._finish_aborted_run()
                 return
             record_type = record["type"]
             if record_type == "message_end":
@@ -989,6 +993,8 @@ class FakePiHarness:
                     self._persist_assistant_message(message)
                 elif message["role"] == "toolResult":
                     self._persist_tool_result_message(message)
+            elif record_type == "agent_end":
+                loop_ended = True
             elif record_type == "agent_settled":
                 self.state.is_streaming = False
             self._write_json(record)
@@ -1123,10 +1129,14 @@ class FakePiHarness:
             {"type": "agent_end", "messages": messages, "willRetry": False}
         )
         if settled:
-            self.state.is_streaming = False
-            self._abort_requested.clear()
-            self._take_pending_steer()
-            self._write_json({"type": "agent_settled"})
+            self._settle_run()
+
+    def _settle_run(self) -> None:
+        """Expose idle state and emit the final settlement."""
+        self.state.is_streaming = False
+        self._abort_requested.clear()
+        self._take_pending_steer()
+        self._write_json({"type": "agent_settled"})
 
     def _finish_aborted_run(self, message: JsonDict | None = None) -> None:
         """Finish the current run, emitting an active aborted MESSAGE first."""

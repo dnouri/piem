@@ -252,7 +252,9 @@ alone does not discard a pending steering continuation: the text-stream
 scenario emits the aborted low-level `agent_end`, starts that continuation,
 and emits exactly one `agent_settled` after the final run. Sending `clear_queue`
 before `abort` prevents that continuation. The existing fake still has one
-pending steering slot, not a general follow-up queue.
+pending steering slot, not a general follow-up queue. The fake's stop
+acknowledgment is a worker-join boundary, not a guarantee about real Pi's
+abort acknowledgment ordering.
 
 ### Tool execution path
 
@@ -320,9 +322,11 @@ playback actually returns. `abort`, `new_session`, and successful
 `switch_session` join it even when streaming is already false, so no old
 records arrive after their success response. A second nested prompt while
 that worker is alive is rejected; this bounded fake does not model overlapping
-runs. Interrupted playback drops the remaining records and, if still
-streaming, closes the lifecycle through the existing aborted-run helper. It
-does not manufacture child cancellations, results, or partial messages.
+runs. Interrupted playback drops the remaining records. Before the literal
+`agent_end`, it closes the lifecycle with one end and one settlement. After
+that end but before settlement, it emits only the owed `agent_settled`, never
+another `agent_end`; after settlement it emits neither. It does not manufacture
+child cancellations, results, or partial messages.
 
 Playback uses fixed 30 ms spacing and a 500 ms pause after settlement so tests
 can inspect disk or stop the late replay. These are fixture pacing, not Pi

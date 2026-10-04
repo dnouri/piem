@@ -2171,36 +2171,107 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
         (should (= 1 (pilish-test--count-matches "Incomplete saved call summary" visible)))
         (should-not (string-match-p "[0-9]+ more calls not recorded" visible))))))
 
+(ert-deftest pilish-fake-pi-test-nested-tools-abort-after-agent-end-settles-once ()
+  "Abort after the literal end owes one settlement, not another low-level end."
+  (pilish-fake-pi-test-with-process (proc "nested-tools")
+    (let* ((state (pilish-fake-pi-test--rpc proc '(:type "get_state")))
+           (session-file (plist-get (plist-get state :data) :sessionFile))
+           abort-sent)
+      ;; React in the actual wire filter, not after a collector discards the
+      ;; already received lifecycle prefix.  Keep every event for the counts.
+      (set-process-filter
+       proc (lambda (process output)
+              (pilish-fake-pi-test--process-filter process output)
+              (when (and (not abort-sent)
+                         (pilish-fake-pi-test--events-of-type
+                          (process-get process 'fake-pi-objects) "agent_end"))
+                (setq abort-sent t)
+                (pilish-fake-pi-test--send
+                 process '(:id "abort-after-end" :type "abort")))))
+      (should (eq (plist-get (pilish-fake-pi-test--rpc
+                             proc '(:type "prompt" :message "abort after literal end"))
+                            :success) t))
+      (let* ((events (pilish-fake-pi-test--collect-until
+                      proc (lambda (event)
+                             (equal (plist-get event :id) "abort-after-end"))))
+             (ack (car (last events)))
+             (disk-at-ack (pilish-fake-pi-test--file-bytes session-file)))
+        (should abort-sent)
+        (should (equal (plist-get ack :type) "response"))
+        (should (equal (plist-get ack :command) "abort"))
+        (should (eq (plist-get ack :success) t))
+        (should (equal (seq-filter
+                        (lambda (type)
+                          (member type '("agent_start" "agent_end" "agent_settled")))
+                        (pilish-fake-pi-test--event-types events))
+                       '("agent_start" "agent_end" "agent_settled")))
+        (should-not (seq-find
+                     (lambda (event) (equal (plist-get event :toolCallId) "parent/3"))
+                     (pilish-fake-pi-test--events-of-type events "tool_execution_end")))
+        (set-process-filter proc #'pilish-fake-pi-test--process-filter)
+        (let ((idle (plist-get (pilish-fake-pi-test--rpc proc '(:type "get_state")) :data)))
+          (should (eq (plist-get idle :isStreaming) :false))
+          (should (eq (plist-get idle :isCompacting) :false))
+          (should (= (plist-get idle :pendingMessageCount) 0))
+          (should (= (plist-get idle :messageCount) 4)))
+        ;; Reuse the reset contract's observation window past the fixture's
+        ;; late-record pause.  Fake abort success is a worker-join boundary;
+        ;; this says nothing about real Pi's abort acknowledgment ordering.
+        (should-not (pilish-test-wait-until
+                     (lambda () (process-get proc 'fake-pi-objects))
+                     0.75 0.01 proc))
+        (should (equal disk-at-ack (pilish-fake-pi-test--file-bytes session-file)))
+        (let ((next (pilish-fake-pi-test--rpc
+                     proc '(:id "next" :type "prompt" :message "next replay"))))
+          (should (eq (plist-get next :success) t))
+          (should (equal (plist-get (plist-get next :data) :disposition) "started")))
+        (let* ((next-events
+                (pilish-fake-pi-test--collect-until
+                 proc (lambda (event)
+                        (and (equal (plist-get event :type) "tool_execution_end")
+                             (equal (plist-get event :toolCallId) "parent/3")))))
+               (final (car (last (pilish-fake-pi-test--message-events
+                                  next-events "message_end" "assistant")))))
+          (should (equal (plist-get (plist-get final :message) :content)
+                         [(:type "text" :text "FINAL-AFTER-PARENT")])))
+        (should (eq (plist-get (pilish-fake-pi-test--rpc
+                               proc '(:id "join-next" :type "abort")) :success) t))))))
+
 (ert-deftest pilish-fake-pi-test-nested-tools-reset-stops-playback ()
   "Abort and session resets join playback even after wire settlement."
   (let ((target-dir (make-temp-file "pilish-fake-pi-nested-reset-" t)))
     (unwind-protect
-        (dolist (boundary '("tool_execution_update" "agent_settled"))
+        (dolist (boundary '("tool_execution_update" "agent_end" "agent_settled"))
           (dolist (command-type '("abort" "new_session" "switch_session"))
             (ert-info ((format "boundary=%s command=%s" boundary command-type))
               (pilish-fake-pi-test-with-process (proc "nested-tools")
                 (let* ((state (pilish-fake-pi-test--rpc proc '(:type "get_state")))
                        (old-file (plist-get (plist-get state :data) :sessionFile))
                        (target (expand-file-name
-                                (concat boundary "-" command-type ".jsonl") target-dir)))
-                  (should (eq (plist-get (pilish-fake-pi-test--rpc
-                                         proc '(:type "prompt" :message "stop this replay"))
-                                        :success) t))
-                  (pilish-fake-pi-test--collect-until
-                   proc (lambda (event)
-                          (and (equal (plist-get event :type) boundary)
-                               (or (equal boundary "agent_settled")
-                                   (equal (plist-get event :toolCallId) "parent/3")))))
+                                (concat boundary "-" command-type ".jsonl") target-dir))
+                       (prefix
+                        (progn
+                          (should (eq (plist-get (pilish-fake-pi-test--rpc
+                                                 proc '(:type "prompt" :message "stop this replay"))
+                                                :success) t))
+                          (pilish-fake-pi-test--collect-until
+                           proc (lambda (event)
+                                  (and (equal (plist-get event :type) boundary)
+                                       (or (member boundary '("agent_end" "agent_settled"))
+                                           (equal (plist-get event :toolCallId) "parent/3"))))))))
                   (pilish-fake-pi-test--send
                    proc (append (list :id "reset" :type command-type)
                                 (when (equal command-type "switch_session")
                                   (list :sessionPath target))))
-                  (let* ((events (pilish-fake-pi-test--collect-until
-                                  proc (lambda (event)
-                                         (equal (plist-get event :id) "reset"))))
+                  (let* ((events (append prefix
+                                         (pilish-fake-pi-test--collect-until
+                                          proc (lambda (event)
+                                                 (equal (plist-get event :id) "reset")))))
                          (ack (car (last events)))
                          (disk-at-ack (pilish-fake-pi-test--file-bytes old-file)))
                     (should (eq (plist-get ack :success) t))
+                    (dolist (type '("agent_start" "agent_end" "agent_settled"))
+                      (should (= (length (pilish-fake-pi-test--events-of-type events type)) 1)))
                     (unless (equal command-type "abort")
                       (should (eq (plist-get (plist-get ack :data) :cancelled) :false)))
                     ;; The late end is paused after settlement in this fixture.
