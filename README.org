@@ -65,9 +65,7 @@ is the shortest path to a working session.
 - A C compiler if Emacs needs to compile tree-sitter grammars
 
 Upgrade older Pi installations before using Pilish, for example with
-=npm install -g @earendil-works/pi-coding-agent@latest=.  Pi 1.0.0 or
-later is required for run settlement, queue clearing, and compaction
-abort handling; older protocol versions are not supported.
+=npm install -g @earendil-works/pi-coding-agent@latest=.
 
 ** Install pi and authenticate
 
@@ -284,10 +282,15 @@ tools appear inline in graphical Emacs and as a type-and-size
 placeholder in terminals; the limits are described under =Images= in
 Advanced.
 
+For =codemode=, the script and child calls appear inside the parent
+tool block.  Its script, call list, parent output, and individual
+child outputs fold independently with =TAB=.  Reload and resume
+retain saved child-call summaries, not child outputs.
+
 Hover completed replies, thinking, or tool blocks for timestamps and details:
 reply provider/model and message-level token/cache usage, thinking line counts,
 or short tool command/path hints.  Native =C-h .= shows full help at point,
-including in terminals.  Stream durations, output rates, and tool timings are
+including in terminals.  Reply-stream durations and output rates are
 approximate and live-only; reload or resume drops them.
 
 Press =RET= on a file target to visit it: a file-content row in tool
@@ -312,8 +315,8 @@ versions plus skill and prompt-template counts.  Press =TAB= on it to
 expand sections listing context files, skills, prompt templates, and
 extension commands, grouped by Project and User, with explicit paths
 and unknown-scope resources kept separate; the extension section
-lists registered commands.  Names link to their source files and
-carry descriptions when available, so you can explore what is on
+lists registered commands.  Names are links when a source file exists.
+Descriptions appear when available, so you can explore what is on
 offer before running anything from =C-c C-p=.  =TAB= anywhere in the
 details collapses the summary again.
 
@@ -329,8 +332,9 @@ hides and shows the session windows in the current frame.
 session browser.  It reads Pi's session archive from disk —
 =~/.pi/agent/sessions/= by default, or =$PI_CODING_AGENT_DIR/sessions/=
 — so browsing, searching, renaming, and deleting work with no live
-process at all.  Sessions with a currently live Pilish process in
-this Emacs get a ● marker; the marker only sees Pilish processes in
+process at all.  Sessions saved by older Pi releases can still be
+resumed.  Sessions with a currently live Pilish process in this Emacs
+get a ● marker; the marker only sees Pilish processes in
 this Emacs — sessions running in another Emacs or in a terminal are
 not marked.
 Press =g= to refresh markers.  Press =RET= to switch to the session
@@ -1133,9 +1137,9 @@ still requires the terminal.
 
 Pi connects enabled MCP servers in the background.  The first prompt
 may wait up to ten seconds by default for servers with direct tools.
-Other prompt hooks can take longer; Pilish's waiting label is not an
-observed MCP connection state.  Check notifications in =*Messages*=
-and =~/.pi/agent/mcp.log= for connection problems.  See
+Other startup work can keep the header waiting longer.  Check
+notifications in =*Messages*= and =~/.pi/agent/mcp.log= for connection
+problems.  See
 [[https://pi.dev/docs/latest/mcp][Pi's MCP documentation]] for configuration details.
 
 ** Tree-sitter grammar management

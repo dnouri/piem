@@ -3017,9 +3017,8 @@ local ownership or mutate a later operation on the same process."
     (pilish--rpc-async proc '(:type "abort") #'ignore)))
 
 (defconst pilish--prompt-start-timeout 0.5
-  "Seconds to wait for agent_start after a successful prompt response.
-Some extension commands can complete without a visible agent turn; this timeout
-returns the frontend to idle for that no-turn success path.")
+  "Seconds before probing Pi state after acceptance with no agent_start.
+Elapsed time alone does not return the frontend to idle.")
 
 (defvar-local pilish--prompt-start-timer nil
   "Timer waiting for agent_start after prompt preflight success.")
