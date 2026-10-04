@@ -2967,6 +2967,146 @@ literal LATEST-PREVIEW without losing the closed fold."
               (should (= (window-point selected) (point-max))))))
       (when (buffer-live-p buffer) (kill-buffer buffer)))))
 
+(defun pilish-test--nested-demand-driven-image-output (read-svg-p)
+  "Repaint a closed rich child, opening its real output only on demand.
+READ-SVG-P selects returned SVG text rather than an image content block.
+The caller saves the window configuration; queued paints need a visible chat."
+  (with-temp-buffer
+    (switch-to-buffer (current-buffer))
+    (pilish-chat-mode)
+    (let* ((svg "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2\" height=\"1\"><rect width=\"2\" height=\"1\"/></svg>")
+           (name (if read-svg-p "read" "image_tool"))
+           (args (if read-svg-p '(:path "missing.svg") '(:label "image-only")))
+           (result (list :content
+                         (if read-svg-p (vector (list :type "text" :text svg))
+                           (vector (list :type "image" :mimeType "image/png"
+                                         :data pilish-test--png-base64)))))
+           (decode (symbol-function 'base64-decode-string))
+           (scan (symbol-function 'pilish--standalone-svg-p))
+           (decode-count 0)
+           (scan-count 0))
+      (cl-letf (((symbol-function 'base64-decode-string)
+                 (lambda (&rest args)
+                   (cl-incf decode-count)
+                   (apply decode args)))
+                ((symbol-function 'pilish--standalone-svg-p)
+                 (lambda (&rest args)
+                   (cl-incf scan-count)
+                   (apply scan args))))
+        (pilish-test--nested-event
+         "tool_execution_start" "lazy-root" nil :toolName "runner" :args '(:job "lazy"))
+        (pilish-test--nested-event
+         "tool_execution_start" "rich-child" "lazy-root" :toolName name :args args)
+        (pilish-test--nested-event
+         "tool_execution_end" "rich-child" "lazy-root" :toolName name :isError :false :result result)
+        (pilish-test--nested-event
+         "tool_execution_start" "progress-child" "lazy-root" :toolName "runner" :args '(:job "progress"))
+        (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "lazy-root")))
+               (closed (buffer-substring-no-properties (point-min) (point-max))))
+          (cl-labels ((button ()
+                        (pilish--find-toggle-button-in-region
+                         (overlay-start overlay) (overlay-end overlay) '(child . "rich-child")))
+                      (repaint ()
+                        (pilish-test--nested-event
+                         "tool_execution_update" "progress-child" "lazy-root"
+                         :partialResult '(:content []))
+                        (should (assoc "lazy-root" pilish--pending-tool-updates))
+                        (cancel-timer pilish--tool-update-flush-timer)
+                        (cl-letf (((symbol-function 'input-pending-p) (lambda () nil)))
+                          (pilish--flush-tool-updates (current-buffer)))
+                        (should-not pilish--pending-tool-updates)))
+            (should (equal "[+ output]" (button-label (button))))
+            (should-not (pilish-test--image-preview-positions))
+            (dotimes (_ 2) (repaint))
+            (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))
+            (should (= 0 decode-count))
+            (should (= 0 scan-count))
+            ;; Opening runs the normal selector and real image preparation.
+            (pilish-test--nested-tab "lazy-root" '(child . "rich-child"))
+            (should (equal "[- output]" (button-label (button))))
+            (should (> (if read-svg-p scan-count decode-count) 0))
+            (let* ((positions (pilish-test--image-preview-positions))
+                   (position (car positions)))
+              (should (= 1 (length positions)))
+              (should (string-match-p
+                       (regexp-quote (if read-svg-p "Image: image/svg+xml" "Image: image/png"))
+                       (buffer-string)))
+              (if (and (display-images-p)
+                       (image-type-available-p (if read-svg-p 'svg 'png)))
+                  (should (eq 'image (car (get-text-property position 'display))))
+                (should-not (get-text-property position 'display))))
+            (when read-svg-p
+              (should (string-match-p (regexp-quote svg) (buffer-string))))
+            (let ((opened-decodes decode-count) (opened-scans scan-count))
+              (pilish-test--nested-tab "lazy-root" '(child . "rich-child"))
+              (dotimes (_ 2) (repaint))
+              (should (= opened-decodes decode-count))
+              (should (= opened-scans scan-count)))
+            (should (equal "[+ output]" (button-label (button))))
+            (should-not (pilish-test--image-preview-positions))
+            (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))))))))
+
+(ert-deftest pilish-test-nested-closed-image-only-output-prepares-on-demand ()
+  "Closed image-only children keep output buttons without decoding on repaint."
+  ;; Eager child selection decodes invisible images on every root redraw.
+  (save-window-excursion
+    (pilish-test--nested-demand-driven-image-output nil)))
+
+(ert-deftest pilish-test-nested-closed-read-svg-output-prepares-on-demand ()
+  "Closed read-SVG children skip scanning; public opening renders SVG and text."
+  ;; Omitting base64 work alone still eagerly scans returned SVG text.
+  (save-window-excursion
+    (pilish-test--nested-demand-driven-image-output t)))
+
+(ert-deftest pilish-test-nested-output-availability-follows-selected-text ()
+  "Closed output buttons match details, write, edit, ANSI-empty and empty bodies."
+  ;; A second availability grammar loses args/diffs/details or exposes dead
+  ;; output buttons for text that becomes empty after ANSI filtering.
+  (dolist (case '(("details-only" "inspect" nil
+                  (:content [] :details (:answer 7)) "\"answer\": 7")
+                 ("write-args" "write" (:path "written.el" :content "WRITTEN-FROM-ARGS")
+                  (:content []) "WRITTEN-FROM-ARGS")
+                 ("edit-diff" "edit" (:path "edited.el")
+                  (:content [(:type "text" :text "ACK")]
+                   :details (:diff "+ 1 EDIT-ADDED\n- 2 EDIT-REMOVED")) "EDIT-ADDED")
+                 ("ansi-empty" "bash" (:command "printf empty")
+                  (:content [(:type "text" :text "\33[31m\33[0m")]) nil)
+                 ("truly-empty" "inspect" nil (:content []) nil)))
+    (pcase-let ((`(,id ,name ,args ,result ,expected) case))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish-test--nested-event
+         "tool_execution_start" "availability-root" nil :toolName "runner" :args '(:job "availability"))
+        (pilish-test--nested-event
+         "tool_execution_start" id "availability-root" :toolName name :args args)
+        (pilish-test--nested-event
+         "tool_execution_end" id "availability-root" :toolName name :isError :false :result result)
+        (let* ((overlay (pilish--tool-block-overlay (pilish--nested-tool-owner "availability-root")))
+               (section (cons 'child id)))
+          (cl-labels ((button ()
+                        (pilish--find-toggle-button-in-region
+                         (overlay-start overlay) (overlay-end overlay) section)))
+            (should (eq (not (null expected)) (not (null (button)))))
+            (let ((closed (buffer-substring-no-properties (point-min) (point-max))))
+              (pilish-test--nested-tab "availability-root" section)
+              (if (null expected)
+                  (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))
+                (should (equal "[- output]" (button-label (button))))
+                ;; Search below the summary: write arguments also name the
+                ;; output, but the body must really be inserted on opening.
+                (goto-char (button-end (button)))
+                (forward-line 1)
+                (should (search-forward expected (overlay-end overlay) t))
+                (when (equal name "edit")
+                  (should (= 4 (length (seq-filter
+                                        (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                        (overlays-in (point-min) (point-max)))))))
+                (pilish-test--nested-tab "availability-root" section)
+                (should (equal "[+ output]" (button-label (button))))
+                (should (equal closed (buffer-substring-no-properties (point-min) (point-max))))
+                (should-not (seq-filter (lambda (ov) (overlay-get ov 'pilish-diff-overlay))
+                                        (overlays-in (point-min) (point-max))))))))))))
+
 (ert-deftest pilish-test-nested-child-results-preserve-text-images-and-diffs ()
   "Public folds retain rich results and never annotate a failed parent as success."
   ;; Losing destination-buffer insertion loses diff overlays; whole-body

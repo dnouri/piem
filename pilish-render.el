@@ -2288,7 +2288,8 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
                     (pilish--tool-result-presentation
                      (pilish--nested-call-name call) (pilish--nested-call-arguments call)
                      (plist-get child-result :content) (plist-get child-result :details)
-                     (not (null (memq (pilish--nested-call-status call) '(error cancelled)))))))
+                     (not (null (memq (pilish--nested-call-status call) '(error cancelled))))
+                     (not open))))
                  (text (plist-get presentation :text))
                  (images (plist-get presentation :images)))
             (insert (propertize
@@ -2300,7 +2301,8 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
                         (bytes (pilish--nested-call-arguments-bytes call)))
               (insert (propertize (format " saved arguments omitted (%d bytes)" bytes)
                                   'pilish-no-fontify t)))
-            (when (or images (and text (not (string-empty-p text))))
+            (when (or (plist-get presentation :image-content-p)
+                      images (and text (not (string-empty-p text))))
               (insert " ")
               (pilish--insert-compound-tool-button
                (if open "[- output]" "[+ output]") section))
@@ -4541,10 +4543,14 @@ Returns markdown string for syntax highlighting."
   (let ((fence (pilish--markdown-fence-delimiter content)))
     (format "%s%s\n%s\n%s" fence (or lang "") content fence)))
 
-(defun pilish--tool-result-presentation (tool-name args content details is-error)
+(defun pilish--tool-result-presentation
+    (tool-name args content details is-error &optional omit-image-preparation)
   "Select TOOL-NAME's result presentation from ARGS, CONTENT and DETAILS.
 IS-ERROR gates success-only diff annotations and SVG previews.  Insertion
-stays in the destination buffer so image properties and diff overlays survive."
+stays in the destination buffer so image properties and diff overlays survive.
+OMIT-IMAGE-PREPARATION skips image decoding and SVG scans for closed children.
+Text selection is unchanged; :images remains a list of prepared previews,
+and :image-content-p reports cheap image-block presence in CONTENT."
   (let* ((is-error (eq t is-error))
          (content-blocks (pilish--content-block-list content))
          (text-blocks (seq-filter (lambda (c) (equal (plist-get c :type) "text"))
@@ -4552,8 +4558,9 @@ stays in the destination buffer so image properties and diff overlays survive."
          (raw-output (mapconcat (lambda (c)
                                   (pilish--render-safe-string (plist-get c :text)))
                                 text-blocks "\n"))
-         (images (pilish--content-image-previews content-blocks))
-         (svg-preview (and (null images)
+         (images (unless omit-image-preparation
+                   (pilish--content-image-previews content-blocks)))
+         (svg-preview (and (not omit-image-preparation) (null images)
                            (pilish--read-svg-preview tool-name args raw-output details is-error)))
          (edit-diff (and (equal tool-name "edit") (pilish--tool-arg-get details :diff))))
     (list :text
@@ -4569,6 +4576,7 @@ stays in the destination buffer so image properties and diff overlays survive."
           :lang (pilish--path-to-language (pilish--tool-path-string (pilish--tool-arg-path args)))
           :is-edit-diff (and (not is-error) (stringp edit-diff))
           :images (if svg-preview (list svg-preview) images)
+          :image-content-p (pilish--content-has-image-p content-blocks)
           :preview-limit (if (equal tool-name "bash") pilish-bash-preview-lines pilish-tool-preview-lines)
           :offset (and (equal tool-name "read") (pilish--tool-arg-get args :offset)))))
 
