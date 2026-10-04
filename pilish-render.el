@@ -1927,6 +1927,7 @@ overlays are left alone."
   args
   result
   displayed-output                   ; Parent presentation used by the last paint.
+  script-line-map                    ; Painted preview's source rows; nil when full.
   nested-calls
   folds
   history-p
@@ -2214,6 +2215,7 @@ HISTORY-P distinguishes saved unfinished work from a stopped live process."
 Reuse ordinary result selection and rich-output insertion directly.
 OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
   (let* ((folds (pilish--tool-block-folds block))
+         script-line-map
          (presentation
           (or output-presentation
               (when-let* ((result (pilish--tool-block-result block)))
@@ -2237,6 +2239,8 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
           (pilish--insert-compound-tool-button
            (if expanded "[-]" (pilish--tool-hidden-line-label hidden)) 'script)
           (insert "\n"))
+        (setq script-line-map
+              (when (and (not expanded) (> hidden 0)) (plist-get truncation :line-map)))
         (add-text-properties start (point) '(pilish-tool-section script))))
     (when presentation
       (let* ((start (point))
@@ -2322,7 +2326,8 @@ OUTPUT-PRESENTATION folds a displayed snapshot; otherwise select current facts."
     (when (pilish--tool-block-summary-incomplete-p block)
       (insert (propertize "Incomplete saved call summary\n"
                           'pilish-no-fontify t 'pilish-tool-section 'children)))
-    (setf (pilish--tool-block-displayed-output block) presentation)))
+    (setf (pilish--tool-block-displayed-output block) presentation
+          (pilish--tool-block-script-line-map block) script-line-map)))
 
 (defun pilish--toggle-compound-tool-section (button)
   "Toggle only BUTTON's compound fold key."
@@ -2416,9 +2421,10 @@ Decoration in TOGGLED-SECTION also clamps, never impersonating source text."
 
 (defun pilish--redraw-compound-tool (block &optional toggled-section)
   "Rewrite compound BLOCK within retained bounds and preserve each reader's view.
-TOGGLED-SECTION identifies an explicit fold in either direction.  Parent
-output folds use the last painted presentation so captured row spans and
-preview line maps share one source.  Pending updates still paint newer
+Script and output coordinates always use the actual old and new painted
+line maps.  TOGGLED-SECTION identifies an explicit fold in either direction.
+Parent output folds use the last painted presentation so captured row spans
+and preview line maps share one source.  Pending updates still paint newer
 retained facts through the existing queue."
   (when-let* ((overlay (pilish--tool-block-overlay block))
               ((eq (overlay-buffer overlay) (current-buffer)))
@@ -2426,20 +2432,10 @@ retained facts through the existing queue."
               (end (pilish--tool-block-end-marker block)))
     (let* ((start (marker-position header))
            (old-end (marker-position end))
-           ;; The fold has already changed; an open script was a preview
-           ;; before this toggle, and a closed script was full content.
-           (script-expanded (member 'script (pilish--tool-block-folds block)))
-           (script-line-map
-            (when (eq toggled-section 'script)
-              ;; A preview keeps the first nonblank source rows.  Enumerate
-              ;; their identities independently of its old budget or width.
-              (vconcat (cl-loop for line in (split-string (pilish--compound-tool-code block) "\n")
-                                for source-line from 1
-                                unless (string-empty-p line) collect source-line))))
            (old-sections
             (pilish--tool-section-bounds
              start old-end
-             (list (cons 'script (and script-expanded script-line-map))
+             (list (cons 'script (pilish--tool-block-script-line-map block))
                    (cons 'output (pilish--tool-block-line-map block)))))
            (displayed-output (and (eq toggled-section 'output)
                                   (pilish--tool-block-displayed-output block)))
@@ -2458,17 +2454,7 @@ retained facts through the existing queue."
              (new-sections
               (pilish--tool-section-bounds
                start new-end
-               ;; A closed script with no hidden rows was inserted in full,
-               ;; including blanks.  Only a real preview needs source-row IDs.
-               ;; The map only exists for an explicit script fold, so checking
-               ;; it first skips the whole-body button search on ordinary
-               ;; repaints; when it exists, an actual inserted preview button
-               ;; is still required before the map is returned.
-               (list (cons 'script
-                           (and (not script-expanded)
-                                script-line-map
-                                (pilish--find-toggle-button-in-region start new-end 'script)
-                                script-line-map))
+               (list (cons 'script (pilish--tool-block-script-line-map block))
                      (cons 'output (pilish--tool-block-line-map block))))))
         (pilish--restore-tool-cooling-view
          view start old-end new-end
@@ -2494,6 +2480,7 @@ retained facts through the existing queue."
   (setf (pilish--tool-block-args block) nil
         (pilish--tool-block-result block) nil
         (pilish--tool-block-displayed-output block) nil
+        (pilish--tool-block-script-line-map block) nil
         (pilish--tool-block-nested-calls block) nil
         (pilish--tool-block-folds block) nil
         (pilish--tool-block-history-p block) nil

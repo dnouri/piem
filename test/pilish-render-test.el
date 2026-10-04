@@ -2509,6 +2509,114 @@ PREVIEW-AT-TAB changes the budget after painting, before the public fold."
    'script "\nconst FIRST = 1;\n\nconst SECOND = 2;\ntext(SECOND);"
    "const FIRST = 1;" "const SECOND = 2;" 1))
 
+(defun pilish-test--codemode-resize-repaint-view (old-width new-width target &optional queued-p)
+  "Repaint a script at NEW-WIDTH after its OLD-WIDTH paint, reading TARGET.
+SECOND survives either projection; SIXTH disappears in the narrow preview.
+With QUEUED-P, resize hidden chat, reopen, then paint with input selected."
+  (let ((frame (selected-frame))
+        (width (frame-width))
+        (height (frame-height)))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (set-frame-size frame old-width 60)
+          (with-temp-buffer
+            (pilish-chat-mode)
+            (switch-to-buffer (current-buffer))
+            (let* ((chat (current-buffer))
+                   (pilish-tool-preview-lines 10)
+                   (lines (mapcar (lambda (name)
+                                    (concat "const " name " = \"" (make-string 80 ?x) "\";"))
+                                  '("FIRST" "SECOND" "THIRD" "FOURTH" "FIFTH" "SIXTH")))
+                   (source (concat "\n" (string-join lines "\n\n"))))
+              (pilish--append-to-chat "OLDER TURN\nunchanged prelude\n")
+              (pilish-test--nested-event
+               "tool_execution_start" "resize-root" nil :toolName "codemode" :args (list :code source))
+              (pilish-test--nested-event
+               "tool_execution_start" "resize-child" "resize-root" :toolName "read" :args '(:path "file.txt"))
+              (pilish--append-to-chat "\nNEWER TURN\nunchanged epilogue\n")
+              (should (eq (not (null (string-match-p (regexp-quote source) (buffer-string))))
+                          (= old-width 120)))
+              (let* ((root (pilish--nested-tool-owner "resize-root"))
+                     (overlay (pilish--tool-block-overlay root))
+                     (prefix (buffer-substring-no-properties (point-min) (overlay-start overlay)))
+                     (suffix (buffer-substring-no-properties (overlay-end overlay) (point-max)))
+                     (reader (selected-window))
+                     (other (split-window-below 20))
+                     (input-window (split-window other 20 'below)))
+                (set-window-buffer other chat)
+                (with-temp-buffer
+                  (pilish-input-mode)
+                  (insert "NEWER DRAFT")
+                  (goto-char 5)
+                  (let ((input (current-buffer)))
+                    (set-window-buffer input-window input)
+                    (when queued-p
+                      (select-window input-window)
+                      (set-window-buffer reader input)
+                      (set-window-buffer other input)
+                      (set-frame-size frame new-width 60)
+                      (set-window-buffer reader chat)
+                      (set-window-buffer other chat))
+                    (with-current-buffer chat
+                      (goto-char (+ 2 (pilish-test--hover-pos target)))
+                      (set-window-point reader (point))
+                      (set-window-start reader (pilish-test--hover-pos (concat "const " target)) t)
+                      (set-window-point other (1+ (pilish-test--hover-pos "SECOND")))
+                      (set-window-start other (pilish-test--hover-pos "const SECOND") t)
+                      (if queued-p
+                          (progn
+                            (let ((painted (buffer-string)))
+                              (pilish-test--nested-event
+                               "tool_execution_update" "resize-child" "resize-root"
+                               :partialResult '(:content [(:type "text" :text "PROGRESS")]))
+                              (should (equal painted (buffer-string))))
+                            (cancel-timer pilish--tool-update-flush-timer)
+                            (pilish--flush-tool-updates chat))
+                        (set-frame-size frame new-width 60)
+                        (pilish-test--nested-event
+                         "tool_execution_end" "resize-child" "resize-root" :toolName "read"
+                         :isError :false :result '(:content [])))
+                      (should (eq (not (null (string-match-p (regexp-quote source) (buffer-string))))
+                                  (= new-width 120)))
+                      (if (equal target "SIXTH")
+                          (let ((anchor (text-property-any (overlay-start overlay) (overlay-end overlay)
+                                                          'pilish-tool-section 'script)))
+                            (should-not (string-match-p "SIXTH" (buffer-string)))
+                            (should (= (point) anchor))
+                            (should (= (window-point reader) anchor))
+                            (should (= (window-start reader) anchor)))
+                        (should (= (point) (+ 2 (pilish-test--hover-pos "SECOND"))))
+                        (should (= (window-point reader) (point)))
+                        (should (pilish-test--window-point-text-p reader "COND"))
+                        (should (= (window-start reader) (pilish-test--hover-pos "const SECOND")))
+                        (should (equal (nth 1 lines) (pilish-test--window-start-line reader))))
+                      (should (= (window-point other) (1+ (pilish-test--hover-pos "SECOND"))))
+                      (should (pilish-test--window-point-text-p other "ECOND"))
+                      (should (= (window-start other) (pilish-test--hover-pos "const SECOND")))
+                      (should (equal (nth 1 lines) (pilish-test--window-start-line other)))
+                      (should (equal prefix (buffer-substring-no-properties (point-min) (overlay-start overlay))))
+                      (should (equal suffix (buffer-substring-no-properties (overlay-end overlay) (point-max)))))
+                    (should (eq (selected-window) (if queued-p input-window reader)))
+                    (should (eq (window-buffer input-window) input))
+                    (should (= (window-point input-window) 5))
+                    (should (equal (buffer-string) "NEWER DRAFT"))))))))
+      (set-frame-size frame width height))))
+
+(ert-deftest pilish-test-codemode-script-child-end-after-widening-preserves-source-view ()
+  "An ordinary child end maps the painted preview onto full source, without TAB."
+  ;; Displayed row indices put SECOND in FIRST when the source blanks return.
+  (pilish-test--codemode-resize-repaint-view 80 120 "SECOND"))
+
+(ert-deftest pilish-test-codemode-script-queued-repaint-after-narrowing-preserves-source-view ()
+  "Reopened chat maps full source into its preview with the draft still selected."
+  ;; Old geometry belongs to the wide paint, not the reopened window's width.
+  (pilish-test--codemode-resize-repaint-view 120 80 "SECOND" t))
+
+(ert-deftest pilish-test-codemode-script-child-end-after-narrowing-clamps-hidden-source ()
+  "Only vanished script text clamps; the other reader stays on surviving text."
+  (pilish-test--codemode-resize-repaint-view 120 80 "SIXTH"))
+
 (defun pilish-test--nested-collapse-to-full-source-view (section budget-change-p)
   "Collapse SECTION after it fits and preserve both readers' source positions.
 BUDGET-CHANGE-P increases the preview budget instead of the display width."
