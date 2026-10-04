@@ -1936,7 +1936,6 @@ overlays are left alone."
                (:constructor pilish--make-nested-call))
   "One nested call's live or saved facts, stored in display order."
   id
-  parent-id
   name
   arguments
   arguments-bytes
@@ -1964,6 +1963,15 @@ index outlives ordinary execution registration, never a transcript teardown.")
   "Return BLOCK's nested call with exact ID, or nil."
   (seq-find (lambda (call) (equal id (pilish--nested-call-id call)))
             (pilish--tool-block-nested-calls block)))
+
+(defun pilish--promote-nested-call (block call)
+  "Place CALL after BLOCK's observed/saved rows and before unmatched details.
+Reuse the exact record and preserve the other rows' order."
+  (let* ((others (delq call (pilish--tool-block-nested-calls block)))
+         (details-p (lambda (row) (eq (pilish--nested-call-source row) 'details))))
+    (setf (pilish--tool-block-nested-calls block)
+          (append (seq-remove details-p others) (list call)
+                  (seq-filter details-p others)))))
 
 (defun pilish--nested-pending-p (block)
   "Return non-nil when BLOCK has an observed descendant still owing an end."
@@ -2003,8 +2011,7 @@ starts/updates owe an end, and repeated events cannot reopen ended calls."
       (let ((call (pilish--nested-call-get block id)))
         (when (or (null call) (memq (pilish--nested-call-source call) '(details saved)))
           (unless call (setq call (pilish--make-nested-call :id id)))
-          (setf (pilish--nested-call-parent-id call) parent-id
-                (pilish--nested-call-name call) (plist-get event :toolName)
+          (setf (pilish--nested-call-name call) (plist-get event :toolName)
                 (pilish--nested-call-arguments call)
                 (if (plist-member event :args) (plist-get event :args)
                   (pilish--nested-call-arguments call))
@@ -2012,13 +2019,7 @@ starts/updates owe an end, and repeated events cannot reopen ended calls."
                 (pilish--nested-call-status call)
                 (if (eq (pilish--nested-call-status call) 'cancelled) 'cancelled 'running)
                 (pilish--nested-call-pending-end-p call) t)
-          (let* ((others (delq call (pilish--tool-block-nested-calls block)))
-                 (details-p (lambda (row) (eq (pilish--nested-call-source row) 'details))))
-            ;; Observed event order precedes unmatched metadata order.  Exact-ID
-            ;; promotion keeps the same record, not a guessed copy of it.
-            (setf (pilish--tool-block-nested-calls block)
-                  (append (seq-remove details-p others) (list call)
-                          (seq-filter details-p others))))
+          (pilish--promote-nested-call block call)
           (puthash id block pilish--nested-tool-owners))
         (when (pilish--nested-call-pending-end-p call)
           (pcase (plist-get event :type)
@@ -2079,11 +2080,7 @@ enables the shared compound presentation."
                 (setf (pilish--nested-call-source call) 'saved
                       (pilish--nested-call-name call) name
                       (pilish--nested-call-status call) status)
-                (let* ((others (delq call (pilish--tool-block-nested-calls block)))
-                       (details-p (lambda (row) (eq (pilish--nested-call-source row) 'details))))
-                  (setf (pilish--tool-block-nested-calls block)
-                        (append (seq-remove details-p others) (list call)
-                                (seq-filter details-p others)))))
+                (pilish--promote-nested-call block call))
               (when (and (null (pilish--nested-call-arguments call)) (listp arguments))
                 (setf (pilish--nested-call-arguments call) arguments))
               (when-let* (((eq (pilish--nested-call-source call) 'saved))

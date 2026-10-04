@@ -3216,8 +3216,6 @@ literal LATEST-PREVIEW without losing the closed fold."
             (should (equal (mapcar #'pilish--nested-call-id
                                   (pilish--tool-block-nested-calls b))
                            '("different-id")))
-            (should (equal (pilish--nested-call-parent-id grandchild)
-                           "opaque-child"))
             (should (equal (pilish--nested-call-arguments grandchild)
                            '(:path "a.el")))
             (should (equal (pilish--tool-block-args a)
