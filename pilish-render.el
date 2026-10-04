@@ -2458,8 +2458,13 @@ retained facts through the existing queue."
                start new-end
                ;; A closed script with no hidden rows was inserted in full,
                ;; including blanks.  Only a real preview needs source-row IDs.
+               ;; The map only exists for an explicit script fold, so checking
+               ;; it first skips the whole-body button search on ordinary
+               ;; repaints; when it exists, an actual inserted preview button
+               ;; is still required before the map is returned.
                (list (cons 'script
                            (and (not script-expanded)
+                                script-line-map
                                 (pilish--find-toggle-button-in-region start new-end 'script)
                                 script-line-map))
                      (cons 'output (pilish--tool-block-line-map block))))))
