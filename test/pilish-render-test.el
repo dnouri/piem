@@ -13161,6 +13161,74 @@ When ASYNC is non-nil, include native terminal asynchronous syntax."
         (should-not (plist-get target :line))
         (should-not (plist-get target :range))))))
 
+(ert-deftest pilish-test-file-target-link-percent-encoded-destination-resolves ()
+  "Percent-encoded local destinations resolve to their decoded paths.
+The destination stays raw in `:raw', while `:emacs-path' and `:shell-path'
+use decoded characters, matching how CommonMark URLs denote local names."
+  (dolist (variant '(raw fontified streamed reloaded))
+    (dolist (case '(("[Release report](tmp/reports/2026-10-04%20-%20v3.3.0-release.html)"
+                     "tmp/reports/2026-10-04%20-%20v3.3.0-release.html"
+                     "tmp/reports/2026-10-04 - v3.3.0-release.html")
+                    ("![Release report](tmp/reports/2026-10-04%20-%20v3.3.0-release.png)"
+                     "tmp/reports/2026-10-04%20-%20v3.3.0-release.png"
+                     "tmp/reports/2026-10-04 - v3.3.0-release.png")))
+      (with-temp-buffer
+        (pilish-chat-mode)
+        (pilish--set-chat-session-identity "/tmp/session/")
+        (pilish-test--insert-semantic-link-variant (nth 0 case) variant)
+        (goto-char (point-min))
+        (search-forward "Release")
+        (goto-char (match-beginning 0))
+        (let ((target (pilish--file-target-at-point)))
+          (should (eq :link (plist-get target :source)))
+          (should (equal (nth 1 case) (plist-get target :raw)))
+          (should (equal (concat "/tmp/session/" (nth 2 case))
+                         (plist-get target :emacs-path)))
+          (should (equal (concat "/tmp/session/" (nth 2 case))
+                         (plist-get target :shell-path))))))))
+
+(ert-deftest pilish-test-file-target-link-percent-encoded-space-contract ()
+  "Decoded percent escapes follow the angle-destination space rules.
+A decoded separator may even introduce components; only the decoded path
+is validated and opened."
+  (dolist (case '(("[R](docs/some%20notes.md)"
+                   "docs/some%20notes.md" "docs/some notes.md")
+                  ("[R](tmp%2Ffile.md)"
+                   "tmp%2Ffile.md" "tmp/file.md")
+                  ("[R](<tmp/a%20b.md>)"
+                   "<tmp/a%20b.md>" "tmp/a b.md")
+                  ("[R](docs/out%2Emd#method)"
+                   "docs/out%2Emd#method" "docs/out.md")
+                  ("[R](docs/out%6A.md)"
+                   "docs/out%6A.md" "docs/outj.md")
+                  ("[R](docs/caf%C3%A9%20x.md)"
+                   "docs/caf%C3%A9%20x.md" "docs/café x.md")))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (pilish--set-chat-session-identity "/tmp/session/")
+      (let ((inhibit-read-only t)) (insert (nth 0 case)))
+      ;; Position 2 is the one-character label; unlike longer labels there
+      ;; is no interior label character to point at.
+      (goto-char (+ (point-min) 1))
+      (let ((target (pilish--file-target-at-point)))
+        (should (eq :link (plist-get target :source)))
+        (should (equal (nth 1 case) (plist-get target :raw)))
+        (should (equal (concat "/tmp/session/" (nth 2 case))
+                       (plist-get target :emacs-path)))))))
+
+(ert-deftest pilish-test-file-target-link-percent-encoded-fails-closed ()
+  "Malformed or prose-like percent destinations stay owned and invalid."
+  (dolist (text '("[src/label.el](tmp/my%20dir/file.md)"
+                  "[src/label.el](docs/100%.md)"
+                  "[src/label.el](docs/out.md%23method)"
+                  "[src/label.el](https%3A%2F%2Fexample.com/x)"
+                  "[src/label.el](docs/a%5Cb.md)"))
+    (with-temp-buffer
+      (pilish-chat-mode)
+      (let ((inhibit-read-only t)) (insert text))
+      (goto-char (+ (point-min) 5))
+      (should-not (pilish--file-target-at-point)))))
+
 (ert-deftest pilish-test-file-target-link-empty-label-is-inert ()
   "Valid links and images without emitted label text stay owned and inert."
   (dolist (text '("[](docs/a.md)" "![](images/a.png)"))
@@ -14873,6 +14941,20 @@ fixture; a test may dynamically override it inside FUNCTION."
       (let ((state (pilish-test--visit-file-state "native" 4)))
         (should (equal (cdr case) (plist-get state :path)))
         (should (= 4 (plist-get state :point)))))))
+
+(ert-deftest pilish-test-visit-file-link-percent-encoded-destination ()
+  "RET opens the decoded path of a percent-encoded Markdown link."
+  (with-temp-buffer
+    (pilish-chat-mode)
+    (pilish--set-chat-session-identity "/tmp/session/")
+    (let ((inhibit-read-only t))
+      (insert "[Release report](tmp/reports/2026-10-04%20-%20v3.3.0-release.html)"))
+    (goto-char (point-min))
+    (search-forward "Release")
+    (goto-char (match-beginning 0))
+    (let ((state (pilish-test--visit-file-state "native" 1)))
+      (should (equal "/tmp/session/tmp/reports/2026-10-04 - v3.3.0-release.html"
+                     (plist-get state :path))))))
 
 (ert-deftest pilish-test-visit-file-non-tool-no-location-keeps-native-point ()
   "A no-location target preserves native point in an existing file buffer."

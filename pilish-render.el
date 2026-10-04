@@ -6498,6 +6498,31 @@ file-path grammar rather than being assigned broader path semantics."
         (setq index (1+ index))))
     (apply #'concat (nreverse pieces))))
 
+(defun pilish--semantic-link-percent-decode (text)
+  "Decode URL percent escapes in TEXT and return the decoded string.
+Only a percent sign followed by two hexadecimal digits is an escape; any
+other percent sign stays literal.  Escapes denote UTF-8 bytes, not
+characters, so decoded and literal input is assembled as UTF-8; invalid
+sequences become raw bytes that fail the strict path grammar.  CommonMark
+layering applies this after Markdown backslash escapes."
+  (if (not (string-match-p "%[0-9A-Fa-f][0-9A-Fa-f]" text))
+      text
+    (let ((index 0)
+          (bytes nil))
+      (while (string-match "%\\([0-9A-Fa-f][0-9A-Fa-f]\\)" text index)
+        (setq bytes
+              (nconc bytes
+                     (string-to-list
+                      (encode-coding-string
+                       (substring text index (match-beginning 0)) 'utf-8))
+                     (list (string-to-number (match-string 1 text) 16)))
+              index (match-end 0)))
+      (setq bytes
+            (nconc bytes
+                   (string-to-list
+                    (encode-coding-string (substring text index) 'utf-8))))
+      (decode-coding-string (apply #'unibyte-string bytes) 'utf-8))))
+
 (defun pilish--semantic-link-malformed-end (start limit)
   "Return malformed inline-link ownership end after shortcut ending at START.
 A shortcut immediately followed by `(' is the installed grammar's recovery
@@ -7075,7 +7100,10 @@ only an inline link or inline image with a strict local destination qualifies.
 URL schemes, mailto links, protocol-relative links, fragment-only links, empty
 or malformed destinations, bare filenames, and reference forms are owned but
 invalid.  A local fragment is returned separately and is never interpreted as
-line metadata."
+line metadata.  Destinations decode Markdown backslash escapes, then URL
+percent escapes; angle-quoted destinations and destinations containing
+percent escapes validate the decoded path with the angle-destination
+rules."
   (let* ((type (plist-get owner :type))
          (label-projection (plist-get owner :label-projection))
          (label-positions (plist-get label-projection :positions))
@@ -7106,7 +7134,11 @@ line metadata."
               (and (eq (get-text-property position 'pilish-startup-banner)
                        'expanded)
                    (get-text-property position 'pilish-startup-source)))
-             (path (or source-path (pilish--semantic-link-unescape path-source)))
+             (path (or source-path
+                       (pilish--semantic-link-percent-decode
+                        (pilish--semantic-link-unescape path-source))))
+             (percent-escaped
+              (string-match-p "%[0-9A-Fa-f][0-9A-Fa-f]" path-source))
              (case-fold-search t))
         (when (or source-path
                   (and (not (string-empty-p path))
@@ -7114,7 +7146,8 @@ line metadata."
                        (not (string-prefix-p "//" source))
                        (not (string-match-p
                              "\\`[[:alpha:]][[:alnum:]+.-]*:" source))
-                       (pilish--strict-text-file-path-p path angle)))
+                       (pilish--strict-text-file-path-p
+                        path (or angle percent-escaped))))
           (let* ((anchor (pilish--chat-session-directory))
                  (emacs-path (pilish--emacs-path path anchor))
                  (label (plist-get label-projection :text)))
