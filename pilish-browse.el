@@ -62,6 +62,7 @@
 (require 'pilish-ui)
 (require 'pilish-jsonl)
 (require 'cl-lib)
+(require 'cursor-sensor)
 (require 'ucs-normalize)
 (require 'magit-section)
 (require 'transient)
@@ -1725,6 +1726,18 @@ hides it.  Other kinds of invisibility are left untouched."
      window
      (pilish--browse-repair-folded-position (window-point window)))))
 
+(defun pilish--browse-visible-section-at-point ()
+  "Return the visible current section selected at point, or nil.
+A section must still own its row start after a rerender.  Check that
+start, not just point: Magit's context-menu selection can name a hidden
+row while point is elsewhere.  Redisplay repairs cursors, but commands
+can run before that repair."
+  (when-let* ((section (magit-current-section))
+              (start (oref section start))
+              ((eq section (magit-section-at start)))
+              ((not (invisible-p start))))
+    section))
+
 (defun pilish--browse-current-fold-row ()
   "Return current flat-row metadata, or nil outside a browser row."
   (and pilish--browse-fold-row-by-section
@@ -2072,6 +2085,7 @@ Uses Magit's flat section navigation plus Pilish's explicit row folding."
         pilish--browse-fold-row-by-section (make-hash-table :test #'eq)
         pilish--browse-fold-overlays nil)
   (add-to-invisibility-spec 'pilish-browse-fold)
+  (cursor-intangible-mode 1)
   (add-hook 'magit-section-movement-hook
             #'pilish--browse-skip-folded-section nil t))
 
@@ -2604,21 +2618,21 @@ A blank or whitespace-only query clears the filter."
 
 (defun pilish--session-browser-item-at-point ()
   "Return the loaded session item represented at point, or nil.
-Session sections carry canonical identity keys; resolve that key in
-`pilish--session-browser-items', the complete loaded snapshot rather
+Visible session sections carry canonical identity keys; resolve that key
+in `pilish--session-browser-items', the complete loaded snapshot rather
 than the currently visible filtered rows."
-  (when-let* ((section (magit-current-section))
+  (when-let* ((section (pilish--browse-visible-section-at-point))
               ((object-of-class-p section 'pilish-session-section)))
     (cl-find (oref section value) pilish--session-browser-items
              :key #'pilish--session-item-key :test #'equal)))
 
 (defun pilish--session-browser-path-at-point ()
-  "Return the file path of the session at point, or nil.
+  "Return the file path of the visible session at point, or nil.
 Sections carry canonical identities; the displayed row's raw retained
 spelling is returned so actions (switch, rename, delete) act on the
 path the user selected.  Identity-sensitive guards and relationships
 canonicalize separately."
-  (when-let* ((section (magit-current-section))
+  (when-let* ((section (pilish--browse-visible-section-at-point))
               ((object-of-class-p section 'pilish-session-section)))
     (let ((key (oref section value)))
       (or (plist-get (pilish--session-browser-item-at-point) :path)
@@ -2699,10 +2713,10 @@ remaining zero-width characters with the replacement character."
 (defconst pilish--session-delete-child-name-width 26
   "Maximum display width of each child name in a delete prompt.")
 
-(defconst pilish--session-delete-prompt-max-width 320
+(defconst pilish--session-delete-prompt-max-width 400
   "Upper display-width bound for a session deletion prompt.
-This covers the longest fixed wording, three bounded child names,
-the bounded target identity, and ordinary finite child counts.")
+This covers the longest fixed wording including the live-check limit,
+three bounded child names, the target identity, and finite child counts.")
 
 (defun pilish--session-delete-prompt-component (text width)
   "Return sanitized TEXT quoted within display WIDTH, ellipsizing if needed.
@@ -2818,7 +2832,17 @@ sanitized, display-bounded, and truthfully ellipsized."
        "Permanently delete session file")
      " in project " project " — session " name "."
      (pilish--session-delete-child-warning children)
+     " Other Emacs instances or external processes are not checked."
      " Continue? ")))
+
+(defun pilish--session-delete-file-state (path)
+  "Observe PATH's modification time, byte size, and file identity, or nil.
+Ignore access time and request uncached metadata from remote handlers."
+  (let ((remote-file-name-inhibit-cache t))
+    (when-let* ((attributes (file-attributes path)))
+      (list (file-attribute-modification-time attributes)
+            (file-attribute-size attributes)
+            (file-attribute-file-identifier attributes)))))
 
 (defun pilish-session-browser-delete ()
   "Delete the session at point after contextual confirmation.
@@ -2833,16 +2857,14 @@ pathname, preserving symlink and file-handler semantics.
 
 Refuse a session used by a live Pilish process before prompting and
 check that identity again after confirmation.  Also recompute the
-selected pathname's canonical identity and reject an observed change,
-such as a symlink retargeted while the prompt was active.  This is a
-best-effort observation, not locking: it cannot detect a same-path
-replacement that preserves the canonical spelling, and an independent
-writer can still change the path between this check and `delete-file'.
-Live detection
-covers only Pilish processes in this Emacs, not another Emacs or a
-system-wide process.  Cancellation and a signaled `delete-file' leave
-the browser snapshot unrefreshed; success refreshes through the existing
-scan path."
+selected pathname's canonical identity and compare its file's modification
+time, size, and identity with their pre-prompt values.  Reject observed
+changes or unavailable metadata.  This is not locking: idle external
+writers are undetectable, and a writer can still change the file after
+the final check.  The prompt discloses that live detection covers only
+Pilish processes in this Emacs, not another Emacs or an external process.
+Cancellation and a signaled `delete-file' leave the browser snapshot
+unrefreshed; success refreshes through the existing scan path."
   (interactive)
   (if-let* ((session (pilish--session-browser-item-at-point))
             (raw-path (pilish--session-browser-path-at-point)))
@@ -2864,29 +2886,30 @@ scan path."
         (setq children
               (pilish--session-direct-child-items
                session pilish--session-browser-items))
-        (when (y-or-n-p
-               (pilish--session-delete-prompt
-                session pilish--session-browser-items children trash-p))
-          ;; A process can open the identity while confirmation is active.
-          (pilish--browse-ensure-session-closed identity)
-          ;; Observe the selected path again to catch a canonical retarget,
-          ;; such as a symlink changed to another target while the prompt was
-          ;; active.  This is not locking: same-path replacement preserving
-          ;; the canonical spelling and a change after this check remain
-          ;; possible for independent writers.
-          (unless (equal identity
-                         (condition-case nil
-                             (pilish--canonical-session-path raw-path)
-                           (error nil)))
-            (user-error "Selected session changed while awaiting confirmation"))
-          ;; Keep the policy named by the prompt stable even if Lisp run
-          ;; from the minibuffer changed the global option meanwhile.
-          (let ((delete-by-moving-to-trash trash-p))
-            (delete-file raw-path trash-p))
-          (pilish--session-browser-fetch-and-render)
-          (if trash-p
-              (message "Pi: Moved %s to trash" name)
-            (message "Pi: Permanently deleted %s" name))))
+        ;; Local canonical identity follows the selected symlink to the
+        ;; session file; `file-attributes' on the raw link would not.
+        (let ((file-state (pilish--session-delete-file-state identity)))
+          (when (y-or-n-p
+                 (pilish--session-delete-prompt
+                  session pilish--session-browser-items children trash-p))
+            ;; A process can open the identity while confirmation is active.
+            (pilish--browse-ensure-session-closed identity)
+            (unless (and file-state
+                         (equal identity
+                                (condition-case nil
+                                    (pilish--canonical-session-path raw-path)
+                                  (error nil)))
+                         (equal file-state
+                                (pilish--session-delete-file-state identity)))
+              (user-error "Selected session changed while awaiting confirmation"))
+            ;; Keep the policy named by the prompt stable even if Lisp run
+            ;; from the minibuffer changed the global option meanwhile.
+            (let ((delete-by-moving-to-trash trash-p))
+              (delete-file raw-path trash-p))
+            (pilish--session-browser-fetch-and-render)
+            (if trash-p
+                (message "Pi: Moved %s to trash" name)
+              (message "Pi: Permanently deleted %s" name)))))
     (message "Pi: No session at point")))
 
 (defun pilish--browse-clean-session-name (name)
@@ -4051,7 +4074,7 @@ Selecting the actual current projected entry is a no-op.  Projected
 legacy and ambiguous rows are visible but cannot truthfully name a
 continuation target."
   (interactive)
-  (let* ((section (magit-current-section))
+  (let* ((section (pilish--browse-visible-section-at-point))
          (value (and section (oref section value))))
     (cond
      ((or (null section)
@@ -4070,9 +4093,9 @@ continuation target."
       (pilish--browse-navigate value)))))
 
 (defun pilish-tree-browser-set-label ()
-  "Set or clear a label on the addressable tree node at point."
+  "Set or clear a label on the visible addressable tree node at point."
   (interactive)
-  (when-let* ((section (magit-current-section))
+  (when-let* ((section (pilish--browse-visible-section-at-point))
               (node-id (oref section value))
               ((stringp node-id)))
     (let* ((current-label (when pilish--tree-browser-tree
